@@ -1,0 +1,67 @@
+# Qwen3.6-27B MLA heal recipe — post-sanity-check composition.
+#
+# IMPORTANT structural point: the training PHASES each run at one long seq_len
+# (local~32k, global~16k, final~65k) and read ONE band, so every band a phase reads
+# must itself be the full mixture — genuine-long STRESS sources (honor the band's
+# `min_doc_tokens` floor) PLUS don't-regress/agentic/chinese/chat FILLER sources
+# (per-source `min_doc_tokens: 0`, packed to fill the window). A separate short band
+# would never be trained on. So:
+#   * `main`  = the bulk band (local + global train here): ~60% genuine-long stress,
+#               ~40% filler. Synthetic kept <40% of the stress mass.
+#   * `top`   = final long-context top-off (65k): genuine-long only.
+# Chinese lane rides in `main` as filler (Qwen is strong en+zh). Chinese-LONG is a
+# KNOWN DEFERRED gap. Per-category held-out slice drives per-axis heal tracking.
+#
+# seq_len + `tokens` are PLACEHOLDERS — run sanity/sweep.py, then sanity/size_recipe.py
+# writes the sweep-chosen values here (band seq_len = the longest phase using it,
+# tokens ≈ tok/s × phase_hours × ~0.8 epoch).
+model: Qwen/Qwen3.6-27B          # family-shared tokenizer (vocab 248320)
+
+bands:
+  # ---- bulk band: local (32k) + global (16k) train here --------------------
+  main:
+    seq_len: 32768
+    tokens: 3000000000
+    min_doc_tokens: 16384          # band default: STRESS sources must clear half a window
+    heldout_blocks: 8
+    # CODE-FORWARD mix: end goal is a coding model, so code + agentic are boosted
+    # generously (~0.26 code + ~0.13 agentic ≈ 40% of the mix directly). NOTE: this
+    # recipe is shared across the team — revisit the composition for non-coding uses.
+    sources:
+      # --- genuine-long STRESS (~0.62; synthetic <40% of this) ---
+      - {source: starcoderdata,    weight: 0.26, role: stress, category: code,
+         config: {langs: [python, java, cpp, javascript, typescript, go, rust, c, c-sharp],
+                  repo_chars: 220000}}
+      - {source: arxiv_papers,     weight: 0.12, role: stress, category: arxiv}
+      - {source: pg19,             weight: 0.08, role: stress, category: books}
+      - {source: synth_needle,     weight: 0.06, role: stress, category: synth,
+         config: {target_chars: 130000, n_needles: 28}}
+      - {source: synth_copy,       weight: 0.06, role: stress, category: synth,
+         config: {target_chars: 130000}}
+      - {source: synth_multiquery, weight: 0.04, role: stress, category: synth,
+         config: {target_chars: 130000, max_bindings: 140}}
+      # --- agentic + don't-regress + chinese + chat FILLER (~0.38; no floor) ---
+      - {source: nemotron_agentic, weight: 0.13, role: filler, category: agentic,  min_doc_tokens: 0}
+      - {source: fineweb_edu,      weight: 0.08, role: filler, category: web,      min_doc_tokens: 0}
+      - {source: finemath,         weight: 0.05, role: filler, category: math,     min_doc_tokens: 0}
+      - {source: ultrachat,        weight: 0.04, role: filler, category: chat,     min_doc_tokens: 0}
+      - {source: chinese_edu,      weight: 0.04, role: filler, category: chinese,  min_doc_tokens: 0}
+      - {source: wikipedia_zh,     weight: 0.02, role: filler, category: chinese,  min_doc_tokens: 0}
+      - {prepacked: data/mix_5k_copy, weight: 0.02, role: filler, category: prior_mix}
+
+  # ---- top-off band: final (65k), genuine-long only ------------------------
+  top:
+    seq_len: 65536
+    tokens: 800000000
+    min_doc_tokens: 32768
+    heldout_blocks: 4
+    sources:
+      - {source: starcoderdata,    weight: 0.26, role: stress, category: code,
+         config: {langs: [python, java, cpp, javascript, typescript, go, rust],
+                  repo_chars: 420000}}    # big repos fill 65k = long-range cross-file code
+      - {source: arxiv_papers,     weight: 0.28, role: stress, category: arxiv}
+      - {source: pg19,             weight: 0.20, role: stress, category: books}
+      - {source: synth_needle,     weight: 0.14, role: stress, category: synth,
+         config: {target_chars: 270000, n_needles: 52}}
+      - {source: synth_copy,       weight: 0.12, role: stress, category: synth,
+         config: {target_chars: 270000}}

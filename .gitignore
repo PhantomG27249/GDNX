@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+*.pt
+runs/
+research/runs/
+research/configs/
+research/leaderboard.jsonl
+research/research_log.md
+research/current_task.md
+research/loop.log
+research/loop.out
+data/mix_v1
+BOT_TOKEN
+CHANNEL_ID
