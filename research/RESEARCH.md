@@ -119,8 +119,9 @@ baseline" and keep sweeping configs / trying `n_keys`+seed variations instead.
   `runs/gdn3_twotimescale_heal/`, `data/`, `gdn3/`, `train/`, or `data_pipeline/`.
 - If a run errors (`status` starts with `error:`), log it and try a *different*
   config — don't loop on the same failure.
-- **Time budget: keep `steps × grad_accum ≤ 700`** (~4s per micro-step ⇒ ≈45 min +
-  ~2 min load/eval). Defaults `steps=300, grad_accum=2` land ~40 min. Never exceed
-  an hour per experiment — that's the whole point of the proxy.
+- **Time budget:** ~1.8 s per micro-step. Calibration (`steps=400, grad_accum=1`)
+  ran in **14 min** — so you have room. Keep `steps × grad_accum ≤ ~1200` (≈35 min +
+  load/eval). Good default: `grad_accum=1, steps=500–800` to give recall room to
+  emerge past the format plateau. Never exceed an hour per experiment.
 - Flag any config with `final_recall ≥ 0.5` and `skip_rate < 0.2` in the log under a
   `## PROMOTE` heading — those are candidates for a human to run a full distill+RULER.
