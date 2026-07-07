@@ -71,7 +71,7 @@ class KMD2Mixer(nn.Module):
     def __init__(self, d, H=4, dk=32, dv=32, r=4, eps=0.5,
                  kron=False, compact_P=0, compact_R=0, slow_decay=0.97,
                  use_conv=True, compact_ste=False, trap=False,
-                 rot=False, r_out=1):
+                 rot=False, r_out=1, rope_mod=False):
         super().__init__()
         self.H, self.dk, self.dv, self.r, self.eps = H, dk, dv, r, eps
         self.kron = kron
@@ -93,6 +93,19 @@ class KMD2Mixer(nn.Module):
             nn.init.zeros_(self.rot_proj.weight)
             # softplus(-4.6) ~ 0.01 rad/token at init: gentle, learnable phase
             nn.init.constant_(self.rot_proj.bias, -4.6)
+        # Data-dependent RoPE (author's variant): FIXED RoPE frequency ladder,
+        # learned per-token scalar rate m_t -> data-dependent position
+        # p_t = cumsum(m), angle = p_t * inv_freq. Vanilla RoPE is m == 1.
+        self.rope_mod = rope_mod
+        if rope_mod:
+            assert not rot, "rot and rope_mod are exclusive rotation schemes"
+            self.mod_proj = nn.Linear(d, H, bias=True)
+            nn.init.zeros_(self.mod_proj.weight)
+            nn.init.constant_(self.mod_proj.bias, 0.5413)   # softplus ~ 1.0
+            half = dk // 2
+            self.register_buffer(
+                "rope_inv_freq",
+                10000.0 ** (-torch.arange(half, dtype=torch.float32) / half))
         # Mamba-3-style output widening: r_out query slots read the state, then
         # a learned per-head mix recombines (their C_t ∈ R^{N x R} output MIMO).
         self.r_out = r_out
@@ -170,10 +183,16 @@ class KMD2Mixer(nn.Module):
         B, T, d = x.shape
         H, dk, dv, r = self.H, self.dk, self.dv, self.r
         q, K, V = self._qkv(x, B, T)           # q [B,T,H,r_out,dk], K [B,T,H,r,dk]
-        if self.rot:
-            # data-dependent rotating state transition via cumulative RoPE on q/k
-            theta = F.softplus(self.rot_proj(x)).view(B, T, H, dk // 2)
-            Theta = theta.cumsum(dim=1)
+        if self.rot or self.rope_mod:
+            if self.rot:
+                # free per-channel data-dependent angles, cumulative
+                theta = F.softplus(self.rot_proj(x)).view(B, T, H, dk // 2)
+                Theta = theta.cumsum(dim=1)
+            else:
+                # fixed RoPE ladder x learned per-token rate (adaptive position)
+                m = F.softplus(self.mod_proj(x))                 # [B,T,H]
+                pos = m.cumsum(dim=1)
+                Theta = pos.unsqueeze(-1) * self.rope_inv_freq   # [B,T,H,dk/2]
             cos = Theta.cos().unsqueeze(-2)     # [B,T,H,1,dk/2]
             sin = Theta.sin().unsqueeze(-2)
             def rope(z):
@@ -320,6 +339,8 @@ def main():
                     help="Mamba-3 exponential-trapezoidal write (+q/k biases)")
     ap.add_argument("--rot", action="store_true",
                     help="data-dependent 2x2 rotating state transition (Mamba-3 complex SSM)")
+    ap.add_argument("--rope_mod", action="store_true",
+                    help="fixed RoPE freq ladder x learned per-token rate (adaptive position)")
     ap.add_argument("--r_out", type=int, default=1,
                     help="output MIMO rank: query slots recombined per head")
     ap.add_argument("--slow_decay", type=float, default=0.97)
@@ -348,7 +369,8 @@ def main():
                       kron=args.kron, compact_P=args.compact_P,
                       compact_R=args.compact_R, slow_decay=args.slow_decay,
                       use_conv=not args.no_conv, compact_ste=args.compact_ste,
-                      trap=args.trap, rot=args.rot, r_out=args.r_out)
+                      trap=args.trap, rot=args.rot, r_out=args.r_out,
+                      rope_mod=args.rope_mod)
     model = TinyLM(vocab, d=args.d, L=args.layers, arch=args.arch, **mix_kw).to(dev)
     nparams = sum(p.numel() for p in model.parameters())
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), weight_decay=0.01)

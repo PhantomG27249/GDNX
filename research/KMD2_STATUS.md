@@ -189,3 +189,16 @@ FINAL: r=1 delta + conv + learned decay | SVD compaction R>=load/4 + STE + rot |
 optional r_out=4 / rank-r+ortho for efficiency | skip trap | train w/
 distillation or aux-InfoNCE, never CE-only-frozen. Testbed phase COMPLETE.
 Next: retrofit into the real GDN3 heal (gdn3/kmd2.py + train pipeline).
+
+## DATA-DEPENDENT RoPE TEST (2026-07-07, author's final idea) — NOT ADOPTED
+`--rope_mod` = fixed RoPE freq ladder x learned per-token scalar rate (adaptive
+position p_t = cumsum(softplus(proj(x)))); vanilla RoPE is m==1. np64, 2 seeds:
+  plain:  0.906/0.961 (mean 0.934)  vs baseline 0.977/0.957 (0.973 incl s2)
+  +STE:   0.906/0.949 (mean 0.928)  vs ste 0.926/0.941; rot+ste 0.953/0.965
+Neutral-to-slightly-negative; does NOT reproduce free-angle rot's compaction
+bonus. Mechanism: content-addressed retrieval at variable distances — the
+ladder's fast channels (1 rad/token) phase-scramble key-query matches and the
+scalar rate can't selectively suppress them; free-angle rot starts gentle and
+learns per-channel. (Partial-RoPE variant might be neutral; no path to a win.)
+FINAL ARCHITECTURE UNCHANGED. All author ideas now measured: rot=include,
+trap/lam_t=skip, MIMO widening=efficiency-only, data-dep RoPE=skip.
