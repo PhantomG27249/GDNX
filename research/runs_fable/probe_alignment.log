@@ -1,0 +1,64 @@
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+[transformers] The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d
+Loading weights:   0%|          | 0/320 [00:00<?, ?it/s]Loading weights:  58%|█████▊    | 186/320 [00:00<00:00, 1847.02it/s]Loading weights: 100%|██████████| 320/320 [00:00<00:00, 2317.70it/s]
+
+GDN3 Upgrade: Scanning 24 layers...
+  [KMD-2] using Fable's rank-r MIMO delta drop-in
+  Layer  0: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer  1: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer  2: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer  3: full_attention [PRESERVED]
+  Layer  4: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer  5: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer  6: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer  7: full_attention [PRESERVED]
+  Layer  8: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer  9: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 10: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 11: full_attention [PRESERVED]
+  Layer 12: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 13: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 14: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 15: full_attention [PRESERVED]
+  Layer 16: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 17: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 18: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 19: full_attention [PRESERVED]
+  Layer 20: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 21: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 22: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 23: full_attention [PRESERVED]
+
+Upgrade complete: 18 layers upgraded
+training 200 steps (same recipe as proxy)...
+/home/dev/gdn3_fable/research/runs_fable/probe_kmd2_alignment.py:64: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at /pytorch/torch/csrc/autograd/generated/python_variable_methods.cpp:838.)
+  print(f"  step {step} ce={float(loss):.3f} ({time.time()-t0:.0f}s)", flush=True)
+  step 0 ce=15.225 (4s)
+  step 50 ce=2.241 (167s)
+  step 100 ce=2.495 (331s)
+  step 150 ce=1.723 (496s)
+
+=== q->k alignment at answer position (24 episodes, trained 200 steps) ===
+layer  mean gap best-head gap   (gap>0 => query prefers GOLD binding)
+    0   -0.0322        0.0147
+    1   -0.0338        0.0028
+    2   -0.0424        0.0110
+    4   -0.0456        0.0124
+    5   -0.0414        0.0141
+    6   -0.0533        0.0091
+    8   -0.0383        0.0150
+    9   -0.0382        0.0253
+   10   -0.0330        0.0084
+   12   -0.0568        0.0159
+   13   -0.0374        0.0140
+   14   -0.0540        0.0091
+   16   -0.0505        0.0120
+   17   -0.0668        0.0119
+   18   -0.0452        0.0127
+   20   -0.0455        0.0100
+   21   -0.0395        0.0129
+   22   -0.0318        0.0178
+
+ALL-LAYER mean gap: -0.0436
+interpretation: ~0 => no induction alignment; >0.1 => real alignment forming

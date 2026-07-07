@@ -1,0 +1,46 @@
+=== fr3_np64_r1_P32R32_ste (--n_pairs 64 --r 1 --compact_P 32 --compact_R 32 --compact_ste) ===
+step     0  ce 5.4165  tok_acc 0.0039  episode_recall 0.0000  (1s)
+step  1000  ce 4.1657  tok_acc 0.0205  episode_recall 0.0000  (149s)
+step  2000  ce 3.5652  tok_acc 0.1279  episode_recall 0.0000  (305s)
+step  3000  ce 0.4017  tok_acc 0.8633  episode_recall 0.5625  (459s)
+step  4000  ce 0.1551  tok_acc 0.9736  episode_recall 0.9062  (613s)
+step  5000  ce 0.0382  tok_acc 0.9844  episode_recall 0.9414  (767s)
+step  5999  ce 0.0166  tok_acc 0.9863  episode_recall 0.9492  (921s)
+{"final_tokacc": 0.9863, "final_recall": 0.9492, "wall_s": 920.7}
+=== fr3_np64_r1_P32R16_ste (--n_pairs 64 --r 1 --compact_P 32 --compact_R 16 --compact_ste) ===
+step     0  ce 5.4155  tok_acc 0.0049  episode_recall 0.0000  (1s)
+step  1000  ce 4.1626  tok_acc 0.0186  episode_recall 0.0000  (155s)
+step  2000  ce 3.9521  tok_acc 0.0654  episode_recall 0.0000  (309s)
+step  3000  ce 0.9790  tok_acc 0.6455  episode_recall 0.1914  (463s)
+step  4000  ce 0.3086  tok_acc 0.9463  episode_recall 0.7891  (617s)
+step  5000  ce 0.0504  tok_acc 0.9834  episode_recall 0.9336  (769s)
+step  5999  ce 0.0302  tok_acc 0.9814  episode_recall 0.9258  (919s)
+{"final_tokacc": 0.9814, "final_recall": 0.9258, "wall_s": 919.2}
+=== fr3_np64_r1_P32R8_ste (--n_pairs 64 --r 1 --compact_P 32 --compact_R 8 --compact_ste) ===
+step     0  ce 5.4136  tok_acc 0.0020  episode_recall 0.0000  (1s)
+step  1000  ce 4.1741  tok_acc 0.0244  episode_recall 0.0000  (153s)
+step  2000  ce 3.9853  tok_acc 0.0615  episode_recall 0.0000  (308s)
+step  3000  ce 2.1813  tok_acc 0.3770  episode_recall 0.0156  (464s)
+step  4000  ce 0.6622  tok_acc 0.8037  episode_recall 0.4102  (619s)
+step  5000  ce 0.2544  tok_acc 0.9062  episode_recall 0.6562  (774s)
+step  5999  ce 0.1986  tok_acc 0.9404  episode_recall 0.7852  (929s)
+{"final_tokacc": 0.9404, "final_recall": 0.7852, "wall_s": 928.6}
+=== fr3_np64_r1_P32R4_ste (--n_pairs 64 --r 1 --compact_P 32 --compact_R 4 --compact_ste) ===
+step     0  ce 5.4128  tok_acc 0.0020  episode_recall 0.0000  (1s)
+step  1000  ce 4.1836  tok_acc 0.0225  episode_recall 0.0000  (156s)
+step  2000  ce 3.9894  tok_acc 0.0586  episode_recall 0.0000  (311s)
+step  3000  ce 3.1054  tok_acc 0.1865  episode_recall 0.0000  (465s)
+step  4000  ce 2.3357  tok_acc 0.4014  episode_recall 0.0195  (620s)
+step  5000  ce 1.8374  tok_acc 0.5303  episode_recall 0.0781  (775s)
+step  5999  ce 1.5132  tok_acc 0.5654  episode_recall 0.1133  (926s)
+{"final_tokacc": 0.5654, "final_recall": 0.1133, "wall_s": 925.7}
+=== fr3_np64_r4_P32R16_ste_ortho (--n_pairs 64 --r 4 --compact_P 32 --compact_R 16 --compact_ste --slot_ortho 0.1) ===
+step     0  ce 5.4361  tok_acc 0.0078  episode_recall 0.0000  (1s)
+step  1000  ce 4.1851  tok_acc 0.0137  episode_recall 0.0000  (156s)
+step  2000  ce 4.0521  tok_acc 0.0381  episode_recall 0.0000  (310s)
+step  3000  ce 3.9074  tok_acc 0.0732  episode_recall 0.0000  (466s)
+step  4000  ce 1.3896  tok_acc 0.6094  episode_recall 0.1367  (621s)
+step  5000  ce 0.0968  tok_acc 0.9502  episode_recall 0.8164  (776s)
+step  5999  ce 0.1216  tok_acc 0.9736  episode_recall 0.9062  (931s)
+{"final_tokacc": 0.9736, "final_recall": 0.9062, "wall_s": 931.3}
+SUITE DONE

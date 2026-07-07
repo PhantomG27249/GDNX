@@ -11,6 +11,8 @@ set -u
 cd /home/dev/gdn3_two_timescale_release
 export PATH="/home/dev/.local/share/pi-node/node-v22.23.1-linux-x64/bin:$PATH"  # where the real `pi` launcher lives
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export CUDA_VISIBLE_DEVICES=1   # pin all proxy training to physical GPU1 (GPU0 drives the display).
+                                # In-process this remaps to cuda:0, so any --device the agent passes lands on GPU1.
 
 PROMPT="Do ONE bounded unit of GDN3 auto-research this turn, per research/RESEARCH.md. \
 First skim research/leaderboard.jsonl (and current_task.md if it exists) so you don't repeat work. \

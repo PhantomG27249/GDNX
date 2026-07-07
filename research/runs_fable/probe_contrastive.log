@@ -1,0 +1,60 @@
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+[transformers] The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d
+Loading weights:   0%|          | 0/320 [00:00<?, ?it/s]Loading weights:  95%|█████████▌| 304/320 [00:00<00:00, 3029.74it/s]Loading weights: 100%|██████████| 320/320 [00:00<00:00, 3104.56it/s]
+
+GDN3 Upgrade: Scanning 24 layers...
+  [KMD-2] using Fable's rank-r MIMO delta drop-in
+  Layer  0: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer  1: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer  2: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer  3: full_attention [PRESERVED]
+  Layer  4: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer  5: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer  6: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer  7: full_attention [PRESERVED]
+  Layer  8: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer  9: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 10: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 11: full_attention [PRESERVED]
+  Layer 12: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 13: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 14: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 15: full_attention [PRESERVED]
+  Layer 16: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 17: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 18: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 19: full_attention [PRESERVED]
+  Layer 20: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 21: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 22: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 23: full_attention [PRESERVED]
+
+Upgrade complete: 18 layers upgraded
+collecting hidden states (untrained drop-ins; frozen backbone)...
+kept train=300 eval=100 episodes (175s)
+mean bindings/episode: 12.0 (chance = 1/that = 0.083)
+
+=== per-layer contrastive alignment probe (InfoNCE, 64-dim) ===
+layer train_acc  eval_acc
+    0     0.417     0.080
+    1     1.000     0.930
+    2     1.000     0.950
+    4     1.000     0.920
+    5     1.000     0.950
+    6     1.000     0.930
+    8     1.000     0.940
+    9     1.000     0.950
+   10     1.000     0.940
+   12     1.000     0.950
+   13     1.000     0.940
+   14     1.000     0.920
+   16     1.000     0.950
+   17     1.000     0.930
+   18     1.000     0.940
+   20     1.000     0.940
+   21     1.000     0.930
+   22     1.000     0.920
+
+BEST layer 2: eval_acc 0.950
+verdict: eval_acc >> chance -> representation FINE, ceiling is the CE loss signal;
+         eval_acc ~= chance -> frozen backbone never moves key identity to the answer position.

@@ -26,7 +26,10 @@ Usage: proxy_mqar.py --config cfg.json --out result.json [--device cuda:0]
 from __future__ import annotations
 import os, sys, json, time, argparse, random, traceback
 
-ROOT = "/home/dev/gdn3_two_timescale_release"
+# Import gdn3 from THIS repo (gdn3_fable) so source edits here are what gets
+# tested. gdn3_fable is a self-contained copy of gdn3_two_timescale_release with
+# the added research context; the old release dir is left untouched.
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 SNAP = ("/home/dev/.cache/huggingface/models--Qwen--Qwen3.5-0.8B/snapshots/"
         "2fc06364715b967f1860aea9cf38778875588b17")
@@ -123,6 +126,14 @@ def main():
     if "residual_rank" in cfg: os.environ["GDN3_P"] = str(cfg["residual_rank"])
     if "slow_decay" in cfg:    os.environ["GDN3_SLOW_DECAY"] = str(cfg["slow_decay"])
     if "decay_clamp" in cfg:   os.environ["GDN3_DECAY_CLAMP"] = str(cfg["decay_clamp"])
+    # KMD-2 (Fable) drop-in: set GDN3_KMD2=1 and optional arch knobs.
+    if cfg.get("kmd2"):        os.environ["GDN3_KMD2"] = "1"
+    for k, env in (("kmd2_r", "GDN3_KMD2_R"), ("kmd2_h", "GDN3_KMD2_H"),
+                   ("kmd2_dk", "GDN3_KMD2_DK"), ("kmd2_dv", "GDN3_KMD2_DV"),
+                   ("kmd2_eps", "GDN3_KMD2_EPS"),
+                   ("kmd2_decay_bias", "GDN3_KMD2_DECAY_BIAS"),
+                   ("kmd2_qk_init", "GDN3_KMD2_QK_INIT")):
+        if k in cfg: os.environ[env] = str(cfg[k])
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     result = {"config": cfg, "status": "error:init", "device": args.device}
@@ -142,22 +153,54 @@ def main():
 
         tok = AutoTokenizer.from_pretrained(SNAP)
         model = AutoModelForCausalLM.from_pretrained(SNAP, torch_dtype=torch.float32, low_cpu_mem_usage=True)
-        mgr = GDN3UpgradeManager(model); mgr.apply_upgrade(); upg = mgr.upgraded_layers
-        for p in model.parameters(): p.requires_grad_(False)
-        mem_params, cop_params = [], []
-        for idx in upg:
-            for n, p in model.model.layers[idx].linear_attn.named_parameters():
-                if any(k in n for k in PRESERVED):
-                    continue                                  # freeze warm-started projections (matches heal)
-                p.requires_grad_(True)
-                (cop_params if "coprod" in n or n.startswith(("W_q_", "W_k_", "W_v_")) else mem_params).append(p)
+        arch = cfg.get("arch", "gdn3")
+        if arch == "native":
+            # FAIR CONTROL: Qwen3.5's original GatedDeltaNet (the GDN2-family linear attn GDN3
+            # replaces), same frozen backbone + same MQAR task/metric. For fairness the native
+            # arch must learn its recurrence FROM SCRATCH like GDN3 (not fine-tune pretrained
+            # weights): freeze the SAME shared projections GDN3 freezes, and re-init the 4
+            # recurrence params (A_log, dt_bias, in_proj_a/b) to fresh canonical values.
+            # cfg "reinit": false -> keep pretrained recurrence (the "can the SETUP retrieve
+            # at all, given a good arch?" ceiling check).
+            import math
+            NATIVE_FREEZE = ("in_proj_qkv", "in_proj_z", "conv1d", "norm", "out_proj")
+            fair_init = bool(cfg.get("reinit", True))
+            layer_types = model.config.to_dict().get("layer_types", [])
+            upg = [i for i, t in enumerate(layer_types) if t == "linear_attention"]
+            for p in model.parameters(): p.requires_grad_(False)
+            train_params = []
+            with torch.no_grad():
+                for idx in upg:
+                    for n, p in model.model.layers[idx].linear_attn.named_parameters():
+                        if any(k in n for k in NATIVE_FREEZE):
+                            continue                              # keep pretrained shared projection, frozen (matches GDN3)
+                        if fair_init:                             # fresh canonical GatedDeltaNet init
+                            if n.endswith("A_log"):
+                                p.copy_(torch.log(torch.arange(1, p.numel() + 1, dtype=torch.float32)).to(p))
+                            elif n.endswith("dt_bias"):
+                                lo, hi = math.log(1e-3), math.log(1e-1)
+                                dt = torch.exp(torch.rand(p.numel()) * (hi - lo) + lo)
+                                p.copy_(torch.log(torch.expm1(dt)).to(p))
+                            else:                                 # in_proj_a / in_proj_b linear weights
+                                p.normal_(0, 0.02)
+                        p.requires_grad_(True); train_params.append(p)
+            groups = [{"params": train_params, "lr": lr_mem}]
+        else:
+            mgr = GDN3UpgradeManager(model); mgr.apply_upgrade(); upg = mgr.upgraded_layers
+            for p in model.parameters(): p.requires_grad_(False)
+            mem_params, cop_params = [], []
+            for idx in upg:
+                for n, p in model.model.layers[idx].linear_attn.named_parameters():
+                    if any(k in n for k in PRESERVED):
+                        continue                                  # freeze warm-started projections (matches heal)
+                    p.requires_grad_(True)
+                    (cop_params if "coprod" in n or n.startswith(("W_q_", "W_k_", "W_v_")) else mem_params).append(p)
+            groups = [{"params": mem_params, "lr": lr_mem}, {"params": cop_params, "lr": lr_cop}]
         model.config.use_cache = False
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model.to(dev).train()
 
-        opt = torch.optim.AdamW([{"params": mem_params, "lr": lr_mem},
-                                 {"params": cop_params, "lr": lr_cop}],
-                                betas=(0.9, 0.95), weight_decay=0.01)
+        opt = torch.optim.AdamW(groups, betas=(0.9, 0.95), weight_decay=0.01)
         def lr_at(step):
             return (step + 1) / max(1, warmup) if step < warmup else 1.0
         sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_at)
@@ -192,7 +235,7 @@ def main():
                 if not torch.isfinite(loss):
                     bad = True; break
                 (loss / accum).backward(); last_ce = float(loss.detach())
-            gnorm = torch.nn.utils.clip_grad_norm_(mem_params + cop_params, clip)
+            gnorm = torch.nn.utils.clip_grad_norm_([p for g in opt.param_groups for p in g["params"]], clip)
             if bad or not torch.isfinite(gnorm):
                 opt.zero_grad(set_to_none=True); sched.step(); skipped += 1; continue
             opt.step(); sched.step(); opt.zero_grad(set_to_none=True)

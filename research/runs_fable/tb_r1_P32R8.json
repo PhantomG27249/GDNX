@@ -1,0 +1,87 @@
+{
+  "config": {
+    "r": 1,
+    "heads": 4,
+    "dk": 32,
+    "dv": 32,
+    "d": 128,
+    "layers": 2,
+    "eps": 0.5,
+    "kron": false,
+    "compact_P": 32,
+    "compact_R": 8,
+    "slow_decay": 0.97,
+    "n_pairs": 16,
+    "n_query": 4,
+    "keys_vocab": 64,
+    "vals_vocab": 64,
+    "batch": 32,
+    "steps": 5000,
+    "lr": 0.001,
+    "eval_every": 500,
+    "seed": 0,
+    "device": "cuda:1",
+    "out": "research/runs_fable/tb_r1_P32R8.json"
+  },
+  "n_params": 528128,
+  "curve": {
+    "0": {
+      "tok_acc": 0.0117,
+      "recall": 0.0,
+      "ce": 5.0213
+    },
+    "500": {
+      "tok_acc": 0.0762,
+      "recall": 0.0,
+      "ce": 3.6365
+    },
+    "1000": {
+      "tok_acc": 0.0938,
+      "recall": 0.0,
+      "ce": 3.6471
+    },
+    "1500": {
+      "tok_acc": 0.1055,
+      "recall": 0.0,
+      "ce": 3.8511
+    },
+    "2000": {
+      "tok_acc": 0.0771,
+      "recall": 0.0,
+      "ce": 3.5802
+    },
+    "2500": {
+      "tok_acc": 0.0918,
+      "recall": 0.0,
+      "ce": 3.6655
+    },
+    "3000": {
+      "tok_acc": 0.0889,
+      "recall": 0.0,
+      "ce": 3.7818
+    },
+    "3500": {
+      "tok_acc": 0.0771,
+      "recall": 0.0,
+      "ce": 3.761
+    },
+    "4000": {
+      "tok_acc": 0.0996,
+      "recall": 0.0,
+      "ce": 3.7389
+    },
+    "4500": {
+      "tok_acc": 0.0879,
+      "recall": 0.0,
+      "ce": 3.8101
+    },
+    "4999": {
+      "tok_acc": 0.0977,
+      "recall": 0.0,
+      "ce": 3.5752
+    }
+  },
+  "final_tokacc": 0.0977,
+  "final_recall": 0.0,
+  "wall_s": 235.3
+}

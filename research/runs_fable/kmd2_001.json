@@ -1,0 +1,45 @@
+{
+  "config": {
+    "name": "kmd2_fable_v1",
+    "hypothesis": "Fable's KMD-2 rank-r MIMO delta (r=4, trainable q/k/v/gates) breaks the original-GDN3 0-recall ceiling on the robust proxy; trainable query CAN align to stored keys (induction) unlike frozen-Qwen-q/k GDN3.",
+    "kmd2": true,
+    "kmd2_r": 4,
+    "kmd2_h": 16,
+    "kmd2_dk": 64,
+    "kmd2_dv": 64,
+    "kmd2_eps": 0.5,
+    "steps": 400,
+    "eval_every": 80,
+    "warmup": 40,
+    "grad_accum": 1,
+    "n_keys": 4,
+    "seq_len": 512,
+    "lr_memory": 0.00025,
+    "lr_coproduct": 0.00015,
+    "seed": 0
+  },
+  "status": "ok",
+  "device": "cuda:1",
+  "tokacc_curve": {
+    "0": 0.0,
+    "80": 0.3375,
+    "160": 0.2708,
+    "240": 0.2708,
+    "320": 0.2792,
+    "399": 0.3
+  },
+  "recall_curve": {
+    "0": 0.0,
+    "80": 0.0,
+    "160": 0.0,
+    "240": 0.0,
+    "320": 0.0,
+    "399": 0.0
+  },
+  "final_tokacc": 0.3,
+  "final_recall": 0.0,
+  "emergence_step": null,
+  "skip_rate": 0.0,
+  "final_ce": 1.7069,
+  "wall_s": 1502.0
+}

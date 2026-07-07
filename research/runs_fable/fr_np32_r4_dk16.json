@@ -1,0 +1,69 @@
+{
+  "config": {
+    "arch": "kmd2",
+    "no_conv": false,
+    "r": 4,
+    "heads": 4,
+    "dk": 16,
+    "dv": 32,
+    "d": 128,
+    "layers": 2,
+    "eps": 0.5,
+    "kron": false,
+    "compact_P": 0,
+    "compact_R": 8,
+    "slow_decay": 0.97,
+    "n_pairs": 32,
+    "n_query": 4,
+    "keys_vocab": 128,
+    "vals_vocab": 64,
+    "batch": 32,
+    "steps": 6000,
+    "lr": 0.001,
+    "eval_every": 1000,
+    "seed": 0,
+    "device": "cuda:1",
+    "out": "research/runs_fable/fr_np32_r4_dk16.json"
+  },
+  "n_params": 912512,
+  "curve": {
+    "0": {
+      "tok_acc": 0.001,
+      "recall": 0.0,
+      "ce": 5.4299
+    },
+    "1000": {
+      "tok_acc": 0.0586,
+      "recall": 0.0,
+      "ce": 3.9414
+    },
+    "2000": {
+      "tok_acc": 0.0723,
+      "recall": 0.0,
+      "ce": 3.6564
+    },
+    "3000": {
+      "tok_acc": 0.0859,
+      "recall": 0.0,
+      "ce": 3.549
+    },
+    "4000": {
+      "tok_acc": 0.165,
+      "recall": 0.0,
+      "ce": 3.1777
+    },
+    "5000": {
+      "tok_acc": 0.6943,
+      "recall": 0.2461,
+      "ce": 1.1096
+    },
+    "5999": {
+      "tok_acc": 0.8311,
+      "recall": 0.4727,
+      "ce": 0.4852
+    }
+  },
+  "final_tokacc": 0.8311,
+  "final_recall": 0.4727,
+  "wall_s": 495.3
+}

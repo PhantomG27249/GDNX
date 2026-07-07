@@ -1,0 +1,57 @@
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+[transformers] The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d
+Loading weights:   0%|          | 0/320 [00:00<?, ?it/s]Loading weights:  53%|█████▎    | 171/320 [00:00<00:00, 1677.33it/s]Loading weights: 100%|██████████| 320/320 [00:00<00:00, 2206.46it/s]
+
+GDN3 Upgrade: Scanning 24 layers...
+  [KMD-2] using Fable's rank-r MIMO delta drop-in
+  Layer  0: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer  1: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer  2: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer  3: full_attention [PRESERVED]
+  Layer  4: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer  5: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer  6: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer  7: full_attention [PRESERVED]
+  Layer  8: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer  9: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 10: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 11: full_attention [PRESERVED]
+  Layer 12: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 13: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 14: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 15: full_attention [PRESERVED]
+  Layer 16: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 17: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 18: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 19: full_attention [PRESERVED]
+  Layer 20: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 21: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 22: linear_attention -> GDN3 Kr-MIMO [OK]
+  Layer 23: full_attention [PRESERVED]
+
+Upgrade complete: 18 layers upgraded
+collecting hidden states...
+kept train=300 eval=100 (179s)
+
+layer train_acc  eval_acc   (per-token keys, span max-pool)
+    0     0.060     0.110
+    1     0.160     0.080
+    2     0.427     0.240
+    4     0.917     0.400
+    5     1.000     0.500
+    6     0.963     0.450
+    8     1.000     0.300
+    9     0.280     0.140
+   10     0.297     0.160
+   12     0.987     0.080
+   13     1.000     0.290
+   14     0.813     0.190
+   16     1.000     0.190
+   17     0.997     0.290
+   18     1.000     0.460
+   20     0.990     0.290
+   21     0.997     0.470
+   22     1.000     0.640
+
+saved per-layer probes -> /home/dev/gdn3_fable/research/runs_fable/qk_probe_init.pt
+mean eval_acc: 0.2933333259489801

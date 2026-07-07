@@ -1,0 +1,99 @@
+{
+  "config": {
+    "arch": "attn",
+    "no_conv": false,
+    "r": 4,
+    "heads": 4,
+    "dk": 32,
+    "dv": 32,
+    "d": 128,
+    "layers": 2,
+    "eps": 0.5,
+    "kron": false,
+    "compact_P": 0,
+    "compact_R": 8,
+    "slow_decay": 0.97,
+    "n_pairs": 16,
+    "n_query": 4,
+    "keys_vocab": 64,
+    "vals_vocab": 64,
+    "batch": 32,
+    "steps": 6000,
+    "lr": 0.001,
+    "eval_every": 500,
+    "seed": 0,
+    "device": "cuda:1",
+    "out": "research/runs_fable/tb2_attn.json"
+  },
+  "n_params": 560128,
+  "curve": {
+    "0": {
+      "tok_acc": 0.0088,
+      "recall": 0.0,
+      "ce": 5.0705
+    },
+    "500": {
+      "tok_acc": 0.0654,
+      "recall": 0.0,
+      "ce": 3.6983
+    },
+    "1000": {
+      "tok_acc": 0.0781,
+      "recall": 0.0,
+      "ce": 3.5188
+    },
+    "1500": {
+      "tok_acc": 0.0889,
+      "recall": 0.0,
+      "ce": 3.452
+    },
+    "2000": {
+      "tok_acc": 0.0879,
+      "recall": 0.0,
+      "ce": 3.2569
+    },
+    "2500": {
+      "tok_acc": 0.1123,
+      "recall": 0.0,
+      "ce": 3.1477
+    },
+    "3000": {
+      "tok_acc": 0.9971,
+      "recall": 0.9883,
+      "ce": 0.0104
+    },
+    "3500": {
+      "tok_acc": 0.998,
+      "recall": 0.9922,
+      "ce": 0.0005
+    },
+    "4000": {
+      "tok_acc": 1.0,
+      "recall": 1.0,
+      "ce": 0.0779
+    },
+    "4500": {
+      "tok_acc": 0.999,
+      "recall": 0.9961,
+      "ce": 0.0001
+    },
+    "5000": {
+      "tok_acc": 0.999,
+      "recall": 0.9961,
+      "ce": 0.0147
+    },
+    "5500": {
+      "tok_acc": 1.0,
+      "recall": 1.0,
+      "ce": 0.1675
+    },
+    "5999": {
+      "tok_acc": 0.999,
+      "recall": 0.9961,
+      "ce": 0.0
+    }
+  },
+  "final_tokacc": 0.999,
+  "final_recall": 0.9961,
+  "wall_s": 50.3
+}

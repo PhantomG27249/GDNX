@@ -1,0 +1,46 @@
+=== fr2_np64_r4_ortho (--n_pairs 64 --r 4 --slot_ortho 0.1) ===
+step     0  ce 5.4365  tok_acc 0.0078  episode_recall 0.0000  (1s)
+step  1000  ce 4.1868  tok_acc 0.0156  episode_recall 0.0000  (156s)
+step  2000  ce 4.0311  tok_acc 0.0430  episode_recall 0.0000  (310s)
+step  3000  ce 3.8880  tok_acc 0.0645  episode_recall 0.0000  (463s)
+step  4000  ce 1.6410  tok_acc 0.4805  episode_recall 0.0430  (617s)
+step  5000  ce 0.1180  tok_acc 0.9424  episode_recall 0.7734  (771s)
+step  5999  ce 0.0838  tok_acc 0.9795  episode_recall 0.9219  (925s)
+{"final_tokacc": 0.9795, "final_recall": 0.9219, "wall_s": 924.8}
+=== fr2_np32_r4dk16_ortho (--n_pairs 32 --r 4 --dk 16 --slot_ortho 0.1) ===
+step     0  ce 5.4394  tok_acc 0.0010  episode_recall 0.0000  (1s)
+step  1000  ce 3.9402  tok_acc 0.0508  episode_recall 0.0000  (86s)
+step  2000  ce 3.6605  tok_acc 0.0850  episode_recall 0.0000  (172s)
+step  3000  ce 3.1800  tok_acc 0.1641  episode_recall 0.0078  (257s)
+step  4000  ce 0.7156  tok_acc 0.7666  episode_recall 0.3398  (342s)
+step  5000  ce 0.4351  tok_acc 0.9268  episode_recall 0.7461  (427s)
+step  5999  ce 0.1186  tok_acc 0.9463  episode_recall 0.8125  (511s)
+{"final_tokacc": 0.9463, "final_recall": 0.8125, "wall_s": 510.6}
+=== fr2_np64_r1_P32R16 (--n_pairs 64 --r 1 --compact_P 32 --compact_R 16) ===
+step     0  ce 5.4155  tok_acc 0.0049  episode_recall 0.0000  (1s)
+step  1000  ce 4.1947  tok_acc 0.0166  episode_recall 0.0000  (147s)
+step  2000  ce 4.1601  tok_acc 0.0195  episode_recall 0.0000  (292s)
+step  3000  ce 4.1068  tok_acc 0.0303  episode_recall 0.0000  (434s)
+step  4000  ce 3.9766  tok_acc 0.0537  episode_recall 0.0000  (577s)
+step  5000  ce 3.5198  tok_acc 0.1221  episode_recall 0.0000  (718s)
+step  5999  ce 2.8073  tok_acc 0.3379  episode_recall 0.0117  (859s)
+{"final_tokacc": 0.3379, "final_recall": 0.0117, "wall_s": 859.1}
+=== fr2_np64_r1_P32R32 (--n_pairs 64 --r 1 --compact_P 32 --compact_R 32) ===
+step     0  ce 5.4165  tok_acc 0.0039  episode_recall 0.0000  (1s)
+step  1000  ce 4.1947  tok_acc 0.0166  episode_recall 0.0000  (141s)
+step  2000  ce 4.1620  tok_acc 0.0156  episode_recall 0.0000  (285s)
+step  3000  ce 4.1048  tok_acc 0.0283  episode_recall 0.0000  (426s)
+step  4000  ce 3.9564  tok_acc 0.0596  episode_recall 0.0000  (566s)
+step  5000  ce 3.1416  tok_acc 0.2109  episode_recall 0.0000  (706s)
+step  5999  ce 2.1810  tok_acc 0.4385  episode_recall 0.0430  (847s)
+{"final_tokacc": 0.4385, "final_recall": 0.043, "wall_s": 846.8}
+=== fr2_np64_r1_P64R16 (--n_pairs 64 --r 1 --compact_P 64 --compact_R 16) ===
+step     0  ce 5.4150  tok_acc 0.0039  episode_recall 0.0000  (1s)
+step  1000  ce 4.1945  tok_acc 0.0166  episode_recall 0.0000  (142s)
+step  2000  ce 4.1512  tok_acc 0.0234  episode_recall 0.0000  (283s)
+step  3000  ce 4.0501  tok_acc 0.0371  episode_recall 0.0000  (423s)
+step  4000  ce 3.7043  tok_acc 0.1162  episode_recall 0.0000  (564s)
+step  5000  ce 2.4109  tok_acc 0.3525  episode_recall 0.0156  (705s)
+step  5999  ce 1.2853  tok_acc 0.6855  episode_recall 0.2461  (846s)
+{"final_tokacc": 0.6855, "final_recall": 0.2461, "wall_s": 845.9}
+SUITE DONE
