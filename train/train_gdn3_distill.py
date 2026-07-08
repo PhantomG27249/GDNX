@@ -195,6 +195,12 @@ def main():
                     help="consecutive sub-eps windows required to stop")
     ap.add_argument("--max-hours", type=float, default=0.0,
                     help="hard wall-clock stop (0 = off); checkpoints before exiting")
+    ap.add_argument("--resume", default="",
+                    help="path to a gdn3_layers.pt checkpoint to warm-start from")
+    ap.add_argument("--plateau-doubling", action="store_true",
+                    help="power-law-aware plateau: windows double in length each "
+                         "check, so a healthy power-law descent (constant improvement "
+                         "per doubling) never false-triggers")
     args = ap.parse_args()
 
     if args.smoke:
@@ -244,6 +250,11 @@ def main():
                 if classify(name) == "preserved":
                     p.requires_grad_(False); nfz += p.numel()
         print(f"[freeze] preserved projections frozen ({nfz/1e6:.1f}M params)", flush=True)
+    if args.resume:
+        sd = torch.load(args.resume, map_location="cpu")
+        missing, unexpected = student.load_state_dict(sd, strict=False)
+        assert not unexpected, f"resume: unexpected keys {unexpected[:5]}"
+        dc.send(f"♻️ resumed {len(sd)} linear-attn tensors from {args.resume}")
     student.config.use_cache = False
     if args.no_grad_checkpoint:
         print("[checkpoint] student gradient checkpointing disabled", flush=True)
@@ -286,6 +297,7 @@ def main():
     skipped = 0        # steps dropped by the NaN/inf guard (kept out of the weights)
     consec_skip = 0
     plateau_win, prev_mean, plateau_strikes = [], None, 0
+    plateau_len = args.plateau_every
     opt.zero_grad(set_to_none=True)
 
     while step < args.steps:
@@ -346,11 +358,17 @@ def main():
             running = {kk: 0.0 for kk in running}
 
         # ---- plateau early-stop (mean loss per window; <eps improvement for
-        # `patience` consecutive windows => converged, stop) ----
+        # `patience` consecutive windows => converged, stop). With
+        # --plateau-doubling the window doubles after each check: a power-law
+        # descent improves a CONSTANT amount per doubling, so this variant only
+        # fires on a genuine flatline (fixed-width windows false-trigger on any
+        # healthy power law once slope*window/step < eps). ----
         plateau_win.append(micro_loss)
-        if len(plateau_win) >= args.plateau_every:
+        if len(plateau_win) >= plateau_len:
             cur_mean = sum(plateau_win) / len(plateau_win)
             plateau_win.clear()
+            if args.plateau_doubling:
+                plateau_len *= 2
             if prev_mean is not None and prev_mean > 0:
                 improve = (prev_mean - cur_mean) / prev_mean
                 dc.send(f"📉 plateau check @ {step}: window mean {cur_mean:.4f} "
