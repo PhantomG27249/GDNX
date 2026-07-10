@@ -238,4 +238,10 @@ For issues or questions:
 - Check `code/training/gdn3_upgrade.py` line ~497 for `_compact_vec` implementation
 - Tune `self.slow_decay` in `GDN3LinearAttn.__init__()` for your use case
 
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
+
 **Happy building!** 🚀
