@@ -464,6 +464,16 @@ def test_merge_rejects_non_tensor_and_cross_device_block_inputs() -> None:
             ),
             "state.*value",
         ),
+        (
+            ExactCacheState(
+                keys=torch.zeros(2, 4, 3, 5),
+                values=torch.zeros(2, 4, 3, 7),
+                scores=torch.zeros(2, 4, 3),
+                positions=torch.zeros(2, 4, 3, dtype=torch.int64),
+                valid=torch.ones(2, 4, 3, dtype=torch.bool),
+            ),
+            "state.*width",
+        ),
     ],
 )
 def test_merge_rejects_state_shape_mismatches(
@@ -566,11 +576,11 @@ def test_merge_ignores_nonfinite_key_values_at_invalid_block_positions() -> None
 
 def test_merge_ignores_nonfinite_key_values_in_invalid_persistent_slots() -> None:
     prior = ExactCacheState(
-        keys=torch.tensor([[[[float("nan")]]]]),
-        values=torch.tensor([[[[float("-inf")]]]]),
-        scores=torch.tensor([[[float("inf")]]]),
-        positions=torch.tensor([[[99]]]),
-        valid=torch.tensor([[[False]]]),
+        keys=torch.tensor([[[[float("nan")], [float("inf")]]]]),
+        values=torch.tensor([[[[float("-inf")], [float("nan")]]]]),
+        scores=torch.tensor([[[float("inf"), float("nan")]]]),
+        positions=torch.tensor([[[99, 98]]]),
+        valid=torch.tensor([[[False, False]]]),
     )
 
     state = merge_persistent_cache(
@@ -768,12 +778,12 @@ def test_cache_read_prior_outputs_are_invariant_to_future_block_changes() -> Non
 def test_cache_read_masks_future_block_indices_even_when_positions_are_visible() -> None:
     _, diagnostics = exact_cache_module.cache_read_blocks(
         torch.ones(1, 2, 1, 1),
-        torch.tensor([[100, 100]]),
+        torch.tensor([[100, 0]]),
         None,
         torch.ones(1, 2, 1, 1),
         torch.tensor([[[[10.0]], [[9000.0]]]]),
         torch.zeros(1, 2, 1),
-        torch.tensor([[0, 0]]),
+        torch.tensor([[100, 0]]),
         torch.ones(1, 2, dtype=torch.bool),
         _cache_config(),
         torch.ones(1),
@@ -783,7 +793,7 @@ def test_cache_read_masks_future_block_indices_even_when_positions_are_visible()
 
     torch.testing.assert_close(
         diagnostics.candidate_valid,
-        torch.tensor([[[[True, False]], [[True, True]]]]),
+        torch.tensor([[[[True, False]], [[False, True]]]]),
     )
 
 
@@ -828,6 +838,36 @@ def test_cache_read_sink_only_is_exact_zero_and_has_sink_semantics() -> None:
     assert torch.equal(diagnostics.sink_mass, torch.ones(1, 2, 2))
     assert torch.equal(diagnostics.top1_positions, torch.full((1, 2, 2), -1))
     assert torch.equal(diagnostics.attention_entropy, torch.zeros(1, 2, 2))
+
+
+def test_cache_read_persistent_only_allows_an_empty_current_block() -> None:
+    state = ExactCacheState(
+        keys=torch.ones(1, 1, 1, 1),
+        values=torch.full((1, 1, 1, 1), 4.0),
+        scores=torch.ones(1, 1, 1),
+        positions=torch.tensor([[[3]]]),
+        valid=torch.ones(1, 1, 1, dtype=torch.bool),
+    )
+
+    y_cache, diagnostics = exact_cache_module.cache_read_blocks(
+        torch.ones(1, 2, 1, 1),
+        torch.tensor([[5, 6]]),
+        state,
+        torch.empty(1, 0, 1, 1),
+        torch.empty(1, 0, 1, 1),
+        torch.empty(1, 0, 1),
+        torch.empty(1, 0, dtype=torch.int64),
+        torch.empty(1, 0, dtype=torch.bool),
+        _cache_config(width=1),
+        torch.ones(1),
+        torch.ones(1),
+        torch.zeros(1),
+    )
+    expected_mass = torch.softmax(torch.tensor([1.0, 0.0]), dim=0)[0]
+
+    torch.testing.assert_close(y_cache, torch.full((1, 2, 1, 1), 4.0 * expected_mass))
+    assert diagnostics.block_bytes == 0
+    assert diagnostics.candidate_valid.all()
 
 
 def test_cache_read_learned_sink_competes_with_candidates() -> None:
@@ -886,8 +926,124 @@ def test_cache_read_bfloat16_roundtrips_block_storage_before_fp32_read() -> None
     assert not torch.equal(fp32, bf16)
 
 
+def _cache_read_autocast_case(
+    device: torch.device,
+) -> tuple[dict[str, object], tuple[torch.Tensor, ...]]:
+    generator = torch.Generator(device=device).manual_seed(8128)
+    q = torch.randn(1, 2, 2, 3, generator=generator, device=device).requires_grad_()
+    block_k = torch.randn(
+        1, 2, 2, 3, generator=generator, device=device
+    ).requires_grad_()
+    block_v = torch.randn(
+        1, 2, 2, 4, generator=generator, device=device
+    ).requires_grad_()
+    gamma_q = torch.randn(3, generator=generator, device=device).requires_grad_()
+    gamma_k = torch.randn(3, generator=generator, device=device).requires_grad_()
+    sink_logit = torch.randn(2, generator=generator, device=device).requires_grad_()
+    differentiable = (q, block_k, block_v, gamma_q, gamma_k, sink_logit)
+    kwargs: dict[str, object] = {
+        "q_eff": q,
+        "query_positions": torch.tensor([[5, 6]], device=device),
+        "state": None,
+        "block_k": block_k,
+        "block_v": block_v,
+        "block_scores": torch.zeros(1, 2, 2, device=device),
+        "block_positions": torch.tensor([[5, 6]], device=device),
+        "block_valid": torch.ones(1, 2, dtype=torch.bool, device=device),
+        "config": _cache_config(read="rmsnorm"),
+        "gamma_q": gamma_q,
+        "gamma_k": gamma_k,
+        "sink_logit": sink_logit,
+    }
+    return kwargs, differentiable
+
+
+def _clone_cache_read_autocast_case(
+    kwargs: dict[str, object],
+    differentiable: tuple[torch.Tensor, ...],
+) -> tuple[dict[str, object], tuple[torch.Tensor, ...]]:
+    clones = tuple(
+        tensor.detach().clone().requires_grad_(True) for tensor in differentiable
+    )
+    cloned_kwargs = dict(kwargs)
+    for name, clone in zip(
+        ("q_eff", "block_k", "block_v", "gamma_q", "gamma_k", "sink_logit"),
+        clones,
+        strict=True,
+    ):
+        cloned_kwargs[name] = clone
+    return cloned_kwargs, clones
+
+
+def _assert_cache_read_disables_ambient_autocast(
+    device_type: str,
+    autocast_dtype: torch.dtype,
+) -> None:
+    device = torch.device(device_type)
+    baseline_kwargs, baseline_inputs = _cache_read_autocast_case(device)
+    autocast_kwargs, autocast_inputs = _clone_cache_read_autocast_case(
+        baseline_kwargs, baseline_inputs
+    )
+
+    baseline_y, baseline_diagnostics = exact_cache_module.cache_read_blocks(
+        **baseline_kwargs  # type: ignore[arg-type]
+    )
+    with torch.autocast(device_type=device_type, dtype=autocast_dtype):
+        autocast_y, autocast_diagnostics = exact_cache_module.cache_read_blocks(
+            **autocast_kwargs  # type: ignore[arg-type]
+        )
+
+    floating_results = (
+        autocast_y,
+        autocast_diagnostics.attention_weights,
+        autocast_diagnostics.attention_entropy,
+        autocast_diagnostics.top1_mass,
+        autocast_diagnostics.sink_mass,
+    )
+    assert all(result.dtype == torch.float32 for result in floating_results)
+    for autocast_result, baseline_result in zip(
+        floating_results,
+        (
+            baseline_y,
+            baseline_diagnostics.attention_weights,
+            baseline_diagnostics.attention_entropy,
+            baseline_diagnostics.top1_mass,
+            baseline_diagnostics.sink_mass,
+        ),
+        strict=True,
+    ):
+        torch.testing.assert_close(autocast_result, baseline_result)
+
+    baseline_loss = (
+        baseline_y.square().sum() + baseline_diagnostics.attention_entropy.sum()
+    )
+    autocast_loss = (
+        autocast_y.square().sum() + autocast_diagnostics.attention_entropy.sum()
+    )
+    baseline_grads = torch.autograd.grad(baseline_loss, baseline_inputs)
+    autocast_grads = torch.autograd.grad(autocast_loss, autocast_inputs)
+    for autocast_grad, baseline_grad in zip(
+        autocast_grads, baseline_grads, strict=True
+    ):
+        assert torch.isfinite(autocast_grad).all()
+        torch.testing.assert_close(autocast_grad, baseline_grad)
+
+
+def test_cache_read_disables_ambient_cpu_autocast_and_preserves_fp32_gradients() -> None:
+    _assert_cache_read_disables_ambient_autocast("cpu", torch.bfloat16)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cache_read_disables_ambient_cuda_autocast_and_preserves_fp32_gradients() -> None:
+    _assert_cache_read_disables_ambient_autocast("cuda", torch.float16)
+
+
 def test_cache_read_gradients_flow_only_through_differentiable_read_inputs() -> None:
-    q = torch.tensor([[[[1.0, 2.0]]]], requires_grad=True)
+    q = torch.tensor(
+        [[[[1.0, 2.0]], [[2.0, -1.0]]]],
+        requires_grad=True,
+    )
     block_k = torch.tensor(
         [[[[2.0, -1.0]], [[1.0, 1.0]]]],
         requires_grad=True,
@@ -903,7 +1059,7 @@ def test_cache_read_gradients_flow_only_through_differentiable_read_inputs() -> 
 
     y_cache, diagnostics = exact_cache_module.cache_read_blocks(
         q,
-        torch.tensor([[2]]),
+        torch.tensor([[1, 2]]),
         None,
         block_k,
         block_v,
@@ -1009,8 +1165,8 @@ def test_cache_read_width_zero_uses_current_block_only() -> None:
         valid=torch.empty(1, 2, 0, dtype=torch.bool),
     )
     y_cache, diagnostics = exact_cache_module.cache_read_blocks(
-        torch.ones(1, 1, 2, 1),
-        torch.tensor([[101]]),
+        torch.ones(1, 2, 2, 1),
+        torch.tensor([[100, 102]]),
         empty_state,
         torch.ones(1, 2, 2, 1),
         torch.tensor([2.0, 20.0, 4.0, 40.0]).reshape(1, 2, 2, 1),
@@ -1022,16 +1178,26 @@ def test_cache_read_width_zero_uses_current_block_only() -> None:
         torch.ones(1),
         torch.zeros(2),
     )
-    expected_mass = torch.softmax(torch.tensor([1.0, 0.0]), dim=0)[0]
+    first_mass = torch.softmax(torch.tensor([1.0, 0.0]), dim=0)[0]
+    second_mass = torch.softmax(torch.tensor([1.0, 1.0, 0.0]), dim=0)[0]
 
     assert diagnostics.persistent_selected_positions.shape == (1, 2, 0)
     torch.testing.assert_close(
         diagnostics.hit_ready_positions,
-        torch.tensor([[[[100, -1], [100, -1]]]]),
+        torch.tensor(
+            [[[[100, -1], [100, -1]], [[100, 102], [100, 102]]]]
+        ),
     )
     torch.testing.assert_close(
         y_cache,
-        torch.tensor([[[[2.0], [20.0]]]]) * expected_mass,
+        torch.tensor(
+            [
+                [
+                    [[2.0 * first_mass], [20.0 * first_mass]],
+                    [[(2.0 + 4.0) * second_mass], [(20.0 + 40.0) * second_mass]],
+                ]
+            ]
+        ),
     )
     assert diagnostics.persistent_bytes == 0
 
@@ -1097,6 +1263,30 @@ def _valid_cache_read_kwargs() -> dict[str, object]:
         "gamma_k": torch.ones(5),
         "sink_logit": torch.zeros(4),
     }
+
+
+def test_cache_read_rejects_current_block_length_different_from_query_steps() -> None:
+    kwargs = _valid_cache_read_kwargs()
+    kwargs.update(
+        {
+            "block_k": torch.ones(2, 2, 4, 5),
+            "block_v": torch.ones(2, 2, 4, 7),
+            "block_scores": torch.zeros(2, 2, 4),
+            "block_positions": torch.arange(2, dtype=torch.int64).expand(2, 2),
+            "block_valid": torch.ones(2, 2, dtype=torch.bool),
+        }
+    )
+
+    with pytest.raises(ValueError, match="block length.*query steps"):
+        exact_cache_module.cache_read_blocks(**kwargs)  # type: ignore[arg-type]
+
+
+def test_cache_read_rejects_current_block_positions_different_from_queries() -> None:
+    kwargs = _valid_cache_read_kwargs()
+    kwargs["block_positions"] = torch.tensor([[0, 99, 2], [0, 1, 2]])
+
+    with pytest.raises(ValueError, match="block_positions.*query_positions"):
+        exact_cache_module.cache_read_blocks(**kwargs)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(

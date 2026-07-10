@@ -331,6 +331,8 @@ def _validate_merge_inputs(
             raise ValueError("state batch dimension must match block_k")
         if state.keys.shape[1] != heads:
             raise ValueError("state head dimension must match block_k")
+        if state.keys.shape[2] != width:
+            raise ValueError("state width dimension must match requested width")
         if state.keys.shape[-1] != key_dim:
             raise ValueError("state key dimension must match block_k")
         if state.values.shape[-1] != value_dim:
@@ -608,6 +610,16 @@ def _validate_cache_read_inputs(
         raise ValueError("all cache-read tensors must share a device")
     device = q_eff.device
 
+    if block_length > 0:
+        if block_length != steps:
+            raise ValueError(
+                "current block length must equal query steps when the block is nonempty"
+            )
+        if not torch.equal(block_positions.detach(), query_positions.detach()):
+            raise ValueError(
+                "block_positions must exactly equal query_positions for a nonempty current block"
+            )
+
     if state is not None:
         if state.keys.shape[0] != batch:
             raise ValueError("state batch dimension must match q_eff")
@@ -660,6 +672,8 @@ def _validate_cache_read_inputs(
     return batch, steps, heads, key_dim, value_dim, block_length
 
 
+@torch.autocast(device_type="cuda", enabled=False)
+@torch.autocast(device_type="cpu", enabled=False)
 def cache_read_blocks(
     q_eff: torch.Tensor,
     query_positions: torch.Tensor,
@@ -974,6 +988,8 @@ def _validate_reference_scan_inputs(
     return batch, steps, heads, slots, key_dim, value_dim
 
 
+@torch.autocast(device_type="cuda", enabled=False)
+@torch.autocast(device_type="cpu", enabled=False)
 def reference_scan_with_scores(
     q: torch.Tensor,
     k: torch.Tensor,

@@ -310,6 +310,87 @@ def test_non_float64_inputs_compute_and_return_float32(
     assert score.dtype == torch.float32
 
 
+@pytest.mark.parametrize(
+    ("input_dtype", "expected_dtype"),
+    [
+        (torch.float32, torch.float32),
+        (torch.float64, torch.float64),
+    ],
+)
+def test_reference_scan_disables_ambient_cpu_autocast_and_preserves_gradients(
+    input_dtype: torch.dtype,
+    expected_dtype: torch.dtype,
+) -> None:
+    baseline_inputs = _random_inputs(dtype=input_dtype, slots=4)
+    autocast_inputs = tuple(
+        tensor.detach().clone().requires_grad_(True) for tensor in baseline_inputs
+    )
+
+    baseline_y, baseline_score = reference_scan_with_scores(
+        *baseline_inputs[:6], out_mix=baseline_inputs[6]
+    )
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        autocast_y, autocast_score = reference_scan_with_scores(
+            *autocast_inputs[:6], out_mix=autocast_inputs[6]
+        )
+
+    assert autocast_y.dtype == expected_dtype
+    assert autocast_score.dtype == expected_dtype
+    torch.testing.assert_close(autocast_y, baseline_y)
+    torch.testing.assert_close(autocast_score, baseline_score)
+
+    baseline_grads = torch.autograd.grad(baseline_y.square().sum(), baseline_inputs)
+    autocast_grads = torch.autograd.grad(autocast_y.square().sum(), autocast_inputs)
+    for autocast_grad, baseline_grad in zip(
+        autocast_grads, baseline_grads, strict=True
+    ):
+        assert torch.isfinite(autocast_grad).all()
+        torch.testing.assert_close(autocast_grad, baseline_grad)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize(
+    ("input_dtype", "expected_dtype"),
+    [
+        (torch.float32, torch.float32),
+        (torch.float64, torch.float64),
+    ],
+)
+def test_reference_scan_disables_ambient_cuda_autocast_and_preserves_gradients(
+    input_dtype: torch.dtype,
+    expected_dtype: torch.dtype,
+) -> None:
+    baseline_inputs = tuple(
+        tensor.detach().cuda().requires_grad_(True)
+        for tensor in _random_inputs(dtype=input_dtype, slots=4)
+    )
+    autocast_inputs = tuple(
+        tensor.detach().clone().requires_grad_(True) for tensor in baseline_inputs
+    )
+
+    baseline_y, baseline_score = reference_scan_with_scores(
+        *baseline_inputs[:6], out_mix=baseline_inputs[6]
+    )
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        autocast_y, autocast_score = reference_scan_with_scores(
+            *autocast_inputs[:6], out_mix=autocast_inputs[6]
+        )
+
+    assert autocast_y.dtype == expected_dtype
+    assert autocast_score.dtype == expected_dtype
+    torch.testing.assert_close(autocast_y, baseline_y)
+    torch.testing.assert_close(autocast_score, baseline_score)
+
+    baseline_grads = torch.autograd.grad(baseline_y.square().sum(), baseline_inputs)
+    autocast_grads = torch.autograd.grad(autocast_y.square().sum(), autocast_inputs)
+    for autocast_grad, baseline_grad in zip(
+        autocast_grads, baseline_grads, strict=True
+    ):
+        assert torch.isfinite(autocast_grad).all()
+        torch.testing.assert_close(autocast_grad, baseline_grad)
+
+
 def _valid_shape_inputs() -> list[torch.Tensor | None]:
     return [
         torch.zeros(1, 2, 2, 4, 3),
