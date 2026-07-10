@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import os
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -591,6 +592,165 @@ def test_cache_state_is_discarded_between_full_recompute_calls(
     assert not any(
         name in vars(exact)
         for name in ("cache_state", "persistent_cache", "_cache_state")
+    )
+
+
+def _run_full_forward_with_gradients(
+    model,
+    hidden: torch.Tensor,
+    probe: torch.Tensor,
+    autocast_context,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
+    targets = [
+        hidden,
+        model.cache_gamma_q,
+        model.cache_gamma_k,
+        model.cache_sink_logit,
+        model.cache_amplitude,
+    ]
+    if model.r_out > 1:
+        targets.append(model.out_mix)
+    with autocast_context:
+        output = model(hidden)
+        loss = (output.float() * probe).sum()
+    gradients = torch.autograd.grad(loss, targets)
+    return output, gradients
+
+
+def _assert_fp32_cache_diagnostics(model) -> None:
+    diagnostics = model.last_cache_diagnostics
+    assert diagnostics is not None
+    for tensor in (
+        diagnostics.update_scores,
+        diagnostics.state_output_norm,
+        diagnostics.cache_output_norm,
+        diagnostics.final_output_norm,
+        diagnostics.final_selected_scores,
+    ):
+        assert tensor.dtype == torch.float32
+    for block in diagnostics.blocks:
+        for tensor in (
+            block.attention_entropy,
+            block.top1_mass,
+            block.sink_mass,
+        ):
+            assert tensor.dtype == torch.float32
+
+
+def _exercise_full_forward_autocast(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    device: torch.device,
+    autocast_dtype: torch.dtype,
+    r_out: int,
+) -> None:
+    from gdn3 import kmd2_native
+    import research.kmd2_ablation.qwen_exact_cache as qwen_cache
+
+    monkeypatch.setattr(kmd2_native, "_FAST_SCAN", False)
+    monkeypatch.setenv("GDN3_KMD2_ROUT", str(r_out))
+    torch.manual_seed(5700 + r_out)
+    native = KMD2NativeAttn(_model_config(), layer_idx=0).to(device)
+    autocast_model = qwen_cache.KMD2ExactCacheAttn.from_native(
+        native,
+        _model_config(),
+        _cache_config(storage_dtype="bf16"),
+    )
+    with torch.no_grad():
+        autocast_model.cache_amplitude.fill_(0.4)
+        autocast_model.cache_sink_logit.copy_(
+            torch.tensor([-0.2, 0.15], device=device)
+        )
+        if r_out == 4:
+            autocast_model.out_mix.copy_(
+                torch.tensor(
+                    [[0.1, 0.2, 0.3, 0.4], [0.4, 0.3, 0.2, 0.1]],
+                    device=device,
+                )
+            )
+    reference_model = copy.deepcopy(autocast_model)
+
+    q_eff_dtypes: list[torch.dtype] = []
+    original_cache_read = qwen_cache.cache_read_blocks
+
+    def recording_cache_read(*args, **kwargs):
+        q_eff = kwargs.get("q_eff", args[0] if args else None)
+        assert isinstance(q_eff, torch.Tensor)
+        q_eff_dtypes.append(q_eff.dtype)
+        return original_cache_read(*args, **kwargs)
+
+    monkeypatch.setattr(qwen_cache, "cache_read_blocks", recording_cache_read)
+    observed_attention_dtypes: list[torch.dtype] = []
+    autocast_model.set_cache_diagnostic_observer(
+        lambda block: observed_attention_dtypes.append(block.attention_weights.dtype)
+    )
+    generator = torch.Generator(device=device).manual_seed(5750 + r_out)
+    base_hidden = torch.randn(2, 5, 12, generator=generator, device=device) * 0.2
+    autocast_hidden = base_hidden.detach().clone().requires_grad_(True)
+    reference_hidden = base_hidden.detach().clone().requires_grad_(True)
+    probe = torch.randn(2, 5, 12, generator=generator, device=device)
+
+    autocast_output, autocast_gradients = _run_full_forward_with_gradients(
+        autocast_model,
+        autocast_hidden,
+        probe,
+        torch.autocast(
+            device_type=device.type,
+            dtype=autocast_dtype,
+            enabled=True,
+        ),
+    )
+    reference_output, reference_gradients = _run_full_forward_with_gradients(
+        reference_model,
+        reference_hidden,
+        probe,
+        nullcontext(),
+    )
+
+    assert q_eff_dtypes and set(q_eff_dtypes) == {torch.float32}
+    assert observed_attention_dtypes and set(observed_attention_dtypes) == {
+        torch.float32
+    }
+    _assert_fp32_cache_diagnostics(autocast_model)
+    assert bool(torch.isfinite(autocast_output).all())
+    assert _relative_mse(autocast_output, reference_output) < 5.0e-3
+    for actual_gradient, expected_gradient in zip(
+        autocast_gradients, reference_gradients
+    ):
+        assert bool(torch.isfinite(actual_gradient).all())
+        assert _relative_mse(actual_gradient, expected_gradient) < 5.0e-2
+
+
+@pytest.mark.parametrize("r_out", [1, 4])
+def test_full_forward_cpu_bf16_autocast_keeps_cache_boundary_fp32(
+    monkeypatch: pytest.MonkeyPatch,
+    r_out: int,
+) -> None:
+    _exercise_full_forward_autocast(
+        monkeypatch,
+        device=torch.device("cpu"),
+        autocast_dtype=torch.bfloat16,
+        r_out=r_out,
+    )
+
+
+@pytest.mark.cuda
+@pytest.mark.parametrize("r_out", [1, 4])
+@pytest.mark.parametrize("autocast_dtype", [torch.float16, torch.bfloat16])
+def test_full_forward_cuda_autocast_keeps_cache_boundary_fp32(
+    monkeypatch: pytest.MonkeyPatch,
+    r_out: int,
+    autocast_dtype: torch.dtype,
+) -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for Qwen exact-cache autocast coverage")
+    if autocast_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+        pytest.skip("CUDA bfloat16 is not supported on this device")
+    _exercise_full_forward_autocast(
+        monkeypatch,
+        device=torch.device("cuda"),
+        autocast_dtype=autocast_dtype,
+        r_out=r_out,
     )
 
 
@@ -1461,6 +1621,163 @@ def test_two_phase_install_then_optimizer_build_strictly_resumes_new_parameters(
         torch.testing.assert_close(actual.cpu(), expected, rtol=0.0, atol=0.0)
 
 
+def _apply_cache_optimizer_step(model, optimizer, gradient_scale: float) -> None:
+    from research.kmd2_ablation.qwen_exact_cache import named_cache_parameters
+
+    for index, (_, parameter) in enumerate(named_cache_parameters(model), start=1):
+        parameter.grad = torch.full_like(parameter, gradient_scale * index)
+    optimizer.step()
+    optimizer._kmd2_shared_scheduler.step()
+    optimizer.zero_grad(set_to_none=True)
+
+
+def test_scheduler_resume_matches_uninterrupted_state_and_next_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from research.kmd2_ablation.qwen_exact_cache import (
+        build_cache_optimizer,
+        build_cache_resume,
+        named_cache_parameters,
+        strict_load_cache_resume,
+    )
+
+    cache_config = _cache_config()
+    scheduler_spec = {"name": "exponential_lambda", "gamma": 0.9}
+
+    def scheduler_factory(optimizer):
+        return torch.optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda step: 0.9**step,
+        )
+
+    source_model = _exact_cache_model(monkeypatch)
+    source_optimizer = build_cache_optimizer(
+        source_model,
+        cache_config,
+        betas=(0.85, 0.97),
+        eps=1.0e-8,
+        scheduler_factory=scheduler_factory,
+        scheduler_spec=scheduler_spec,
+    )
+    with torch.no_grad():
+        for name, parameter in named_cache_parameters(source_model):
+            if name.endswith(".cache_amplitude"):
+                parameter.fill_(0.4)
+    for step in range(3):
+        _apply_cache_optimizer_step(
+            source_model,
+            source_optimizer,
+            gradient_scale=0.01 * (step + 1),
+        )
+    resume = build_cache_resume(
+        source_model,
+        source_optimizer,
+        job_id="scheduler-job",
+    )
+    assert resume["scheduler_state"]["last_epoch"] == 3
+
+    target_model = _exact_cache_model(monkeypatch)
+    target_optimizer = build_cache_optimizer(
+        target_model,
+        cache_config,
+        betas=(0.85, 0.97),
+        eps=1.0e-8,
+        scheduler_factory=scheduler_factory,
+        scheduler_spec=scheduler_spec,
+    )
+    strict_load_cache_resume(
+        target_model,
+        resume,
+        expected_job_id="scheduler-job",
+        optimizer=target_optimizer,
+    )
+    _assert_nested_equal(
+        target_optimizer._kmd2_shared_scheduler.state_dict(),
+        resume["scheduler_state"],
+    )
+    assert target_optimizer._kmd2_shared_scheduler.last_epoch == 3
+    assert target_optimizer.param_groups[0]["lr"] == source_optimizer.param_groups[0]["lr"]
+
+    _apply_cache_optimizer_step(source_model, source_optimizer, gradient_scale=0.05)
+    _apply_cache_optimizer_step(target_model, target_optimizer, gradient_scale=0.05)
+
+    for (_, source), (_, target) in zip(
+        named_cache_parameters(source_model), named_cache_parameters(target_model)
+    ):
+        torch.testing.assert_close(target, source, rtol=0.0, atol=0.0)
+    _assert_nested_equal(target_optimizer.state_dict(), source_optimizer.state_dict())
+    _assert_nested_equal(
+        target_optimizer._kmd2_shared_scheduler.state_dict(),
+        source_optimizer._kmd2_shared_scheduler.state_dict(),
+    )
+    assert target_optimizer._kmd2_shared_scheduler.last_epoch == 4
+    assert target_optimizer.param_groups[0]["lr"] == source_optimizer.param_groups[0]["lr"]
+
+
+def test_scheduler_load_failure_rolls_back_model_optimizer_and_scheduler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from research.kmd2_ablation.qwen_exact_cache import (
+        build_cache_resume,
+        named_cache_parameters,
+        strict_load_cache_resume,
+    )
+
+    source_model = _exact_cache_model(monkeypatch)
+    source_optimizer = _initialized_cache_optimizer(source_model, _cache_config())
+    resume = build_cache_resume(
+        source_model,
+        source_optimizer,
+        job_id="rollback-job",
+    )
+
+    target_model = _exact_cache_model(monkeypatch)
+    target_optimizer = _initialized_cache_optimizer(target_model, _cache_config())
+    target_scheduler = target_optimizer._kmd2_shared_scheduler
+    target_scheduler.last_epoch = 7
+    with torch.no_grad():
+        for _, parameter in named_cache_parameters(target_model):
+            parameter.add_(0.05)
+        for state in target_optimizer.state.values():
+            state["exp_avg"].zero_()
+
+    parameter_snapshot = {
+        name: parameter.detach().clone()
+        for name, parameter in named_cache_parameters(target_model)
+    }
+    optimizer_snapshot = copy.deepcopy(target_optimizer.state_dict())
+    scheduler_snapshot = copy.deepcopy(target_scheduler.state_dict())
+    scheduler_type = type(target_scheduler)
+    original_load_state_dict = scheduler_type.load_state_dict
+    attempts = 0
+
+    def fail_once(scheduler_self, state_dict):
+        nonlocal attempts
+        assert scheduler_self is target_scheduler
+        attempts += 1
+        if attempts == 1:
+            target_scheduler.last_epoch = 999
+            raise RuntimeError("injected scheduler load failure")
+        return original_load_state_dict(scheduler_self, state_dict)
+
+    monkeypatch.setattr(scheduler_type, "load_state_dict", fail_once)
+    with pytest.raises(RuntimeError, match="injected scheduler load failure"):
+        strict_load_cache_resume(
+            target_model,
+            resume,
+            expected_job_id="rollback-job",
+            optimizer=target_optimizer,
+        )
+
+    assert attempts == 2
+    for name, parameter in named_cache_parameters(target_model):
+        torch.testing.assert_close(
+            parameter, parameter_snapshot[name], rtol=0.0, atol=0.0
+        )
+    _assert_nested_equal(target_optimizer.state_dict(), optimizer_snapshot)
+    _assert_nested_equal(target_scheduler.state_dict(), scheduler_snapshot)
+
+
 def test_installer_rejects_optimizer_state_that_cannot_reference_future_cache_params(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1521,8 +1838,22 @@ def _mutate_resume_envelope(envelope: dict[str, object], case: str) -> None:
         state = envelope["optimizer_state"]["state"]
         first = next(iter(state.values()))
         first["exp_avg"].view(-1)[0] = torch.inf
+    elif case == "scalar_moment":
+        state = envelope["optimizer_state"]["state"]
+        first = next(iter(state.values()))
+        first["exp_avg"] = torch.tensor(0.0, dtype=first["exp_avg"].dtype)
+    elif case == "partial_optimizer_state":
+        state = envelope["optimizer_state"]["state"]
+        first = next(iter(state.values()))
+        first.pop("exp_avg")
     elif case == "scheduler_spec":
         envelope["scheduler_spec"] = {"name": "different"}
+    elif case == "scheduler_missing_key":
+        envelope["scheduler_state"].pop("last_epoch")
+    elif case == "scheduler_nonfinite":
+        envelope["scheduler_state"]["_last_lr"][0] = float("nan")
+    elif case == "scheduler_bad_epoch":
+        envelope["scheduler_state"]["last_epoch"] = 1.0
     else:  # pragma: no cover - test table is exhaustive
         raise AssertionError(case)
 
@@ -1542,7 +1873,12 @@ def _mutate_resume_envelope(envelope: dict[str, object], case: str) -> None:
         "amplitude_range",
         "optimizer_order",
         "optimizer_nonfinite",
+        "scalar_moment",
+        "partial_optimizer_state",
         "scheduler_spec",
+        "scheduler_missing_key",
+        "scheduler_nonfinite",
+        "scheduler_bad_epoch",
     ],
 )
 def test_failed_strict_resume_rejects_corruption_without_model_or_optimizer_mutation(
@@ -1564,6 +1900,9 @@ def test_failed_strict_resume_rejects_corruption_without_model_or_optimizer_muta
         for name, parameter in named_cache_parameters(model)
     }
     optimizer_snapshot = copy.deepcopy(optimizer.state_dict())
+    scheduler_snapshot = copy.deepcopy(
+        optimizer._kmd2_shared_scheduler.state_dict()
+    )
 
     with pytest.raises((KeyError, TypeError, ValueError), match="resume"):
         strict_load_cache_resume(
@@ -1578,6 +1917,10 @@ def test_failed_strict_resume_rejects_corruption_without_model_or_optimizer_muta
             parameter, parameter_snapshot[name], rtol=0.0, atol=0.0
         )
     _assert_nested_equal(optimizer.state_dict(), optimizer_snapshot)
+    _assert_nested_equal(
+        optimizer._kmd2_shared_scheduler.state_dict(),
+        scheduler_snapshot,
+    )
 
 
 def _relative_mse(actual: torch.Tensor, expected: torch.Tensor) -> float:

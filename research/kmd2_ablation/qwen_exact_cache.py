@@ -7,6 +7,7 @@ Importing it opts into the optional Transformers-backed Qwen implementation.
 from __future__ import annotations
 
 import copy
+import math
 import os
 import tempfile
 from collections.abc import Mapping
@@ -33,7 +34,7 @@ CACHE_PARAMETER_BASENAMES = (
     "cache_sink_logit",
     "cache_amplitude",
 )
-CACHE_RESUME_SCHEMA_VERSION = 1
+CACHE_RESUME_SCHEMA_VERSION = 2
 _CACHE_RESUME_FIELDS = {
     "schema_version",
     "job_id",
@@ -42,6 +43,7 @@ _CACHE_RESUME_FIELDS = {
     "optimizer_parameter_names",
     "optimizer_state",
     "scheduler_spec",
+    "scheduler_state",
 }
 
 
@@ -447,10 +449,14 @@ class KMD2ExactCacheAttn(KMD2NativeAttn):
         )
         return y_state, update_scores
 
+    @torch.autocast(device_type="cuda", enabled=False)
+    @torch.autocast(device_type="cpu", enabled=False)
     def _effective_query(self, q: torch.Tensor) -> torch.Tensor:
         if self.r_out == 1:
-            return q[:, :, :, 0, :]
-        return torch.einsum("bthrd,hr->bthd", q, self.out_mix.float())
+            return q[:, :, :, 0, :].float()
+        return torch.einsum(
+            "bthrd,hr->bthd", q.float(), self.out_mix.float()
+        )
 
     def _scan(
         self,
@@ -845,6 +851,23 @@ def _clone_resume_value(value: object) -> object:
     return copy.deepcopy(value)
 
 
+def _bound_cache_scheduler(
+    optimizer: torch.optim.Optimizer,
+    *,
+    context: str,
+):
+    scheduler = getattr(optimizer, "_kmd2_shared_scheduler", None)
+    if scheduler is None or getattr(scheduler, "optimizer", None) is not optimizer:
+        raise ValueError(
+            f"{context} optimizer must own an actual bound cache scheduler"
+        )
+    if not callable(getattr(scheduler, "state_dict", None)) or not callable(
+        getattr(scheduler, "load_state_dict", None)
+    ):
+        raise TypeError(f"{context} cache scheduler must support state_dict/load_state_dict")
+    return scheduler
+
+
 def build_cache_resume(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer | None,
@@ -859,6 +882,7 @@ def build_cache_resume(
         optimizer_names: list[list[str]] = []
         optimizer_state = None
         scheduler_spec = None
+        scheduler_state = None
     else:
         optimizer_names = _optimizer_parameter_names(
             model, optimizer, context="resume"
@@ -867,6 +891,8 @@ def build_cache_resume(
         scheduler_spec = _clone_resume_value(
             getattr(optimizer, "_kmd2_scheduler_spec", None)
         )
+        scheduler = _bound_cache_scheduler(optimizer, context="resume")
+        scheduler_state = _clone_resume_value(scheduler.state_dict())
     return {
         "schema_version": CACHE_RESUME_SCHEMA_VERSION,
         "job_id": job_id,
@@ -877,6 +903,7 @@ def build_cache_resume(
         "optimizer_parameter_names": optimizer_names,
         "optimizer_state": optimizer_state,
         "scheduler_spec": scheduler_spec,
+        "scheduler_state": scheduler_state,
     }
 
 
@@ -940,10 +967,14 @@ def _validate_optimizer_resume_state(
     if len(groups) != len(optimizer_parameter_names):
         raise ValueError("resume optimizer group count mismatch")
     id_to_parameter: dict[object, torch.nn.Parameter] = {}
+    id_to_expected_fields: dict[object, set[str]] = {}
     referenced_ids: list[object] = []
     for saved_group, names in zip(groups, optimizer_parameter_names):
         if not isinstance(saved_group, Mapping):
             raise TypeError("resume optimizer param_group must be a mapping")
+        amsgrad = saved_group.get("amsgrad", False)
+        if type(amsgrad) is not bool:
+            raise TypeError("resume optimizer amsgrad must be a boolean")
         parameter_ids = saved_group.get("params")
         if not isinstance(parameter_ids, list) or len(parameter_ids) != len(names):
             raise ValueError("resume optimizer param_group size mismatch")
@@ -951,29 +982,127 @@ def _validate_optimizer_resume_state(
             if parameter_id in id_to_parameter:
                 raise ValueError("resume optimizer repeats a parameter id")
             id_to_parameter[parameter_id] = model_parameters[name]
+            expected_fields = {"step", "exp_avg", "exp_avg_sq"}
+            if amsgrad:
+                expected_fields.add("max_exp_avg_sq")
+            id_to_expected_fields[parameter_id] = expected_fields
             referenced_ids.append(parameter_id)
     if not set(state).issubset(set(referenced_ids)):
         raise ValueError("resume optimizer state contains an unexpected parameter id")
     for parameter_id, parameter_state in state.items():
         if not isinstance(parameter_state, Mapping):
             raise TypeError("resume optimizer per-parameter state must be a mapping")
+        if set(parameter_state) != id_to_expected_fields[parameter_id]:
+            raise KeyError(
+                "resume optimizer per-parameter AdamW state has missing or "
+                "unexpected fields"
+            )
         parameter = id_to_parameter[parameter_id]
         for state_name, value in parameter_state.items():
             if not isinstance(value, torch.Tensor):
-                continue
+                raise TypeError(
+                    f"resume optimizer state {state_name} must be a tensor"
+                )
             if not bool(torch.isfinite(value.detach()).all()):
                 raise ValueError(
                     f"resume optimizer state {state_name} is nonfinite"
                 )
-            if value.numel() != 1:
-                if tuple(value.shape) != tuple(parameter.shape):
-                    raise ValueError(
-                        f"resume optimizer state {state_name} shape mismatch"
-                    )
-                if value.dtype != parameter.dtype:
+            if state_name == "step":
+                if value.ndim != 0 or value.dtype not in {
+                    torch.float32,
+                    torch.float64,
+                }:
                     raise TypeError(
-                        f"resume optimizer state {state_name} dtype mismatch"
+                        "resume optimizer state step must be a scalar float32/float64 tensor"
                     )
+                continue
+            if tuple(value.shape) != tuple(parameter.shape):
+                raise ValueError(
+                    f"resume optimizer state {state_name} shape mismatch"
+                )
+            if value.dtype != parameter.dtype:
+                raise TypeError(
+                    f"resume optimizer state {state_name} dtype mismatch"
+                )
+
+
+def _validate_scheduler_structure(
+    saved: object,
+    current: object,
+    *,
+    path: str,
+) -> None:
+    if isinstance(current, Mapping):
+        if not isinstance(saved, Mapping) or set(saved) != set(current):
+            raise KeyError(f"resume scheduler structure mismatch at {path}")
+        for key in current:
+            _validate_scheduler_structure(
+                saved[key], current[key], path=f"{path}.{key}"
+            )
+        return
+    if isinstance(current, (list, tuple)):
+        if type(saved) is not type(current) or len(saved) != len(current):
+            raise ValueError(f"resume scheduler sequence mismatch at {path}")
+        for index, (saved_item, current_item) in enumerate(zip(saved, current)):
+            _validate_scheduler_structure(
+                saved_item,
+                current_item,
+                path=f"{path}[{index}]",
+            )
+        return
+    if isinstance(current, torch.Tensor):
+        if not isinstance(saved, torch.Tensor):
+            raise TypeError(f"resume scheduler tensor missing at {path}")
+        if saved.shape != current.shape or saved.dtype != current.dtype:
+            raise TypeError(f"resume scheduler tensor shape/dtype mismatch at {path}")
+        if not bool(torch.isfinite(saved.detach()).all()):
+            raise ValueError(f"resume scheduler tensor is nonfinite at {path}")
+        return
+    if current is None:
+        if saved is not None:
+            raise TypeError(f"resume scheduler expected None at {path}")
+        return
+    if type(saved) is not type(current):
+        raise TypeError(f"resume scheduler value type mismatch at {path}")
+    if isinstance(saved, float) and not math.isfinite(saved):
+        raise ValueError(f"resume scheduler value is nonfinite at {path}")
+
+
+def _validate_scheduler_resume_state(
+    scheduler_state: object,
+    scheduler: object,
+    optimizer_state: Mapping[str, object],
+) -> None:
+    if not isinstance(scheduler_state, Mapping):
+        raise TypeError("resume scheduler_state must be a mapping")
+    current_state = scheduler.state_dict()
+    _validate_scheduler_structure(
+        scheduler_state,
+        current_state,
+        path="scheduler_state",
+    )
+    last_epoch = scheduler_state.get("last_epoch")
+    if type(last_epoch) is not int or last_epoch < -1:
+        raise ValueError("resume scheduler last_epoch must be an integer >= -1")
+    saved_groups = optimizer_state["param_groups"]
+    last_lrs = scheduler_state.get("_last_lr")
+    base_lrs = scheduler_state.get("base_lrs")
+    if not isinstance(last_lrs, list) or len(last_lrs) != len(saved_groups):
+        raise ValueError("resume scheduler _last_lr/group count mismatch")
+    if not isinstance(base_lrs, list) or len(base_lrs) != len(saved_groups):
+        raise ValueError("resume scheduler base_lrs/group count mismatch")
+    for index, (last_lr, base_lr, group) in enumerate(
+        zip(last_lrs, base_lrs, saved_groups)
+    ):
+        if last_lr != group.get("lr"):
+            raise ValueError(
+                f"resume scheduler _last_lr disagrees with optimizer group {index}"
+            )
+        initial_lr = group.get("initial_lr", base_lr)
+        if base_lr != initial_lr:
+            raise ValueError(
+                f"resume scheduler base_lr disagrees with optimizer group {index}"
+            )
 
 
 def strict_load_cache_resume(
@@ -1033,10 +1162,17 @@ def strict_load_cache_resume(
         raise TypeError("resume optimizer_parameter_names must be nested lists")
     optimizer_state = envelope["optimizer_state"]
     scheduler_spec = envelope["scheduler_spec"]
+    scheduler_state = envelope["scheduler_state"]
+    scheduler = None
     if optimizer is None:
-        if optimizer_names or optimizer_state is not None or scheduler_spec is not None:
+        if (
+            optimizer_names
+            or optimizer_state is not None
+            or scheduler_spec is not None
+            or scheduler_state is not None
+        ):
             raise ValueError(
-                "resume contains optimizer state but no optimizer was supplied"
+                "resume contains optimizer/scheduler state but no optimizer was supplied"
             )
     else:
         current_optimizer_names = _optimizer_parameter_names(
@@ -1046,14 +1182,20 @@ def strict_load_cache_resume(
             raise ValueError("resume optimizer parameter names/order mismatch")
         if scheduler_spec != getattr(optimizer, "_kmd2_scheduler_spec", None):
             raise ValueError("resume scheduler_spec mismatch")
+        scheduler = _bound_cache_scheduler(optimizer, context="resume")
         _validate_optimizer_resume_state(
             optimizer_state,
             optimizer_names,
             dict(named),
         )
+        _validate_scheduler_resume_state(
+            scheduler_state,
+            scheduler,
+            optimizer_state,
+        )
         current_groups = optimizer.state_dict()["param_groups"]
         saved_groups = optimizer_state["param_groups"]
-        hyperparameters = ("lr", "betas", "eps", "weight_decay")
+        hyperparameters = ("betas", "eps", "weight_decay", "initial_lr")
         for current_group, saved_group in zip(current_groups, saved_groups):
             for field in hyperparameters:
                 if current_group.get(field) != saved_group.get(field):
@@ -1067,18 +1209,24 @@ def strict_load_cache_resume(
     optimizer_snapshot = (
         None if optimizer is None else copy.deepcopy(optimizer.state_dict())
     )
+    scheduler_snapshot = (
+        None if scheduler is None else copy.deepcopy(scheduler.state_dict())
+    )
     try:
         with torch.no_grad():
             for (_, parameter), tensor in zip(named, saved_tensors):
                 parameter.copy_(tensor.to(device=parameter.device))
         if optimizer is not None:
             optimizer.load_state_dict(copy.deepcopy(optimizer_state))
+            scheduler.load_state_dict(copy.deepcopy(scheduler_state))
     except Exception:
         with torch.no_grad():
             for name, parameter in named:
                 parameter.copy_(parameter_snapshots[name])
         if optimizer is not None and optimizer_snapshot is not None:
             optimizer.load_state_dict(optimizer_snapshot)
+        if scheduler is not None and scheduler_snapshot is not None:
+            scheduler.load_state_dict(scheduler_snapshot)
         raise
 
 
