@@ -358,7 +358,7 @@ def build_inventory(repo_root: str | Path) -> dict[str, Any]:
         "compatibility": {
             "tiny": {
                 "tasks": [
-                    "affine",
+                    "affine_associative_regression",
                     "drift_reversal",
                     "far_surprise",
                     "freshness",

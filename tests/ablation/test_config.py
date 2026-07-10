@@ -31,7 +31,7 @@ def minimal_config_dict() -> dict:
             "decode": False,
             "packing": False,
             "padding": "none",
-            "attention_mask": "causal_full_sequence",
+            "attention_mask": "all_ones",
         },
         "baseline": "gdn2_native",
         "mechanism": "exact_cache",
@@ -184,6 +184,62 @@ def test_complete_schema_builds_frozen_nested_configuration():
         config.runtime.device_ordinal = 1
 
 
+def test_task_params_accept_and_freeze_recursive_json_values():
+    raw = minimal_config_dict()
+    raw["task"]["params"] = {
+        "null": None,
+        "boolean": True,
+        "integer": 7,
+        "finite_float": 1.25,
+        "string": "value",
+        "list": [1, {"nested": (False, None)}],
+        "tuple": ("item", 2),
+    }
+
+    config = _build(raw)
+
+    assert config.task.params["list"] == (1, {"nested": (False, None)})
+    assert config.task.params["tuple"] == ("item", 2)
+    assert json.loads(config.canonical_json)["task"]["params"] == {
+        "boolean": True,
+        "finite_float": 1.25,
+        "integer": 7,
+        "list": [1, {"nested": [False, None]}],
+        "null": None,
+        "string": "value",
+        "tuple": ["item", 2],
+    }
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {1: "non-string key"},
+        {"nested": {2: "non-string nested key"}},
+        {"unsupported": {1, 2}},
+        {"unsupported": b"bytes"},
+        {"unsupported": object()},
+        {"non_finite": math.nan},
+        {"nested": [math.inf]},
+    ],
+    ids=[
+        "non-string-key",
+        "nested-non-string-key",
+        "set",
+        "bytes",
+        "object",
+        "nan",
+        "infinity",
+    ],
+)
+def test_task_params_reject_non_json_values_during_construction(params):
+    raw = minimal_config_dict()
+    raw["task"]["params"] = params
+
+    with pytest.raises((TypeError, ValueError), match=r"task\.params"):
+        _build(raw)
+
+
 def test_canonical_json_and_experiment_id_are_stable_sha256():
     config = _build()
     canonical = json.dumps(
@@ -216,15 +272,27 @@ def test_json_key_order_and_explicit_runtime_fields_do_not_change_identity():
     assert "runtime" not in semantic
 
 
-@pytest.mark.parametrize(
-    "backend", ["tiny", "qwen", "torch_reference", "qwen_native"]
-)
-def test_public_and_legacy_backend_names_are_accepted_and_preserved(backend):
+@pytest.mark.parametrize("backend", ["tiny", "qwen"])
+def test_public_backend_names_are_accepted_and_preserved(backend):
     config = _build(_changed("backend", backend))
 
     assert config.backend == backend
     assert config.semantic_dict()["backend"] == backend
     assert json.loads(config.canonical_json)["backend"] == backend
+
+
+@pytest.mark.parametrize(
+    ("alias", "canonical"),
+    [("torch_reference", "tiny"), ("qwen_native", "qwen")],
+)
+def test_backend_aliases_share_canonical_identity(alias, canonical):
+    alias_config = _build(_changed("backend", alias))
+    canonical_config = _build(_changed("backend", canonical))
+
+    assert alias_config.backend == canonical
+    assert alias_config.semantic_dict()["backend"] == canonical
+    assert alias_config.canonical_json == canonical_config.canonical_json
+    assert alias_config.experiment_id == canonical_config.experiment_id
 
 
 @pytest.mark.parametrize("run_mode", ["reliance", "heal", "initial_exact_cache"])
@@ -647,6 +715,13 @@ def test_schema_versions_enums_and_execution_preferences_are_validated(
         _build(_changed(field, value))
 
 
+@pytest.mark.parametrize("attention_mask", ["none", "all_ones"])
+def test_initial_exact_cache_accepts_only_approved_attention_masks(attention_mask):
+    config = _build(_changed("qwen.attention_mask", attention_mask))
+
+    assert config.qwen.attention_mask == attention_mask
+
+
 @pytest.mark.parametrize(
     ("field", "value"),
     [
@@ -655,6 +730,7 @@ def test_schema_versions_enums_and_execution_preferences_are_validated(
         ("qwen.decode", True),
         ("qwen.packing", True),
         ("qwen.padding", "pad_to_longest"),
+        ("qwen.attention_mask", "causal_full_sequence"),
         ("qwen.attention_mask", "packed_segments"),
     ],
 )

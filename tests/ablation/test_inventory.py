@@ -236,7 +236,7 @@ def test_inventory_declares_backend_task_compatibility():
     assert compatibility == {
         "tiny": {
             "tasks": [
-                "affine",
+                "affine_associative_regression",
                 "drift_reversal",
                 "far_surprise",
                 "freshness",
@@ -267,6 +267,18 @@ def test_inventory_declares_backend_task_compatibility():
     for record in compatibility.values():
         assert record["tasks"] == sorted(record["tasks"])
         assert record["run_modes"] == sorted(record["run_modes"])
+
+
+def test_inventory_tasks_are_all_accepted_by_configuration_registry():
+    inventory = _inventory_module().build_inventory(REPO_ROOT)
+    config_module = importlib.import_module("research.kmd2_ablation.config")
+
+    assert "affine_associative_regression" in inventory["compatibility"]["tiny"][
+        "tasks"
+    ]
+    assert "affine" not in inventory["compatibility"]["tiny"]["tasks"]
+    for record in inventory["compatibility"].values():
+        assert set(record["tasks"]) <= config_module._TASKS
 
 
 def test_inventory_uses_logical_external_qwen_assets_without_checkout_paths():

@@ -14,7 +14,8 @@ from typing import Any
 SCHEMA_VERSION = "1.0.0"
 SUITE_VERSION = "1.0.0"
 
-_BACKENDS = {"tiny", "qwen", "torch_reference", "qwen_native"}
+_BACKEND_ALIASES = {"torch_reference": "tiny", "qwen_native": "qwen"}
+_BACKENDS = {"tiny", "qwen", *_BACKEND_ALIASES}
 _QWEN_RUN_MODES = {"reliance", "heal", "initial_exact_cache"}
 _BASELINES = {"gdn2_native", "kmd2_native", "native_continuation"}
 _MECHANISMS = {
@@ -474,6 +475,32 @@ def _freeze(value: Any) -> Any:
     return value
 
 
+def _freeze_json(value: Any, path: str) -> Any:
+    """Validate a JSON value recursively while returning frozen containers."""
+    value_type = type(value)
+    if value is None or value_type in (bool, int, str):
+        return value
+    if value_type is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{path} float values must be finite")
+        return value
+    if isinstance(value, Mapping):
+        frozen = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                raise TypeError(f"{path} mapping keys must be strings")
+            frozen[key] = _freeze_json(item, f"{path}[{key!r}]")
+        return MappingProxyType(frozen)
+    if isinstance(value, (list, tuple)):
+        return tuple(
+            _freeze_json(item, f"{path}[{index}]")
+            for index, item in enumerate(value)
+        )
+    raise TypeError(
+        f"{path} contains unsupported JSON value type {value_type.__name__}"
+    )
+
+
 def _plain(value: Any) -> Any:
     """Return a fresh JSON-compatible representation of frozen values."""
     if is_dataclass(value) and not isinstance(value, type):
@@ -597,7 +624,6 @@ def _validate_qwen_config(qwen: Mapping[str, Any]) -> None:
     if qwen["attention_mask"] not in {
         "none",
         "all_ones",
-        "causal_full_sequence",
     }:
         raise ValueError(
             "initial exact-cache qwen mode requires an unpadded full-sequence "
@@ -763,6 +789,7 @@ class ExperimentConfig:
         _require_choice("schema_version", raw["schema_version"], {SCHEMA_VERSION})
         _require_choice("suite_version", raw["suite_version"], {SUITE_VERSION})
         _require_choice("backend", raw["backend"], _BACKENDS)
+        backend = _BACKEND_ALIASES.get(raw["backend"], raw["backend"])
         _require_choice("baseline", raw["baseline"], _BASELINES)
         _require_choice("mechanism", raw["mechanism"], _MECHANISMS)
         _require_choice("variant", raw["variant"], _VARIANTS)
@@ -801,12 +828,15 @@ class ExperimentConfig:
         return cls(
             schema_version=raw["schema_version"],
             suite_version=raw["suite_version"],
-            backend=raw["backend"],
+            backend=backend,
             qwen=QwenConfig(**qwen),
             baseline=raw["baseline"],
             mechanism=raw["mechanism"],
             variant=raw["variant"],
-            task=TaskConfig(name=task["name"], params=_freeze(task["params"])),
+            task=TaskConfig(
+                name=task["name"],
+                params=_freeze_json(task["params"], "task.params"),
+            ),
             seeds=_freeze(seeds),
             budget=BudgetConfig(**budget),
             optimizer=OptimizerConfig(
