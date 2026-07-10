@@ -21,6 +21,7 @@ from .tiny_backend import (
     TinyFactors,
     TinyKMD2Model,
     TinyModelOutput,
+    project_trapezoid_gates_,
     tiny_factors_from_episode,
 )
 
@@ -244,7 +245,7 @@ class TinyTrainer:
             lr_lambda=self._schedule_multiplier,
         )
         self._optimizer_post_hook = self.optimizer.register_step_post_hook(
-            self._project_cache_amplitudes
+            self._project_constrained_parameters
         )
 
     def _schedule_multiplier(self, scheduler_step: int) -> float:
@@ -255,7 +256,7 @@ class TinyTrainer:
         progress = min(1.0, max(0.0, (scheduler_step - warmup) / decay_steps))
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
-    def _project_cache_amplitudes(
+    def _project_constrained_parameters(
         self,
         optimizer: torch.optim.Optimizer,
         args: tuple[Any, ...],
@@ -266,6 +267,7 @@ class TinyTrainer:
             for name, parameter in self.model.named_parameters():
                 if name.rsplit(".", 1)[-1] == "cache_amplitude":
                     parameter.clamp_(0.0, 1.0)
+            project_trapezoid_gates_(self.model)
 
     def _forward_episode(self, episode: EpisodeBatch) -> TinyModelOutput:
         if not isinstance(episode, EpisodeBatch):
@@ -284,6 +286,11 @@ class TinyTrainer:
                 out_mix=source.out_mix.to(device),
                 valid=source.valid.to(device),
                 positions=source.positions.to(device),
+                trapezoid_rho=(
+                    None
+                    if source.trapezoid_rho is None
+                    else source.trapezoid_rho.to(device)
+                ),
             )
         return self.model(
             input_ids=(
@@ -383,6 +390,13 @@ class TinyTrainer:
             ):
                 raise FloatingPointError(
                     "post-step cache amplitude is outside [0,1]"
+                )
+            if name.rsplit(".", 1)[-1] == "rho_head" and (
+                bool((tensor.detach() < 0).any())
+                or bool((tensor.detach() > 1).any())
+            ):
+                raise FloatingPointError(
+                    f"post-step rho_head {name!r} is outside [0,1]"
                 )
 
         for group_index, group in enumerate(self.optimizer.param_groups):
@@ -608,6 +622,12 @@ class TinyTrainer:
                 bool((saved < 0).any()) or bool((saved > 1).any())
             ):
                 raise ValueError("checkpoint cache amplitudes must be in [0,1]")
+            if name.rsplit(".", 1)[-1] == "rho_head" and (
+                bool((saved < 0).any()) or bool((saved > 1).any())
+            ):
+                raise ValueError(
+                    f"checkpoint rho_head {name!r} must be in [0,1]"
+                )
 
         if payload["optimizer_parameter_names"] != self.optimizer_parameter_names:
             raise ValueError("checkpoint optimizer parameter names/order do not match")

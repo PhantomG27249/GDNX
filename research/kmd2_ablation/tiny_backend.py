@@ -106,6 +106,8 @@ class TinyKMD2Config:
     rotation_gate_init: float = 0.0
     channel_decay_gate_init: float = 0.0
     write_offset_gate_init: float = 0.0
+    trapezoid: bool = False
+    trapezoid_gate_init: float = 0.0
     cache: CacheConfig | None = None
 
     def __post_init__(self) -> None:
@@ -144,9 +146,12 @@ class TinyKMD2Config:
             "rotation_gate_init",
             "channel_decay_gate_init",
             "write_offset_gate_init",
+            "trapezoid_gate_init",
         ):
             _unit_gate(name, getattr(self, name))
             object.__setattr__(self, name, float(getattr(self, name)))
+        if type(self.trapezoid) is not bool:
+            raise TypeError("trapezoid must be a bool")
         object.__setattr__(self, "eps", float(self.eps))
         if self.cache is not None and not isinstance(self.cache, CacheConfig):
             raise TypeError("cache must be a CacheConfig or None")
@@ -178,6 +183,7 @@ class TinyFactors:
     out_mix: Tensor
     valid: Tensor
     positions: Tensor
+    trapezoid_rho: Tensor | None = None
 
     def __post_init__(self) -> None:
         named = {
@@ -191,6 +197,8 @@ class TinyFactors:
             "valid": self.valid,
             "positions": self.positions,
         }
+        if self.trapezoid_rho is not None:
+            named["trapezoid_rho"] = self.trapezoid_rho
         for name, tensor in named.items():
             if not isinstance(tensor, Tensor):
                 raise TypeError(f"{name} must be a torch.Tensor")
@@ -227,6 +235,22 @@ class TinyFactors:
         for name, shape in expected_shapes.items():
             if tuple(getattr(self, name).shape) != shape:
                 raise ValueError(f"{name} must have shape {shape}")
+        if self.trapezoid_rho is not None:
+            if not isinstance(self.trapezoid_rho, Tensor):
+                raise TypeError("trapezoid_rho must be a torch.Tensor or None")
+            if self.trapezoid_rho.shape != (batch, steps, heads):
+                raise ValueError("trapezoid_rho must have shape [B,T,H]")
+            if not self.trapezoid_rho.is_floating_point():
+                raise TypeError("trapezoid_rho must be floating point")
+            if not bool(torch.isfinite(self.trapezoid_rho.detach()).all()):
+                raise ValueError("trapezoid_rho must contain only finite values")
+            if bool(
+                (
+                    (self.trapezoid_rho.detach() < 0)
+                    | (self.trapezoid_rho.detach() > 1)
+                ).any()
+            ):
+                raise ValueError("trapezoid_rho must be in [0,1]")
         for name in ("q", "k", "v", "decay", "beta_e", "beta_w", "out_mix"):
             tensor = getattr(self, name)
             if not tensor.is_floating_point():
@@ -319,6 +343,10 @@ class TinyKMD2Cell(nn.Module):
                 raise ValueError("native factors require R=1 and Q=config.r_out")
         elif write_slots != self.config.mimo_rank or q_slots != self.config.mimo_rank:
             raise ValueError("true-MIMO factors require R=Q=config.mimo_rank")
+        if self.config.trapezoid and factors.trapezoid_rho is None:
+            raise ValueError("trapezoid factors require trapezoid_rho")
+        if not self.config.trapezoid and factors.trapezoid_rho is not None:
+            raise ValueError("trapezoid_rho requires config.trapezoid=true")
 
     def forward(
         self,
@@ -383,6 +411,18 @@ class TinyKMD2Cell(nn.Module):
         beta_e = factors.beta_e.float()
         beta_w = factors.beta_w.float()
         out_mix = factors.out_mix.float()
+        trapezoid_rho = (
+            None if factors.trapezoid_rho is None else factors.trapezoid_rho.float()
+        )
+        previous_key = None
+        previous_write = None
+        if trapezoid_rho is not None:
+            previous_key = torch.zeros(
+                batch, heads, key_dim, dtype=torch.float32, device=device
+            )
+            previous_write = torch.zeros(
+                batch, heads, value_dim, dtype=torch.float32, device=device
+            )
         outputs: list[Tensor] = []
         scores: list[Tensor] = []
         for token in range(steps):
@@ -402,10 +442,40 @@ class TinyKMD2Cell(nn.Module):
                     beta_w[:, token, :, 0].unsqueeze(-1) * value_one
                     - beta_e[:, token, :, 0].unsqueeze(-1) * memory
                 )
-                candidate = state_bar + key_one.unsqueeze(-1) * update.unsqueeze(-2)
-                score = torch.linalg.vector_norm(
+                native_outer = key_one.unsqueeze(-1) * update.unsqueeze(-2)
+                candidate = state_bar + native_outer
+                native_score = torch.linalg.vector_norm(
                     key_one, dim=-1
                 ) * torch.linalg.vector_norm(update, dim=-1)
+                if trapezoid_rho is not None:
+                    assert previous_key is not None and previous_write is not None
+                    current_write_value = (
+                        beta_w[:, token, :, 0].unsqueeze(-1) * value_one
+                    )
+                    current_write_outer = (
+                        key_one.unsqueeze(-1) * current_write_value.unsqueeze(-2)
+                    )
+                    gate = trapezoid_rho[:, token]
+                    first_or_boundary = (
+                        (factors.positions[:, token] == 0) | reset[:, token]
+                    )
+                    gate = torch.where(
+                        first_or_boundary[:, None], torch.zeros_like(gate), gate
+                    )
+                    previous_outer = (
+                        previous_key.unsqueeze(-1) * previous_write.unsqueeze(-2)
+                    )
+                    transported_previous = decay[:, token].unsqueeze(-1) * previous_outer
+                    correction = gate.unsqueeze(-1).unsqueeze(-1) * (
+                        transported_previous - current_write_outer
+                    )
+                    candidate = candidate + correction
+                    active_score = torch.linalg.matrix_norm(
+                        native_outer + correction, dim=(-2, -1)
+                    )
+                    score = torch.where(gate == 0, native_score, active_score)
+                else:
+                    score = native_score
             else:
                 erase_scale = torch.sqrt(beta_e[:, token] / write_slots).unsqueeze(-1)
                 erase_key = erase_scale * key
@@ -420,6 +490,13 @@ class TinyKMD2Cell(nn.Module):
                 score = torch.linalg.matrix_norm(candidate - state_bar, dim=(-2, -1))
             active = factors.valid[:, token, None, None, None]
             current = torch.where(active, candidate, current)
+            if write_slots == 1 and trapezoid_rho is not None:
+                assert previous_key is not None and previous_write is not None
+                carry_active = factors.valid[:, token, None, None]
+                previous_key = torch.where(carry_active, key_one, previous_key)
+                previous_write = torch.where(
+                    carry_active, current_write_value, previous_write
+                )
             slot_read = torch.matmul(q[:, token], current)
             read = (slot_read * out_mix[:, token].unsqueeze(-1)).sum(dim=-2)
             read = torch.where(
@@ -629,6 +706,12 @@ class TinyFactorProjector(nn.Module):
         self.write_offset_gate = nn.Parameter(
             torch.tensor(config.write_offset_gate_init)
         )
+        if config.trapezoid:
+            self.rho_head = nn.Parameter(
+                torch.full((h,), config.trapezoid_gate_init, dtype=torch.float32)
+            )
+            self.rho_proj = nn.Linear(config.d_model, h, bias=False)
+            nn.init.zeros_(self.rho_proj.weight)
         self.A_log = nn.Parameter(torch.zeros(h))
         self.dt_bias = nn.Parameter(torch.ones(h))
         self.decay_chan = nn.Parameter(torch.zeros(h, dk))
@@ -776,6 +859,14 @@ class TinyFactorProjector(nn.Module):
         out_mix = self.out_mix.float()[None, None].expand(
             batch, steps, h, q_slots
         )
+        trapezoid_rho = None
+        if c.trapezoid:
+            trapezoid_rho = self.rho_head.float()[None, None] * torch.sigmoid(
+                self.rho_proj(hidden).float()
+            )
+            trapezoid_rho = torch.where(
+                valid.unsqueeze(-1), trapezoid_rho, torch.zeros_like(trapezoid_rho)
+            )
         return TinyFactors(
             q=q,
             k=k,
@@ -786,7 +877,19 @@ class TinyFactorProjector(nn.Module):
             out_mix=out_mix,
             valid=valid,
             positions=positions,
+            trapezoid_rho=trapezoid_rho,
         )
+
+
+def project_trapezoid_gates_(module: nn.Module) -> None:
+    """Project every trapezoid head gate in ``module`` onto its valid interval."""
+
+    if not isinstance(module, nn.Module):
+        raise TypeError("module must be a torch.nn.Module")
+    with torch.no_grad():
+        for name, parameter in module.named_parameters():
+            if name.rsplit(".", 1)[-1] == "rho_head":
+                parameter.clamp_(0.0, 1.0)
 
 
 class TinyKMD2Block(nn.Module):
