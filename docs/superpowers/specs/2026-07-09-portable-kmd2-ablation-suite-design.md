@@ -265,7 +265,7 @@ The validated schema includes:
 - seed list;
 - training token/update budget;
 - optimizer and schedule;
-- model/state dimensions;
+- model/state dimensions and finite `d_ff_match_min`/`d_ff_match_max` bounds;
 - context-length curriculum and extrapolation lengths;
 - primary metric, metric direction, `min_useful`, `harm_threshold`,
   `min_reliance`, and equivalence band;
@@ -273,6 +273,11 @@ The validated schema includes:
 - `min_synergy` for a declared four-cell interaction;
 - device/dtype preferences; and
 - required interaction or promotion stage.
+
+All decision thresholds for one metric use that metric's normalized raw units.
+Reliance configurations must satisfy
+`min_reliance > equivalence >= 0` and `harm_threshold > equivalence`; preflight
+rejects a configuration that could make reliance labels overlap.
 
 A canonical serialization of semantic configuration fields produces the
 experiment ID. Runtime-only fields such as output path and device number do not
@@ -472,10 +477,17 @@ extrapolation, not an implicit solve.
 
 ### State-size and true-MIMO sweep
 
-The tiny backend sweeps state dimensions under both:
+The tiny backend runs two distinct sweeps. The **state-size sweep** fixes
+`d_model`, layer count, head count, and MIMO rank at `R=1`, then varies declared
+`(dk, dv)` pairs; recurrent capacity is reported as `heads * dk * dv` elements.
+The **MIMO-rank sweep** fixes `d_model`, layers, heads, `dk`, `dv`, and therefore
+the recurrent-state size, then varies `R`. A declared factorial may vary both,
+but it remains labelled as a factorial rather than either one-dimensional
+sweep.
 
-- fixed surrounding width, to measure raw state-capacity effects; and
-- parameter-matched models, to measure quality/efficiency fairly.
+Each sweep has a raw fixed-FFN comparison, which keeps the feed-forward hidden
+dimension fixed and reports the resulting parameter-count change, and a
+separate parameter-matched comparison defined below.
 
 For each head, true MIMO uses row-normalized independent keys
 `K_t [R, dk]`, values `V_t [R, dv]`, queries `Q_t [R, dk]`, per-slot erase/write
@@ -485,29 +497,51 @@ All slots update simultaneously:
 ```text
 S_bar = D_t * S_prev
 K_e = diag(sqrt(beta_e / R)) K_t
-P = inverse(epsilon I_R + K_e K_e^T)
-S_erase = S_bar - K_e^T P (K_e S_bar)
+S_erase = S_bar - K_e^T (K_e S_bar)
 S_t = S_erase + (1 / sqrt(R)) K_t^T diag(beta_w) V_t
 Y_t = Q_t S_t
 o_t = l2_normalize(o_logits_t), initialized to [1/sqrt(R)] * R
 y_t = o_t^T Y_t
 ```
 
-The block solve makes erase invariant to slot order, and tests require forward
-and gradient invariance under a common slot permutation. The `1/sqrt(R)` write
-and unit-L2 output mixing preserve expected update/read scale for independent
-slots instead of granting an automatic R-fold magnitude advantage. `R=1`
-reduces to the SISO equations up to the declared ridge `epsilon`; the exact
-native SISO control remains a separate arm with the production erase formula.
+The erase is the order-invariant average
+`sum_r (beta_e,r / R) k_r (k_r^T S_bar)`. Tests require forward and gradient
+invariance under a common slot permutation. The `1/R` erase scaling,
+`1/sqrt(R)` write scaling, and unit-L2 output mixing prevent an automatic
+R-fold magnitude advantage. At `R=1`, `K_e = sqrt(beta_e) k`, the erase is
+exactly `S_bar - beta_e k (k^T S_bar)`, the write is exactly
+`k (beta_w v)^T`, and the one-slot output mixer is one. The entire recurrence
+therefore reduces exactly to the declared native SISO reference with no ridge
+or limiting argument.
 
 The current `r_out=4` shared-query slots are another separate control and are
-never relabelled as true MIMO. A fixed-width comparison reports the raw added
-parameters. For the parameter-matched comparison, `d_model`, layers, heads,
-`dk`, `dv`, and recurrent state remain fixed while the feed-forward hidden
-dimension is reduced deterministically to the nearest value divisible by 8.
-The resulting trainable-parameter count must be within the larger of 0.5% or
-1,024 parameters of the SISO target; otherwise preflight rejects the matched
-arm. Both the selected hidden dimension and residual mismatch are reported.
+never relabelled as true MIMO.
+
+Parameter matching uses exact instantiated trainable-parameter counts, not a
+projection-only estimate:
+
+- **State-size matching:** the target is the configured canonical `R=1` model
+  at `(dk_ref, dv_ref)`. Each alternate `(dk, dv)` arm keeps `d_model`, layers,
+  heads, and `R=1` fixed and adjusts only the shared per-layer feed-forward
+  hidden dimension, upward or downward, to compensate for changed q/k/v,
+  gate, rotation, normalization, and output-projection parameters.
+- **MIMO-rank matching:** the target is the `R=1` model at the same `(dk, dv)`.
+  Each `R>1` arm keeps recurrent state and all other dimensions fixed and
+  adjusts only that feed-forward hidden dimension to compensate for the added
+  independent slot projections and gates.
+- **Declared factorial matching:** the target is the canonical
+  `(dk_ref, dv_ref, R=1)` model, and the same feed-forward-only adjustment
+  compensates for both changes together.
+
+For every matched arm, preflight instantiates each feed-forward candidate in the
+configured finite interval `[d_ff_match_min, d_ff_match_max]` (`d_ff >= 8`, both
+bounds and candidates divisible by 8), chooses the one minimizing absolute
+count difference, and requires the resulting total trainable-parameter count
+to be within the larger of 0.5% of the target or 1,024 parameters. It rejects
+the arm when no legal candidate satisfies the tolerance. The bounds, target
+count, selected `d_ff`, exact arm count, and residual mismatch are reported.
+Thus state-size matching may increase FFN capacity while MIMO matching will
+usually reduce it; neither silently changes recurrent-state bytes.
 
 Primary reporting includes quality, state bytes, parameter count, training
 throughput, and single-step/reference-loop latency. No automatic 2x efficiency
@@ -734,13 +768,16 @@ all four factorial cells are invalid rather than approximated.
 
 Rotation and convolution on/off tests measure the effect
 `d_reliance = direction * (full_current - ablated)`. They do not use the new
-addition labels:
+addition labels. Preflight enforces
+`min_reliance > equivalence >= 0` and `harm_threshold > equivalence`. The
+following ordered rules are therefore mutually exclusive:
 
-- **relied-on:** `L >= min_reliance`;
-- **harmful-current:** `U <= -harm_threshold`;
-- **dispensable:** the entire interval lies inside the preregistered equivalence
-  band `[-equivalence, +equivalence]`; or
-- **inconclusive-reliance:** every other valid reliance result.
+1. **failed/invalid:** the run or a required validity gate failed;
+2. **harmful-current:** `U <= -harm_threshold`;
+3. **relied-on:** `L >= min_reliance`;
+4. **dispensable:** the entire interval lies inside the preregistered
+   equivalence band `[-equivalence, +equivalence]`; or
+5. **inconclusive-reliance:** every remaining valid reliance result.
 
 Reliance results can motivate a later removal design, but cannot be reported as
 evidence that an absent feature is incremental.
@@ -820,8 +857,9 @@ fresh:
 8. The trapezoid recurrence resets its factor carry at every declared boundary,
    exactly matches native update at `rho_head=0`, and produces a nonzero active
    effect when the carry gate is enabled.
-9. True-MIMO tests cover `R=1`, simultaneous slot-permutation invariance,
-   expected-scale normalization, and the declared parameter-match tolerance.
+9. True-MIMO tests prove exact native recurrence equality at `R=1`, simultaneous
+   slot-permutation invariance, expected-scale normalization, and the distinct
+   MIMO-rank and state-size parameter-match protocols and tolerance.
 10. Every task generator is deterministic by seed and passes answer-leak,
     balance, target, and length-split checks; affine regression additionally
     proves symmetric keys, withheld queries, and absence of competing constant
@@ -830,7 +868,8 @@ fresh:
    completed jobs, and produces valid JSON and CSV summaries.
 12. Statistical classification exercises every mutually exclusive addition and
     reliance label using configured 95% paired intervals, protected-metric
-    vetoes, and a complete four-cell synergy contrast.
+    vetoes, a complete four-cell synergy contrast, and rejected overlapping
+    reliance thresholds.
 13. Two concurrent shards plus an interrupted writer leave valid atomic run
     records and produce byte-identical ledgers across repeated summarization.
 14. Qwen dry-run/preflight accepts explicit model/checkpoint/data paths and
