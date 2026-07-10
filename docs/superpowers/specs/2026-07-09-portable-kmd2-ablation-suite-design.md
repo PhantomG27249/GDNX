@@ -27,6 +27,8 @@ modules, configurations, tests, documentation, and verified upload bundles.
 The initial suite will not:
 
 - modify the production recurrence in `gdn3/kmd2_native.py`;
+- reproduce HOLA as a separate non-KMD-2 model or claim a literal reproduction
+  where the paper leaves implementation semantics unspecified;
 - change or regenerate the surviving native-heal checkpoint;
 - claim that a small synthetic result proves a language-model improvement;
 - claim that a Qwen checkpoint intervention proves architectural causality;
@@ -37,8 +39,15 @@ The initial suite will not:
   their update and lookahead point;
 - make the experimental recurrences compatible with the production fast scan
   before their reference-loop behavior earns promotion; or
+- implement incremental decoding or claim bounded whole-model memory before the
+  exact-cache mechanism passes its full-recomputation screen; or
 - run every pairwise combination. Interaction tests are reserved for features
   that first pass their individual screen.
+
+The exact-cache lane has one narrow production-path allowance:
+`gdn3/kmd2_fast_scan.py` may add a separate score-returning entry point after
+parity is proved. The current `scan()` signature, outputs, recurrence, and
+`KMD2NativeAttn.forward` behavior remain unchanged.
 
 ## Current Native Baseline Contract
 
@@ -71,9 +80,14 @@ The suite must inventory the current implementation before creating jobs.
 | Momentum | A second full velocity state with a coherent lookahead update |
 | Lookahead target | A causal, identity-gated value-space derivative correction |
 | Native state-size knob | A changed native state shape; not warm-load compatible |
+| Bounded exact cache | Per-head exact K/V retention selected from KMD-2 writes and read through a sharp cache-only path |
 
 The cold `KMD2LinearAttn` and original `GDN3LinearAttn` paths are different
 architectures. They are not valid substitutes for the native baseline.
+`GDN3LinearAttn` does contain a circular exact `U,Vb` residual buffer, so the
+inventory records that conceptual overlap. It is inactive when native KMD-2 is
+selected, position/recency based, read linearly as part of state, and compacted
+lossily; it is not the proposed top-surprise, sharply read cache.
 
 ## Redundancy and No-Op Gates
 
@@ -142,6 +156,7 @@ or proposed mechanism:
 | Momentum | momentum x current decay/erase behavior |
 | Rotation | rotation x pair-tied versus independent channel decay |
 | State size / true MIMO | state size x SISO/true-MIMO; current `r_out=4` remains a separate control |
+| Exact cache | cache x current rotation; cache x `r_out=1/4`; cache bytes x parameter-matched larger state in tiny backend |
 
 New additions are classified as **incremental**, **replacement-only**,
 **redundant**, **synergistic**, **harmful**, or **inconclusive** by the mutually
@@ -166,6 +181,7 @@ research/kmd2_ablation/
 |-- runner.py                # job expansion, execution, resume, atomic output
 |-- tiny_backend.py          # exact native-style small PyTorch model
 |-- qwen_backend.py          # production import, interventions, and heal adapter
+|-- exact_cache.py           # KMD-2 cache selection, sharp read, and Qwen subclass
 |-- summarize.py             # paired deltas, intervals, classifications
 |-- configs/
 |   |-- screening.json       # three-seed, short-budget first pass
@@ -178,6 +194,7 @@ tests/ablation/
 |-- test_recurrence_parity.py
 |-- test_inventory.py
 |-- test_variants.py
+|-- test_exact_cache.py
 |-- test_tasks.py
 |-- test_runner_resume.py
 `-- test_bundle.py
@@ -266,6 +283,8 @@ The validated schema includes:
 - training token/update budget;
 - optimizer and schedule;
 - model/state dimensions and finite `d_ff_match_min`/`d_ff_match_max` bounds;
+- exact-cache width, processing-block size, admission score, read
+  normalization, coordinate frame, dtype, causality, and tie policy;
 - context-length curriculum and extrapolation lengths;
 - primary metric, metric direction, `min_useful`, `harm_threshold`,
   `min_reliance`, and equivalence band;
@@ -287,6 +306,16 @@ the same experiment ID and code provenance.
 Job sharding is deterministic. `--job-index i --num-jobs n` selects a stable
 subset, making the suite usable with Slurm arrays or several independent GPU
 workers without a shared coordinator.
+
+The shard assignment is language-independent:
+
+```text
+uint64_big_endian(sha256(job_id)[0:8]) mod num_jobs
+```
+
+`job_id` includes canonical semantic configuration, seed, and stage. Tests vary
+JSON key order and `PYTHONHASHSEED` and require disjoint shards whose union is
+the complete immutable job manifest.
 
 ## Backends
 
@@ -314,7 +343,11 @@ capacity and data.
 
 The Qwen backend imports the current upgrade manager and
 `KMD2NativeAttn`. Experimental wrappers or subclasses live inside the suite;
-production KMD-2 source remains unchanged.
+the production forward method and recurrence are not copied. The exact-cache
+subclass may override the scan call boundary to request update norms and add the
+cache read. The only production-path extension is a separately named
+`scan_with_update_norm()` helper in `gdn3/kmd2_fast_scan.py`; existing `scan()`
+callers remain unchanged.
 
 It supports two evidence modes.
 
@@ -333,15 +366,25 @@ interventions without retraining. Initial interventions include:
 Reliance mode determines whether the checkpoint currently uses a feature. It
 does not prove that the feature improved training.
 
+Exact cache has no post-hoc reliance arm because it is absent from the current
+checkpoint. Ungated cache probes are diagnostic only and cannot be reported as
+checkpoint reliance or architectural gain.
+
 #### Heal mode
 
 Starts from native Qwen weights or the declared checkpoint, adds one
 identity-gated compatible mechanism, and trains for a fixed paired budget using
 the same examples, optimizer settings, and stopping rules as its baseline.
 
-Trapezoid, B/C-style bias, lookahead, and corrected momentum require heal mode.
+Trapezoid, B/C-style bias, lookahead, corrected momentum, and exact cache
+require heal mode.
 Recurrence-changing variants use the Python reference loop. The suite must not
 fall back silently to the existing fast scan.
+
+Exact cache does not change the recurrence and may use the score-returning fast
+path only after output, score, selected-index, and gradient parity pass. Its
+initial Qwen runs are full-recomputation only and reject incremental decode,
+packed inputs, or cross-call state.
 
 Native state-size changes and true MIMO are not valid warm-start heal arms.
 They are tiny-backend experiments in the initial suite. A future Qwen cold or
@@ -439,6 +482,125 @@ short convolution.
 The primary incremental baseline keeps convolution enabled. Convolution-off
 runs answer whether another feature can replace it and are labelled
 replacement tests.
+
+### KMD-2 bounded exact cache
+
+This lane adapts the bounded exact-memory idea in
+[HOLA](https://arxiv.org/abs/2607.02303) to the actual native KMD-2 update. It
+is a separate read-side/dynamic-memory addition, not another recurrence and not
+a standalone reproduction of the paper.
+
+The paper does not fully specify its gate activation, null-sink equation,
+per-head versus shared selection, hard-top-k gradient semantics, tie breaking,
+or exact block merge/read order. The definitions below are therefore the
+normative KMD-2 adaptation and are reported as such rather than attributed to
+the paper.
+
+For one head, native KMD-2 computes:
+
+```text
+S_bar = D_t * S_prev
+m_t = k_t^T S_bar
+u_t = beta_w,t * v_t - beta_e,t * m_t
+S_t = S_bar + k_t u_t^T
+score_exact,t = ||u_t||_2
+```
+
+The normalized key remains unit norm after the orthogonal paired rotation, so
+`||k_t u_t^T||_F = ||u_t||_2`. The exact score is therefore the magnitude of
+the rank-one change actually committed by KMD-2, excluding the separate decay
+of old state. At the native warm start, `beta_w=beta_e=beta`, so it reduces to
+the paper-style `beta * ||v_t - m_t||`. After the write gate decouples, the
+paper-style expression and actual KMD-2 update magnitude are distinct arms.
+
+#### Cache contents and causal selection
+
+The default cache is independent for every batch item and head. It stores:
+
+- the rotated, unit-normalized key used by the recurrence;
+- the corresponding raw post-convolution/SiLU value `v_t`, never `u_t`;
+- the detached fp32 admission score;
+- the absolute position; and
+- validity.
+
+The persistent capacity is `w` entries per head. For a processing block, the
+visible set at token `t` is the persistent top-`w` from completed blocks, the
+inclusive causal current-block prefix `j <= t`, and one null sink. At block end,
+the next persistent set is selected from the old persistent set plus all valid
+tokens in the completed block. The total order is score descending and absolute
+position descending, so newer tokens deterministically win exact score ties.
+Selection is non-differentiable: scores and indices are detached, while gathered
+K/V tensors retain their ordinary within-forward gradient paths.
+
+The processing-block size `C_cache` is independent of both persistent width
+`w` and the numerical fast-scan chunk. `w=0` is allowed only for the declared
+current-block-only control; a top-surprise experiment requires `w >= 1`, at
+least two processing blocks, and enough candidates to cause eviction.
+
+#### Sharp cache-only read
+
+The cache uses the query represented by the existing shared-query output mixer:
+
+```text
+q_eff = sum_r out_mix_r * q_slot_r
+q_tilde = RMSNorm_gamma_q(q_eff)
+k_tilde_j = RMSNorm_gamma_k(k_j)
+logit_j = q_tilde^T k_tilde_j / sqrt(dk)
+logit_sink = sink_logit_head
+a = softmax([logit_valid, logit_sink])
+y_cache = sum_j a_j * v_j              # sink value is exactly zero
+y = y_state + lambda_head * y_cache
+```
+
+The Q/K RMSNorm scale vectors are cache-only and shared across heads within a
+layer; they never alter the unit-normalized recurrence factors. The sink logit
+and cache amplitude are per head. `lambda_head` is directly trainable,
+constrained to `[0,1]`, and initialized at exactly zero. This preserves the
+checkpoint output while giving the amplitude a usable first-step gradient;
+the optimizer projects it back into `[0,1]` after every step;
+the norm and sink parameters may begin receiving gradients after the amplitude
+opens. The cache sum is applied before the existing gated RMSNorm and output
+projection. Cache amplitude, RMSNorm scales, and sink logits use a dedicated
+optimizer group whose learning rate is declared and matched across cache arms.
+
+Rotated recurrence-space K/V is the primary arm. A pre-rotation cache coordinate
+is a promoted diagnostic only, because it requires a broader experimental
+forward adapter and changes the positional information available to retrieval.
+`r_out=4` still creates one cache entry per token/head. Per-slot cache reads are
+an interaction experiment, not the default and not true MIMO.
+
+#### Admission and read controls
+
+All admission arms use identical capacity, block geometry, read, gate, training
+budget, and examples:
+
+- exact KMD-2 committed update `||beta_w v - beta_e m||`;
+- coupled-paper port `beta_w ||v - m||`;
+- residual only `||v - m||`;
+- write-value only `beta_w ||v||`;
+- recency/FIFO;
+- seeded reservoir/random; and
+- a future-query oracle used only as a diagnostic ceiling.
+
+Read controls are unit-L2 softmax, a fixed-temperature sharp read matched at
+initial logit scale, and learned cache-only RMSNorm. Cache-off and
+current-block-only controls separate persistent exact memory from local exact
+attention.
+
+#### Fast-scan instrumentation
+
+The chunk scan already solves for the per-token `u_t` vectors as `U`. A separate
+`scan_with_update_norm()` entry point may return `(y, ||U||_2)` without changing
+the existing `scan()` API; the returned fp32 norms are detached before policy
+selection. The experimental subclass overrides only the scan
+call boundary and reuses the production forward projections, rotation, norm,
+and output path. Reference full recomputation remains authoritative until the
+fast path matches state output, scores, selected indices, cache read, and
+gradients. Float64 oracle tests use `atol=1e-10, rtol=1e-8`; fp32 reference
+tests use `atol=1e-6, rtol=1e-5`; CUDA fast-path gates retain the current
+`<2e-3` forward relMSE and `<1e-2` gradient relMSE limits. Score/index parity
+uses both well-separated scores and constructed exact ties. Stage 1 does not
+accept or return streaming state.
 
 ### Corrected momentum
 
@@ -561,6 +723,7 @@ Shared language-model and retrieval tasks are secondary transfer measures.
 | Lookahead | causal trajectory extrapolation | linear/sinusoidal motion plus change points | smooth-segment gain versus change-point harm |
 | State size / MIMO | capacity per state byte | MQAR load and length sweep | quality-state-latency Pareto frontier |
 | B/C bias | affine constant-basis memory | symmetric affine associative regression | intercept error; zero-intercept negative control |
+| Exact cache | episodic exceptions beside compressive state | structured-plus-exceptions, far retention, and overwrite freshness | cache miss, wrong read, or stale retrieval |
 
 ### State-tracking tasks
 
@@ -620,6 +783,54 @@ tokens. MQAR varies number of bindings, queries, overwrite frequency, and
 distance. Results include token accuracy, episode exact match, and distance/load
 bins.
 
+### Structured-plus-exceptions memory
+
+This is the primary mechanistic task for exact cache. Each episode defines a
+compressible mapping that the dense recurrent state can represent, then adds a
+small set of one-shot arbitrary exceptions. Queries are stratified into normal
+rule items and episodic exceptions. OOD evaluation varies unseen keys/values,
+rule family, exception fraction, distance, and 2x/4x load.
+
+Interventions report full model, state-only, cache-only, shuffled-cache,
+wrong-value-cache, and oracle-cache results. A valid semiparametric result must
+improve exception retrieval over state-only, retain the state advantage on
+compressible items over cache-only, and lose its exception gain when cache
+entries are shuffled. Overall accuracy without these strata is insufficient.
+
+### Selector replay and far-surprise retention
+
+Before training cache reads, deterministic native traces are replayed through
+each admission policy. Tasks include MQAR, an early queried fact followed by
+recent distractors, deliberately high-residual but unqueried distractors, and
+loads above cache capacity. Metrics include query-relevant coverage at `w`,
+selector precision/AUPRC, survival by age, cache hit rate, and an oracle-policy
+ceiling. This separates admission quality from q/k alignment and read quality.
+
+### Temporal freshness
+
+Freshness episodes rebind the same key from `v_0` through later values, then
+query the latest value. They vary update count, update gap, query lag, cache
+saturation, and adversarial cases where an old entry has the larger immutable
+score. Explicit requests for historical values form a separate split and are
+never mixed into the latest-value metric.
+
+Reported metrics are latest-value accuracy, stale-old-value prediction rate,
+duplicate-key occupancy, update latency, and attention mass on old versus new
+entries. This discrete versioning test is distinct from the smooth drift task:
+an exact cache is not a temporal improvement if it preserves old facts at the
+cost of current truth.
+
+### Cache read and capacity diagnostics
+
+When the queried item is cached, the suite reports top-1 key accuracy, gold
+attention mass, entropy/effective support, wrong-key rate, and cache-only value
+exact match. Capacity sweeps use `w={0,8,16,32,64,128}` with fixed block size;
+only the winning policy/read subsequently sweeps
+`C_cache={64,128,256}`. MQAR loads and query counts cross below, near, and above
+`w`. Quality is reported against persistent/working bytes, latency, and VRAM,
+including a tiny-backend comparison with an equally sized recurrent-state
+increase and an unbounded exact-memory oracle.
+
 ### Affine associative regression
 
 This direct-factor tiny task isolates the constant basis supplied by q/k
@@ -650,6 +861,7 @@ absence of constant q/k inputs, and withheld-query targets.
 - configuration and inventory validation;
 - deterministic task tests and answer-leak checks;
 - recurrence forward/backward parity;
+- exact-cache update-score, selection, causality, and zero-gate parity;
 - identity and active-effect gates;
 - CPU tiny smoke run; and
 - optional CUDA smoke run.
@@ -687,6 +899,100 @@ use identical data order, update/token budget, learning-rate groups, and
 evaluation examples. Full current native features remain enabled unless the
 declared experiment is a replacement interaction.
 
+Exact-cache Qwen promotion uses three paired heal seeds and at least 64 matched
+RULER episodes per cell. A one-seed or 512-token-only run is a feasibility
+result, not evidence of long-context transfer. Training context or curriculum
+is declared in configuration and identical across baseline, recency, and
+surprise-policy arms.
+
+### Exact-cache staged screen
+
+Exact cache uses the following serial gates rather than a full Cartesian sweep:
+
+1. **selector replay:** compare exact KMD-2 score, coupled-paper port,
+   residual-only, write-value-only, recency, reservoir, and oracle policies on
+   the same native traces without a learned read;
+2. **read screen:** fix the strongest non-oracle policy and compare unit-L2,
+   matched fixed-temperature, and cache-only RMSNorm reads;
+3. **capacity screen:** sweep `w={0,8,16,32,64,128}` with fixed `C_cache`, then
+   sweep `C_cache={64,128,256}` only for the winning policy/read;
+4. **tiny promotion:** run five paired seeds on structured-plus-exceptions,
+   MQAR, far-surprise distractors, and temporal freshness;
+5. **native interactions:** run separate four-cell cache x rotation and cache x
+   `r_out={1,4}` factorials only after cache passes alone; and
+6. **Qwen heal:** compare paired native continuation, capacity/read-matched
+   recency cache, and the winning surprise cache.
+
+Tiny selector/read promotion uses an absolute five-point lower-confidence-bound
+gain on the declared primary accuracy metric. Short-context accuracy and
+latest-value freshness must each remain within two points of the appropriate
+native or recency control.
+
+### Promotion from full recomputation to Option 3 streaming
+
+Option 3 begins only if the exact-cache family passes all of these preregistered
+Qwen gates:
+
+1. macro per-answer recall over `{16K,32K} x {4q,8q}` has paired 95% interval
+   lower bound at least `+0.10` versus native continuation;
+2. at least two individual long-context cells also have lower bound at least
+   `+0.10`, so the claim cannot rely only on a collapsed 32K baseline;
+3. the surprise policy has long-context lower bound at least `+0.05` versus a
+   capacity/read/gate/budget-matched recency cache before the admission rule is
+   credited; if only recency wins, the cache family may promote but the result
+   is not labelled surprise-selection evidence;
+4. 512-4K macro recall lower bound is at least `-0.02`, no individual short
+   cell is below `-0.03`, 8K is no worse than `-0.03`, and episode exact-match
+   macro is no worse than `-0.05`;
+5. latest-value freshness remains within two points of native/recency;
+6. held-out CE increases by at most `0.02`, distillation KL increases by at
+   most `max(0.005, 5%)`, and there are no non-finite values or skipped steps;
+7. the gain exists at `w=64`, does not require `w>128`, and is not an isolated
+   capacity spike; and
+8. cache hit/read diagnostics show a real query-linked mechanism rather than a
+   gate that stayed closed or a sharp read that chose arbitrary slots.
+
+The winning policy, not a preregistered preference for surprise, is what Option
+3 integrates. A result that needs changed decay, recurrence, rotation resets,
+or another simultaneous mechanism fails this promotion gate.
+
+#### Option 3 state and execution contract
+
+Per KMD-2 layer, streaming must carry:
+
+```text
+S                  fp32 [B,H,dk,dv]
+conv_tail           model_dtype [B,conv_dim,conv_k-1]
+phase               fp32 [B,H,dk/2]
+next_position       int64 [B]
+persistent.{k,v}    model_dtype [B,H,w,dk or dv]
+persistent.score    fp32 [B,H,w]
+persistent.position int64 [B,H,w]
+persistent.valid    bool [B,H,w]
+block.{k,v,score,position,valid}  bounded current-block prefix
+block_length        int64 [B]
+```
+
+For each accepted token, convolution history is applied first, phase is
+advanced and q/k rotated, the unchanged decay/erase/write update and score are
+computed, the current K/V is appended to the current-block buffer, and the
+inclusive persistent-plus-block cache is read before the output is committed.
+When `C_cache` entries complete a block, persistent top-`w` is selected with
+score-descending/position-descending order and the block buffer is cleared.
+
+`state=None` or an explicit reset mask clears every field before processing.
+Padding rows are complete state no-ops. EOS does not implicitly reset. Beam
+reordering covers every field without aliasing duplicated beams, and rejected
+speculative tokens never commit their transactional state.
+
+At `w=64`, persistent top-`w` K/V for all 18 native layers is limited to roughly
+10 MiB per beam. The bounded current-block workspace is reported separately
+(about 36 MiB at `C_cache=256`) and may not be hidden from total dynamic-memory
+figures. Option 3 also requires decode throughput at least `0.80x`, prefill at
+least `0.75x`, and KMD-2 dynamic memory flat with context. The six preserved
+full-attention layers still have growing KV caches, so no whole-model O(1)
+memory claim is permitted.
+
 ## Metrics and Statistical Decisions
 
 Every run records:
@@ -700,6 +1006,15 @@ Every run records:
 - exact command, canonical configuration, seed, and experiment ID;
 - Git revision and relevant source hashes; and
 - Python, PyTorch, CUDA, GPU, and dependency versions.
+
+Exact-cache runs additionally record cache width/block size, score definition
+and dtype, coordinate frame, inclusive-causal and tie policies, amplitude
+initial/final values, selected-index digest, selection-score statistics,
+retention/eviction counts, queried-item hit rate, recall conditional on a hit,
+sink mass, attention entropy/top-1 mass, stale-key occupancy/error, cache/state
+output norms, persistent and block-workspace bytes, and the reference/fast
+implementation paths. Smoke/parity records retain full scores and indices;
+large runs retain canonical digests plus bounded deterministic samples.
 
 Screening configurations preregister:
 
@@ -828,13 +1143,25 @@ The suite must fail explicitly for:
 - requested Qwen native state-size changes;
 - identity or active-effect gate failure;
 - unavailable fast-scan support for a recurrence variant;
+- exact-cache Qwen masks containing padding, packed-segment metadata,
+  incremental decode/cache parameters, or cross-call state during Stage 1;
+- a top-surprise screen with no possible eviction or an invalid cache/block
+  width;
 - non-finite loss or gradients;
 - OOM; and
 - malformed or conflicting resume records.
 
-OOM is recorded with the requested batch and sequence size. The runner does not
-silently reduce the batch, sequence length, dtype, state size, or task load,
-because that would invalidate paired comparisons.
+Stage-1 exact-cache Qwen accepts only `attention_mask=None` or an all-one
+`[B,T]` mask because the current native recurrence does not make padded tokens
+state no-ops. Masked/padded sequences, packed inputs, position resets,
+incremental decode, and nonempty cache parameters fail with distinct actionable
+errors rather than being ignored.
+
+OOM is recorded with the requested batch, sequence, model/state/cache
+dimensions, dtype/device, estimated cache bytes, peak VRAM, and failing phase
+(`scan`, score, selection, read, or backward). The runner does not silently
+reduce the batch, sequence length, dtype, state size, cache width/block size, or
+task load, because that would invalidate paired comparisons.
 
 One failed job does not corrupt other shards. Summaries distinguish failed,
 missing, inconclusive, and completed runs.
@@ -847,37 +1174,71 @@ fresh:
 1. `preflight --backend tiny` passes on CPU with only tiny requirements.
 2. The tiny recurrence matches the production native reference scan in forward
    and backward tests at declared tolerances.
-3. The production Qwen backend imports, rather than duplicates,
-   `KMD2NativeAttn`.
-4. The inventory correctly recognizes existing convolution, rotation,
-   shared-query `r_out=4`, channel decay, and write offset.
-5. Identity-gated variants match the full baseline before training.
-6. Active-effect tests prove every enabled variant changes its intended path.
-7. Invalid and redundant feature combinations fail with actionable messages.
-8. The trapezoid recurrence resets its factor carry at every declared boundary,
-   exactly matches native update at `rho_head=0`, and produces a nonzero active
-   effect when the carry gate is enabled.
-9. True-MIMO tests prove exact native recurrence equality at `R=1`, simultaneous
-   slot-permutation invariance, expected-scale normalization, and the distinct
-   MIMO-rank and state-size parameter-match protocols and tolerance.
-10. Every task generator is deterministic by seed and passes answer-leak,
-    balance, target, and length-split checks; affine regression additionally
-    proves symmetric keys, withheld queries, and absence of competing constant
-    q/k paths.
-11. A short CPU tiny screening matrix completes, resumes without duplicating
-   completed jobs, and produces valid JSON and CSV summaries.
-12. Statistical classification exercises every mutually exclusive addition and
+3. The Qwen exact-cache class subclasses production `KMD2NativeAttn`, reuses its
+   forward/projections/output path, and confines its override to the scan call
+   boundary rather than copying the production forward method.
+4. The inventory recognizes current convolution, rotation, shared-query
+   `r_out=4`, channel decay, write offset, absence of native exact cache, and the
+   inactive legacy circular residual-buffer overlap.
+5. Identity-gated variants match the full baseline before training; active
+   settings change their intended path with finite gradients.
+6. An independent float64 token-loop oracle proves
+   `score=||beta_w v-beta_e m||_2=||k u^T||_F` for unit rotated keys and proves
+   that cache storage uses raw `v`, not `u`.
+7. Exact-cache selection tests prove independent per-head top-`w`, inclusive
+   `j<=t` causality, future-prefix invariance, block-boundary persistence,
+   score-descending/position-descending ties, eviction, and bounded size.
+8. `scan_with_update_norm()` preserves existing `scan()` output/API and matches
+   the reference in state output, update scores, selected indices, cache read,
+   and gradients for q/k/v, decay, erase/write gates, `out_mix`, cache norms,
+   sink, and amplitude. Tests cross `r_out=1/4`, non-one-hot mixing, block
+   boundaries, and sequence lengths around both scan and cache chunks.
+9. Exact-cache branch-local tests prove recurrence q/k and `y_state` are
+   unchanged, empty/sink reads are finite and zero-valued, zero amplitude has a
+   finite nonzero opening gradient, and a nonzero amplitude trains the cache
+   parameters.
+10. Stage-1 Qwen rejects padding masks, packed segments, incremental decode,
+    cross-call state, and configurations that cannot exercise eviction.
+11. The trapezoid recurrence resets its factor carry at every declared boundary,
+    exactly matches native update at `rho_head=0`, and produces a nonzero active
+    effect when the carry gate is enabled.
+12. True-MIMO tests prove exact native recurrence equality at `R=1`, simultaneous
+    slot-permutation invariance, expected-scale normalization, and the distinct
+    MIMO-rank and state-size parameter-match protocols and tolerance.
+13. Every task generator is deterministic by seed and passes answer-leak,
+    balance, target, and length-split checks. Structured-plus-exceptions proves
+    its rule/exception strata, temporal freshness proves latest versus stale
+    labels, and affine regression proves symmetric keys and no competing
+    constant q/k path.
+14. A short CPU tiny screening matrix completes, resumes without duplicating
+    completed jobs, and produces valid JSON and CSV summaries.
+15. Statistical classification exercises every mutually exclusive addition and
     reliance label using configured 95% paired intervals, protected-metric
     vetoes, a complete four-cell synergy contrast, and rejected overlapping
-    reliance thresholds.
-13. Two concurrent shards plus an interrupted writer leave valid atomic run
+    thresholds.
+16. Exact-cache selector, read, capacity, and intervention screens vary one
+    factor at a time, contain matched recency/reservoir/oracle controls, cause
+    real eviction, and record hit/read/staleness diagnostics.
+17. Qwen dry-run/preflight accepts explicit model/checkpoint/data paths and
+    rejects unsupported native state-size or Option-3 streaming arms without
+    loading large assets.
+18. The exact-cache Qwen job expansion contains paired native, recency, and
+    winning-policy heals with matched seeds/examples/budgets and the declared
+    Option-3 promotion/protected thresholds.
+19. Two concurrent shards plus an interrupted writer leave valid atomic run
     records and produce byte-identical ledgers across repeated summarization.
-14. Qwen dry-run/preflight accepts explicit model/checkpoint/data paths and
-    rejects unsupported native state-size arms without loading large assets.
-15. Optional CUDA tests record device, throughput, VRAM, and state bytes without
-    silently changing configuration.
-16. Tiny and Qwen upload bundles are created, reopened, content-checked, and
-    hash-verified; large external assets are absent unless explicitly included.
-17. Existing production model, trainer, checkpoint, data, and result files are
-    unchanged.
-18. `git diff --check` passes for all suite, test, and documentation changes.
+20. Canonical hash sharding is invariant to JSON key order and
+    `PYTHONHASHSEED`; shards are disjoint and their union equals `jobs.json`.
+21. Forced OOM and malformed-input tests create typed atomic failure records and
+    never silently change batch, length, dtype, state, cache, or task settings.
+22. Optional CUDA tests record device, throughput, VRAM, recurrent bytes,
+    persistent-cache bytes, and block-workspace bytes.
+23. Tiny and Qwen upload bundles are each built twice byte-identically, reopened,
+    content/hash-checked, extracted fresh, and smoke-tested without the source
+    checkout; external large assets and secrets are absent.
+24. The production recurrence, `KMD2NativeAttn.forward`, existing `scan()` API,
+    and baseline outputs remain unchanged; only the separately named optional
+    score-returning fast-scan entry point is added.
+25. Existing trainer, checkpoint, data, and result artifacts are unchanged.
+26. `git diff --check` passes for all suite, test, documentation, and permitted
+    fast-scan instrumentation changes.
