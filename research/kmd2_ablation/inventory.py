@@ -18,7 +18,7 @@ KMD2_NATIVE_SHA256 = (
     "326b84cd8114b189496a385d084664d89ac73b3d98b1c720ce71d80af2069b67"
 )
 KMD2_FAST_SCAN_SHA256 = (
-    "d4efb6ce70fbbe69613b7bba7bf7825ddbf1c13f867ee7a67a4a2d1f81bec6c1"
+    "02f7ac667661362367456db7e4e128f7e82e29175d15777ac5b25a13b54d91da"
 )
 GDN3_UPGRADE_SHA256 = (
     "427ba5c5e03e48d76945ba465c53c6b7751443cec4187be88cb4acec8cb20666"
@@ -85,9 +85,11 @@ REQUIRED_STRUCTURAL_FINDINGS = {
         },
     },
     "separate_fast_score": {
+        "scan_core": True,
         "scan_impl": True,
+        "scan_with_update_norm_impl": True,
         "compiled_scan_assignment": True,
-        "scan_with_update_norm": False,
+        "compiled_score_assignment": True,
     },
 }
 
@@ -495,8 +497,15 @@ def _compute_structural_findings(
     )
     native_constructed = _contains_call(apply_upgrade, "KMD2NativeAttn")
 
+    scan_core = _top_level_function(fast_tree, "_scan_core")
     scan_impl = _top_level_function(fast_tree, "_scan_impl")
+    scan_with_update_norm_impl = _top_level_function(
+        fast_tree, "_scan_with_update_norm_impl"
+    )
     compiled_scan = _top_level_assignment_value(fast_tree, "scan")
+    compiled_score_scan = _top_level_assignment_value(
+        fast_tree, "scan_with_update_norm"
+    )
 
     findings = {
         "current_convolution": {
@@ -641,17 +650,22 @@ def _compute_structural_findings(
             },
         },
         "separate_fast_score": {
+            "scan_core": scan_core is not None,
             "scan_impl": scan_impl is not None,
+            "scan_with_update_norm_impl": scan_with_update_norm_impl is not None,
             "compiled_scan_assignment": (
                 isinstance(compiled_scan, ast.Call)
                 and _dotted_name(compiled_scan.func) == "torch.compile"
                 and len(compiled_scan.args) == 1
                 and _dotted_name(compiled_scan.args[0]) == "_scan_impl"
             ),
-            "scan_with_update_norm": _top_level_function(
-                fast_tree, "scan_with_update_norm"
-            )
-            is not None,
+            "compiled_score_assignment": (
+                isinstance(compiled_score_scan, ast.Call)
+                and _dotted_name(compiled_score_scan.func) == "torch.compile"
+                and len(compiled_score_scan.args) == 1
+                and _dotted_name(compiled_score_scan.args[0])
+                == "_scan_with_update_norm_impl"
+            ),
         },
     }
 
@@ -733,7 +747,7 @@ def build_inventory(repo_root: str | Path) -> dict[str, Any]:
                 "details": structural_findings["legacy_uvb_overlap"],
             },
             "separate_fast_score": {
-                "status": "negative",
+                "status": "positive",
                 "evidence": ["gdn3/kmd2_fast_scan.py"],
                 "details": structural_findings["separate_fast_score"],
             },

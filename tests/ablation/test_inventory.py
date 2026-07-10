@@ -21,7 +21,7 @@ EXPECTED_SOURCE_SHA256 = {
         "427ba5c5e03e48d76945ba465c53c6b7751443cec4187be88cb4acec8cb20666"
     ),
     "gdn3/kmd2_fast_scan.py": (
-        "d4efb6ce70fbbe69613b7bba7bf7825ddbf1c13f867ee7a67a4a2d1f81bec6c1"
+        "02f7ac667661362367456db7e4e128f7e82e29175d15777ac5b25a13b54d91da"
     ),
     "gdn3/kmd2_native.py": (
         "326b84cd8114b189496a385d084664d89ac73b3d98b1c720ce71d80af2069b67"
@@ -79,9 +79,11 @@ EXPECTED_STRUCTURAL_FINDINGS = {
         },
     },
     "separate_fast_score": {
+        "scan_core": True,
         "scan_impl": True,
+        "scan_with_update_norm_impl": True,
         "compiled_scan_assignment": True,
-        "scan_with_update_norm": False,
+        "compiled_score_assignment": True,
     },
 }
 
@@ -173,7 +175,7 @@ def test_inventory_records_current_positive_negative_and_legacy_capabilities(
         "decoupled_write": "positive",
         "native_exact_cache": "negative",
         "legacy_uvb_overlap": "legacy_inactive",
-        "separate_fast_score": "negative",
+        "separate_fast_score": "positive",
     }
 
     assert inventory["inventory_version"] == "1.0.0"
@@ -229,6 +231,32 @@ def test_inventory_hashes_source_bytes_with_deterministic_sha256():
         assert digest == _sha256(REPO_ROOT / relative_path)
         assert len(digest) == 64
         int(digest, 16)
+
+
+def test_inventory_fast_score_predicate_fails_closed_on_decoy(tmp_path, monkeypatch):
+    module = _inventory_module()
+    _copy_inventory_sources(tmp_path)
+    fast_path = tmp_path / "gdn3" / "kmd2_fast_scan.py"
+    source = fast_path.read_text(encoding="utf-8")
+    source = source.replace(
+        "scan_with_update_norm = torch.compile(_scan_with_update_norm_impl)",
+        "scan_with_update_norm = torch.compile(_scan_impl)",
+        1,
+    )
+    source += """
+
+def scan_with_update_norm_decoy(q, k, v, g, beta_e, beta_w, out_mix=None):
+    return _scan_with_update_norm_impl(q, k, v, g, beta_e, beta_w, out_mix)
+"""
+    fast_path.write_text(source, encoding="utf-8")
+    monkeypatch.setitem(
+        module.PINNED_SOURCE_SHA256,
+        "gdn3/kmd2_fast_scan.py",
+        _sha256(fast_path),
+    )
+
+    with pytest.raises(ValueError, match="structural.*separate fast score"):
+        module.build_inventory(tmp_path)
 
 
 def test_inventory_verification_rejects_stale_or_tampered_source_hash(tmp_path):

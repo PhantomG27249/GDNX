@@ -17,6 +17,7 @@ kUp=k*gcumF, kDn=k/gcumF makes the between-decay a ratio: Kmat = kUp @ kDn^T.
 Outputs y_i = qUp_i @ S0 + (masked A=qUp@kDn^T) @ U. Carry S_new=gcumF_last*(S0+kDn^T@U).
 """
 import os
+import sys
 import torch
 import torch._inductor.config as _ic
 import triton
@@ -32,6 +33,18 @@ _BF16 = torch.bfloat16
 # 18% @C=128 -> GLM's original C=128 gave 0.00 recall). C=16 keeps 1/gcumF < 4e36
 # (0% underflow) => numerically valid. Override via GDN3_FAST_C.
 C = int(os.environ.get("GDN3_FAST_C", "16"))
+
+# On this exact local stack, torch.compile's Triton mutation analysis raises
+# ``IndexError('Function argument index out of range')`` for both custom TRSM
+# kernels, assumes every input is mutated, and silently emits NaNs. Keeping the
+# two launches opaque restores correct compiled forward/backward while leaving
+# every remote/Linux and newer-toolchain path unchanged.
+_NEEDS_TRSM_COMPILER_FALLBACK = (
+    os.name == "nt"
+    and sys.version_info[:2] == (3, 13)
+    and torch.__version__ == "2.10.0+cu128"
+    and triton.__version__ == "3.7.0"
+)
 
 
 def _bmm(a, b):
@@ -122,6 +135,11 @@ def _trsm_upper_triton(L, g_U):
     return dU
 
 
+if _NEEDS_TRSM_COMPILER_FALLBACK:
+    _trsm_triton = torch.compiler.disable(_trsm_triton)
+    _trsm_upper_triton = torch.compiler.disable(_trsm_upper_triton)
+
+
 class _TrsmFn(torch.autograd.Function):
     # Opaque cuSOLVER trsm -> custom Triton fwd + hand bwd. No inductor fusion is
     # lost (trsm was already an opaque linalg call), so the autograd.Function
@@ -142,7 +160,7 @@ class _TrsmFn(torch.autograd.Function):
         return g_L, g_rhs, None
 
 
-def _scan_impl(q, k, v, g, beta_e, beta_w, out_mix=None):
+def _scan_core(q, k, v, g, beta_e, beta_w, out_mix=None, *, return_scores):
     B, T, H, r_out, dk = q.shape
     dv = v.shape[-1]
     N = B * H
@@ -192,6 +210,7 @@ def _scan_impl(q, k, v, g, beta_e, beta_w, out_mix=None):
     eye = torch.eye(C, device=dev)
 
     out_chunks = []
+    score_chunks = [] if return_scores else None
     for c in range(nC):
         vc = v_c[:, c]            # [N, C, dv]
         qcc = q_c[:, c]           # [N, C, r_out, dk]
@@ -212,6 +231,8 @@ def _scan_impl(q, k, v, g, beta_e, beta_w, out_mix=None):
         L = eye + bec.unsqueeze(-1) * Kmat                              # [N, C, C] unit-lower
         rhs = bwc.unsqueeze(-1) * vc - bec.unsqueeze(-1) * m_inter     # [N, C, dv]
         U = _TrsmFn.apply(L, rhs, tril_strict)
+        if return_scores:
+            score_chunks.append(k_c[:, c].norm(dim=-1) * U.norm(dim=-1))
 
         # Intra-chunk output: term2[i,r] = sum_{j<=i} (qUp_i . kDn_j) u_j
         # Reuse qUp_flat (shared left factor with term1) so inductor can fuse the two qUp@X gemms.
@@ -231,7 +252,25 @@ def _scan_impl(q, k, v, g, beta_e, beta_w, out_mix=None):
         S = gcumF_c[:, -1, :].unsqueeze(-1) * (S + W)                  # [N, dk, dv]
 
     y_out = torch.cat(out_chunks, dim=1)[:, :T, :]                     # [N, T, dv]
-    return y_out.transpose(0, 1).reshape(T, B, H, dv).permute(1, 0, 2, 3)
+    y = y_out.transpose(0, 1).reshape(T, B, H, dv).permute(1, 0, 2, 3)
+    if return_scores:
+        scores_nt = torch.cat(score_chunks, dim=1)[:, :T]              # [N, T]
+        scores = scores_nt.transpose(0, 1).reshape(T, B, H).permute(1, 0, 2)
+        return y, scores.detach()
+    return y, None
+
+
+def _scan_impl(q, k, v, g, beta_e, beta_w, out_mix=None):
+    y, _ = _scan_core(
+        q, k, v, g, beta_e, beta_w, out_mix, return_scores=False
+    )
+    return y
+
+
+def _scan_with_update_norm_impl(q, k, v, g, beta_e, beta_w, out_mix=None):
+    return _scan_core(
+        q, k, v, g, beta_e, beta_w, out_mix, return_scores=True
+    )
 
 
 # At C=16 (needed for fp32 numerical safety) nC = T/16 is larger (32 train / 128
@@ -240,3 +279,4 @@ def _scan_impl(q, k, v, g, beta_e, beta_w, out_mix=None):
 # body: measured 33x fwd+bwd vs the reference loop (eager is 9.7x). Recompiles per
 # distinct nC (i.e. per seq_len) — one-time for the fixed-512 heal.
 scan = torch.compile(_scan_impl)
+scan_with_update_norm = torch.compile(_scan_with_update_norm_impl)
