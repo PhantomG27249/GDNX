@@ -998,21 +998,26 @@ matched recency controls; passing only the weaker control is insufficient.
 
 ### Promotion from full recomputation to Option 3 streaming
 
-Option 3 begins only if the exact-cache family passes all of these preregistered
-Qwen gates. Unless a rule explicitly says deterministic, it applies to a paired
-95% bootstrap interval over matched seeds/examples:
+Option 3 has two independently evaluated preregistered branches:
 
-Items 1, 2, and 4 use `variant - matched native continuation`; item 3 uses
-`surprise - matched recency`; item 5 must pass separately against both controls.
+- **surprise branch:** `variant` is the winning preregistered surprise policy;
+  it must pass gates 1-8, including the direct surprise-versus-recency gate 3;
+- **recency branch:** `variant` is the matched recency cache; it must pass gates
+  1, 2, and 4-8; gate 3 is not applicable and the result receives no
+  surprise-selection label.
+
+Unless a rule explicitly says deterministic, each gate applies to a paired 95%
+bootstrap interval over matched seeds/examples. Items 1, 2, and 4 use
+`variant - matched native continuation`; gate 3 uses
+`surprise - matched recency`; gate 5 must pass separately against both controls.
 
 1. macro per-answer recall over `{16K,32K} x {4q,8q}` has paired 95% interval
    lower bound at least `+0.10` versus native continuation;
 2. at least two individual long-context cells also have lower bound at least
    `+0.10`, so the claim cannot rely only on a collapsed 32K baseline;
-3. the surprise policy has long-context lower bound at least `+0.05` versus a
-   capacity/read/gate/budget-matched recency cache before the admission rule is
-   credited; if only recency wins, the cache family may promote but the result
-   is not labelled surprise-selection evidence;
+3. for the surprise branch only, the surprise policy has long-context lower
+   bound at least `+0.05` versus a capacity/read/gate/budget-matched recency
+   cache;
 4. 512-4K macro recall lower bound is at least `-0.02`, no individual short
    cell is below `-0.03`, 8K is no worse than `-0.03`, and episode exact-match
    macro is no worse than `-0.05`;
@@ -1038,9 +1043,10 @@ Those defaults are part of the committed promotion configuration and may be
 changed only before jobs are expanded. They are never inferred from observed
 results.
 
-The winning policy, not a preregistered preference for surprise, is what Option
-3 integrates. A result that needs changed decay, recurrence, rotation resets,
-or another simultaneous mechanism fails this promotion gate.
+If the surprise branch passes, Option 3 integrates surprise selection. Otherwise
+it may integrate recency only if the recency branch passes. If neither branch
+passes, Option 3 does not begin. A result that needs changed decay, recurrence,
+rotation resets, or another simultaneous mechanism fails both branches.
 
 #### Option 3 state and execution contract
 
