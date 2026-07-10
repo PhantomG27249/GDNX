@@ -284,7 +284,11 @@ The validated schema includes:
 - optimizer and schedule;
 - model/state dimensions and finite `d_ff_match_min`/`d_ff_match_max` bounds;
 - exact-cache width, processing-block size, admission score, read
-  normalization, coordinate frame, dtype, causality, and tie policy;
+  normalization/initialization, coordinate frame, fp32 compute dtype, explicit
+  storage dtype, causality, tie policy, and cache-optimizer settings;
+- exact-cache promotion thresholds for gate opening, persistent hit rate,
+  conditional read accuracy, shuffled-cache dependence, and neighboring
+  capacity stability;
 - context-length curriculum and extrapolation lengths;
 - primary metric, metric direction, `min_useful`, `harm_threshold`,
   `min_reliance`, and equivalence band;
@@ -349,6 +353,37 @@ cache read. The only production-path extension is a separately named
 `scan_with_update_norm()` helper in `gdn3/kmd2_fast_scan.py`; existing `scan()`
 callers remain unchanged.
 
+The suite owns installation; the production upgrade manager is not changed.
+`install_exact_cache()` performs this ordered procedure:
+
+1. load the base model and apply `GDN3UpgradeManager` in native mode;
+2. when a native-heal checkpoint is declared, load it into those native layers
+   first and require every supplied tensor name/shape to be consumed (missing
+   non-checkpoint model keys are expected; unexpected checkpoint keys fail);
+3. for each upgraded index, require an actual `KMD2NativeAttn`, construct
+   `KMD2ExactCacheAttn.from_native(native_layer, cache_config)`, transfer every
+   inherited parameter and buffer strictly by name/shape, and require the only
+   newly initialized names to be the declared cache parameters;
+4. preserve layer index, `r_out`, device, dtype, training state, and inherited
+   `requires_grad` flags, verify inherited tensors are byte-equal before
+   replacing `layer.linear_attn`; and
+5. load a cache-enabled resume only after replacement, using a suite schema that
+   requires all cache tensors and rejects missing or unexpected targeted-layer
+   keys.
+
+Paired native continuation uses the same pre-replacement checkpoint state. A
+suite-owned `QwenExactCacheRunner` validates top-level call arguments before
+every heal/evaluation forward; it rejects padding/packing, cache/decode state,
+segment/reset metadata, and unsupported position semantics before the inherited
+layer forward is entered. The initial path is supported only through this
+runner, not as a general external model API.
+
+Concretely, `attention_mask` is absent or all ones; `position_ids` is absent or
+the monotonic `0..T-1` row for each example; `use_cache` is false; and
+`cache_params`, `past_key_values`, `cache_position`, `cu_seqlens`,
+`segment_ids`, and `reset_mask` are absent/empty. Any other value fails before
+model execution.
+
 It supports two evidence modes.
 
 #### Reliance mode
@@ -382,8 +417,8 @@ Recurrence-changing variants use the Python reference loop. The suite must not
 fall back silently to the existing fast scan.
 
 Exact cache does not change the recurrence and may use the score-returning fast
-path only after output, score, selected-index, and gradient parity pass. Its
-initial Qwen runs are full-recomputation only and reject incremental decode,
+path only after output, score, selected-index, and gradient parity pass. The
+**initial full-recomputation Qwen exact-cache mode** rejects incremental decode,
 packed inputs, or cross-call state.
 
 Native state-size changes and true MIMO are not valid warm-start heal arms.
@@ -503,13 +538,14 @@ S_bar = D_t * S_prev
 m_t = k_t^T S_bar
 u_t = beta_w,t * v_t - beta_e,t * m_t
 S_t = S_bar + k_t u_t^T
-score_exact,t = ||u_t||_2
+score_exact,t = ||k_t||_2 * ||u_t||_2 = ||k_t u_t^T||_F
 ```
 
-The normalized key remains unit norm after the orthogonal paired rotation, so
-`||k_t u_t^T||_F = ||u_t||_2`. The exact score is therefore the magnitude of
-the rank-one change actually committed by KMD-2, excluding the separate decay
-of old state. At the native warm start, `beta_w=beta_e=beta`, so it reduces to
+The exact score is the magnitude of the rank-one change actually committed by
+KMD-2, excluding the separate decay of old state. Production normalization uses
+an epsilon floor, so a zero or sub-epsilon projected key is not unit norm; the
+`||k_t||_2` factor is required rather than assumed away. For ordinary nonzero
+unit keys and the native warm start `beta_w=beta_e=beta`, the score reduces to
 the paper-style `beta * ||v_t - m_t||`. After the write gate decouples, the
 paper-style expression and actual KMD-2 update magnitude are distinct arms.
 
@@ -517,7 +553,7 @@ paper-style expression and actual KMD-2 update magnitude are distinct arms.
 
 The default cache is independent for every batch item and head. It stores:
 
-- the rotated, unit-normalized key used by the recurrence;
+- the actual rotated, epsilon-normalized key used by the recurrence;
 - the corresponding raw post-convolution/SiLU value `v_t`, never `u_t`;
 - the detached fp32 admission score;
 - the absolute position; and
@@ -532,6 +568,16 @@ position descending, so newer tokens deterministically win exact score ties.
 Selection is non-differentiable: scores and indices are detached, while gathered
 K/V tensors retain their ordinary within-forward gradient paths.
 
+Score computation and the cache read use fp32. Storage has a separate explicit
+`cache_storage_dtype`: tiny/oracle runs default to fp32 and the primary Qwen arm
+uses bf16. Admission casts the actual rotated `k` and raw `v` to storage dtype;
+read casts them back to fp32 before RMSNorm, logits, and value accumulation. The
+cast remains differentiable during full recomputation. Here "exact K/V" means
+an uncompressed token-level association at the declared storage dtype, not a
+bitwise fp32 copy. Reference and fast implementations compare after the same
+storage round-trip; an fp32-storage diagnostic reports quantization sensitivity
+but is not substituted silently for the configured Qwen arm.
+
 The processing-block size `C_cache` is independent of both persistent width
 `w` and the numerical fast-scan chunk. `w=0` is allowed only for the declared
 current-block-only control; a top-surprise experiment requires `w >= 1`, at
@@ -543,8 +589,8 @@ The cache uses the query represented by the existing shared-query output mixer:
 
 ```text
 q_eff = sum_r out_mix_r * q_slot_r
-q_tilde = RMSNorm_gamma_q(q_eff)
-k_tilde_j = RMSNorm_gamma_k(k_j)
+q_tilde = gamma_q * q_eff / sqrt(mean(q_eff^2) + eps_cache)
+k_tilde_j = gamma_k * k_j / sqrt(mean(k_j^2) + eps_cache)
 logit_j = q_tilde^T k_tilde_j / sqrt(dk)
 logit_sink = sink_logit_head
 a = softmax([logit_valid, logit_sink])
@@ -553,15 +599,21 @@ y = y_state + lambda_head * y_cache
 ```
 
 The Q/K RMSNorm scale vectors are cache-only and shared across heads within a
-layer; they never alter the unit-normalized recurrence factors. The sink logit
-and cache amplitude are per head. `lambda_head` is directly trainable,
+layer; they never alter the recurrence factors. `gamma_q` and `gamma_k`
+initialize to ones, `eps_cache` defaults to the model RMS epsilon (or `1e-6`
+when unavailable), and every per-head sink logit initializes to zero. The sink
+logit and cache amplitude are per head. `lambda_head` is directly trainable,
 constrained to `[0,1]`, and initialized at exactly zero. This preserves the
 checkpoint output while giving the amplitude a usable first-step gradient;
 the optimizer projects it back into `[0,1]` after every step;
 the norm and sink parameters may begin receiving gradients after the amplitude
 opens. The cache sum is applied before the existing gated RMSNorm and output
 projection. Cache amplitude, RMSNorm scales, and sink logits use a dedicated
-optimizer group whose learning rate is declared and matched across cache arms.
+AdamW group with declared `lr_cache`, the same betas/epsilon/schedule as the
+memory group, and zero weight decay. The amplitude is projected after each
+optimizer step; an out-of-range resumed amplitude is rejected, not silently
+projected. All cache parameters and optimizer state are serialized in the suite
+resume format.
 
 Rotated recurrence-space K/V is the primary arm. A pre-rotation cache coordinate
 is a promoted diagnostic only, because it requires a broader experimental
@@ -574,23 +626,26 @@ an interaction experiment, not the default and not true MIMO.
 All admission arms use identical capacity, block geometry, read, gate, training
 budget, and examples:
 
-- exact KMD-2 committed update `||beta_w v - beta_e m||`;
-- coupled-paper port `beta_w ||v - m||`;
-- residual only `||v - m||`;
-- write-value only `beta_w ||v||`;
+- exact KMD-2 committed update `||k|| ||beta_w v - beta_e m||`;
+- coupled-paper port `||k|| beta_w ||v - m||`;
+- residual only `||k|| ||v - m||`;
+- write-value only `||k|| beta_w ||v||`;
 - recency/FIFO;
 - seeded reservoir/random; and
 - a future-query oracle used only as a diagnostic ceiling.
 
-Read controls are unit-L2 softmax, a fixed-temperature sharp read matched at
-initial logit scale, and learned cache-only RMSNorm. Cache-off and
-current-block-only controls separate persistent exact memory from local exact
-attention.
+The unit-L2 read uses `q_hat^T k_hat / sqrt(dk)`. Its fixed-temperature control
+uses `sqrt(dk) * q_hat^T k_hat`, equivalent to temperature `dk` under the same
+division and matching the ideal `gamma=1` RMSNorm scale. The learned arm uses
+the explicit cache-only RMSNorm above. All share the zero sink initialization.
+Cache-off and current-block-only controls separate persistent exact memory from
+local exact attention.
 
 #### Fast-scan instrumentation
 
 The chunk scan already solves for the per-token `u_t` vectors as `U`. A separate
-`scan_with_update_norm()` entry point may return `(y, ||U||_2)` without changing
+`scan_with_update_norm()` entry point may return
+`(y, ||k||_2 * ||U||_2)` without changing
 the existing `scan()` API; the returned fp32 norms are detached before policy
 selection. The experimental subclass overrides only the scan
 call boundary and reuses the production forward projections, rotation, norm,
@@ -599,8 +654,9 @@ fast path matches state output, scores, selected indices, cache read, and
 gradients. Float64 oracle tests use `atol=1e-10, rtol=1e-8`; fp32 reference
 tests use `atol=1e-6, rtol=1e-5`; CUDA fast-path gates retain the current
 `<2e-3` forward relMSE and `<1e-2` gradient relMSE limits. Score/index parity
-uses both well-separated scores and constructed exact ties. Stage 1 does not
-accept or return streaming state.
+uses both well-separated scores and constructed exact ties. The initial
+full-recomputation Qwen exact-cache mode does not accept or return streaming
+state.
 
 ### Corrected momentum
 
@@ -824,7 +880,11 @@ cost of current truth.
 
 When the queried item is cached, the suite reports top-1 key accuracy, gold
 attention mass, entropy/effective support, wrong-key rate, and cache-only value
-exact match. Capacity sweeps use `w={0,8,16,32,64,128}` with fixed block size;
+exact match. Every generated fact carries an exact source-position annotation;
+for a multi-token Qwen needle, a persistent hit means at least one valid cache
+position lies in the gold needle span, and top-1 is correct only when its
+position lies in that span. Atomic/direct-factor tasks use their single declared
+write position. Capacity sweeps use `w={0,8,16,32,64,128}` with fixed block size;
 only the winning policy/read subsequently sweeps
 `C_cache={64,128,256}`. MQAR loads and query counts cross below, near, and above
 `w`. Quality is reported against persistent/working bytes, latency, and VRAM,
@@ -923,15 +983,27 @@ Exact cache uses the following serial gates rather than a full Cartesian sweep:
 6. **Qwen heal:** compare paired native continuation, capacity/read-matched
    recency cache, and the winning surprise cache.
 
+For cache interactions with an existing feature, let `A` be cache off/on and
+`B` be the existing feature off/on (`B=1` is the complete-current setting:
+learned rotation or `r_out=4`). The four cells are `M00`, `M10`, `M01`, and
+`M11`. Cache's incremental effect against the complete current implementation
+is `direction*(M11-M01)`; its feature-off replacement contrast is
+`direction*(M10-M00)`. Neither is replaced by the interaction statistic.
+
 Tiny selector/read promotion uses an absolute five-point lower-confidence-bound
-gain on the declared primary accuracy metric. Short-context accuracy and
-latest-value freshness must each remain within two points of the appropriate
-native or recency control.
+gain on the declared primary accuracy metric. Short-context accuracy must have
+`L >= -0.02` versus native. Latest-value accuracy and direction-normalized
+stale-error effect must each have `L >= -0.02` versus both matched native and
+matched recency controls; passing only the weaker control is insufficient.
 
 ### Promotion from full recomputation to Option 3 streaming
 
 Option 3 begins only if the exact-cache family passes all of these preregistered
-Qwen gates:
+Qwen gates. Unless a rule explicitly says deterministic, it applies to a paired
+95% bootstrap interval over matched seeds/examples:
+
+Items 1, 2, and 4 use `variant - matched native continuation`; item 3 uses
+`surprise - matched recency`; item 5 must pass separately against both controls.
 
 1. macro per-answer recall over `{16K,32K} x {4q,8q}` has paired 95% interval
    lower bound at least `+0.10` versus native continuation;
@@ -944,13 +1016,27 @@ Qwen gates:
 4. 512-4K macro recall lower bound is at least `-0.02`, no individual short
    cell is below `-0.03`, 8K is no worse than `-0.03`, and episode exact-match
    macro is no worse than `-0.05`;
-5. latest-value freshness remains within two points of native/recency;
-6. held-out CE increases by at most `0.02`, distillation KL increases by at
-   most `max(0.005, 5%)`, and there are no non-finite values or skipped steps;
-7. the gain exists at `w=64`, does not require `w>128`, and is not an isolated
-   capacity spike; and
-8. cache hit/read diagnostics show a real query-linked mechanism rather than a
-   gate that stayed closed or a sharp read that chose arbitrary slots.
+5. latest-value accuracy and direction-normalized stale-error effect each have
+   lower bound at least `-0.02` versus both native and recency;
+6. the upper bound of `CE_variant-CE_native` is at most `0.02`; the upper bound
+   of `KL_variant-KL_native` is at most
+   `max(0.005, 0.05 * mean(KL_native))`, where the mean is from the matched
+   native-continuation examples; non-finite values or skipped steps fail
+   deterministically;
+7. `w=64` passes the primary `+0.10` gate and at least one adjacent capacity
+   (`w=32` or `w=128`) has primary lower bound at least `+0.05`; no result that
+   requires `w>128` can promote; and
+8. the mean final cache amplitude across installed heads/layers is at least the
+   configured `min_gate_mean` (default `0.005`) and the maximum is at least
+   `min_gate_max` (default `0.02`); on the primary long cells, persistent queried
+   item hit-rate lower bound is at least `min_persistent_hit` (default `0.25`),
+   conditional-on-hit cache top-1 key accuracy lower bound is at least
+   `min_conditional_read` (default `0.50`), and shuffling cache values causes a
+   recall-drop lower bound of at least `min_shuffle_drop` (default `0.05`).
+
+Those defaults are part of the committed promotion configuration and may be
+changed only before jobs are expanded. They are never inferred from observed
+results.
 
 The winning policy, not a preregistered preference for surprise, is what Option
 3 integrates. A result that needs changed decay, recurrence, rotation resets,
@@ -965,11 +1051,12 @@ S                  fp32 [B,H,dk,dv]
 conv_tail           model_dtype [B,conv_dim,conv_k-1]
 phase               fp32 [B,H,dk/2]
 next_position       int64 [B]
-persistent.{k,v}    model_dtype [B,H,w,dk or dv]
+persistent.{k,v}    cache_storage_dtype [B,H,w,dk or dv]
 persistent.score    fp32 [B,H,w]
 persistent.position int64 [B,H,w]
 persistent.valid    bool [B,H,w]
-block.{k,v,score,position,valid}  bounded current-block prefix
+block.{k,v}          cache_storage_dtype bounded current-block prefix
+block.{score,position,valid}     fp32/int64/bool metadata
 block_length        int64 [B]
 ```
 
@@ -985,13 +1072,22 @@ Padding rows are complete state no-ops. EOS does not implicitly reset. Beam
 reordering covers every field without aliasing duplicated beams, and rejected
 speculative tokens never commit their transactional state.
 
-At `w=64`, persistent top-`w` K/V for all 18 native layers is limited to roughly
-10 MiB per beam. The bounded current-block workspace is reported separately
-(about 36 MiB at `C_cache=256`) and may not be hidden from total dynamic-memory
-figures. Option 3 also requires decode throughput at least `0.80x`, prefill at
-least `0.75x`, and KMD-2 dynamic memory flat with context. The six preserved
-full-attention layers still have growing KV caches, so no whole-model O(1)
-memory claim is permitted.
+For one stored entry, logical bytes are
+`(dk+dv)*bytes(cache_storage_dtype) + 4(score) + 8(position) + 1(valid)`;
+reports include both this tensor-byte formula and measured allocator usage. At
+`w=64`, bf16 persistent K/V plus metadata for all 18 native layers is about
+9.23 MiB per beam. The bounded bf16 current-block K/V plus metadata is about
+36.91 MiB at `C_cache=256`. fp32 storage approximately doubles only the K/V
+portion (about 18.23 and 72.91 MiB respectively). Logit/softmax working
+allocations are measured separately and may not be hidden from peak-memory
+figures.
+
+The Option 3 persistent-cache acceptance limit is 10 MiB/beam only for the
+declared bf16 `w=64` arm; other dtypes use the formula-derived limit recorded in
+configuration. Option 3 also requires decode throughput at least `0.80x`,
+prefill at least `0.75x`, and KMD-2 dynamic memory flat with context. The six
+preserved full-attention layers still have growing KV caches, so no whole-model
+O(1) memory claim is permitted.
 
 ## Metrics and Statistical Decisions
 
@@ -1007,8 +1103,8 @@ Every run records:
 - Git revision and relevant source hashes; and
 - Python, PyTorch, CUDA, GPU, and dependency versions.
 
-Exact-cache runs additionally record cache width/block size, score definition
-and dtype, coordinate frame, inclusive-causal and tie policies, amplitude
+Exact-cache runs additionally record cache width/block size, score definition,
+fp32 compute dtype, storage dtype, coordinate frame, inclusive-causal and tie policies, amplitude
 initial/final values, selected-index digest, selection-score statistics,
 retention/eviction counts, queried-item hit rate, recall conditional on a hit,
 sink mass, attention entropy/top-1 mass, stale-key occupancy/error, cache/state
@@ -1064,7 +1160,8 @@ Rules are evaluated in this order:
 2. **harmful:** `U <= -harm_threshold`, or a protected metric has
    `U < -max_regression` (confident unacceptable regression);
 3. **synergistic:** interaction arm only; it is protected-safe and the lower
-   interval bound for `I = d_AB - d_A - d_B` is at least the configured
+   interval bound for
+   `I = direction * (M11 - M10 - M01 + M00)` is at least the configured
    `min_synergy`;
 4. **incremental:** `L >= min_useful` against the complete current baseline and
    all protected metrics are safe;
@@ -1075,9 +1172,12 @@ Rules are evaluated in this order:
 7. **inconclusive:** every remaining valid result, including an interval that
    still contains both a useful gain and meaningful harm.
 
-All terms in the synergy contrast use the same complete baseline, matched
-examples, seed set, metric direction, and budget. Interactions that do not have
-all four factorial cells are invalid rather than approximated.
+Every four-cell contrast uses matched examples, seed set, metric direction, and
+budget. For two absent additions, `M00` is the complete current baseline. For an
+addition crossed with an existing feature, `M01` is the complete current
+baseline and the incremental addition contrast is `M11-M01` as defined above.
+Interactions that do not have all four factorial cells are invalid rather than
+approximated.
 
 ### Reliance semantics for existing features
 
@@ -1143,15 +1243,17 @@ The suite must fail explicitly for:
 - requested Qwen native state-size changes;
 - identity or active-effect gate failure;
 - unavailable fast-scan support for a recurrence variant;
-- exact-cache Qwen masks containing padding, packed-segment metadata,
-  incremental decode/cache parameters, or cross-call state during Stage 1;
+- initial full-recomputation Qwen exact-cache calls containing padding,
+  packed-segment metadata, incremental decode/cache parameters, or cross-call
+  state;
 - a top-surprise screen with no possible eviction or an invalid cache/block
   width;
 - non-finite loss or gradients;
 - OOM; and
 - malformed or conflicting resume records.
 
-Stage-1 exact-cache Qwen accepts only `attention_mask=None` or an all-one
+Initial full-recomputation Qwen exact-cache mode accepts only
+`attention_mask=None` or an all-one
 `[B,T]` mask because the current native recurrence does not make padded tokens
 state no-ops. Masked/padded sequences, packed inputs, position resets,
 incremental decode, and nonempty cache parameters fail with distinct actionable
@@ -1174,31 +1276,37 @@ fresh:
 1. `preflight --backend tiny` passes on CPU with only tiny requirements.
 2. The tiny recurrence matches the production native reference scan in forward
    and backward tests at declared tolerances.
-3. The Qwen exact-cache class subclasses production `KMD2NativeAttn`, reuses its
-   forward/projections/output path, and confines its override to the scan call
-   boundary rather than copying the production forward method.
+3. The suite-owned installer applies the unmodified upgrade manager, consumes
+   every declared native-checkpoint tensor, replaces only verified native layers
+   through `from_native`, strictly transfers every inherited tensor/attribute,
+   initializes only declared cache names, and validates unsupported top-level
+   call arguments before the inherited forward. The exact-cache class subclasses
+   `KMD2NativeAttn` and confines its override to the scan call boundary.
 4. The inventory recognizes current convolution, rotation, shared-query
    `r_out=4`, channel decay, write offset, absence of native exact cache, and the
    inactive legacy circular residual-buffer overlap.
 5. Identity-gated variants match the full baseline before training; active
    settings change their intended path with finite gradients.
 6. An independent float64 token-loop oracle proves
-   `score=||beta_w v-beta_e m||_2=||k u^T||_F` for unit rotated keys and proves
-   that cache storage uses raw `v`, not `u`.
+   `score=||k||_2 ||beta_w v-beta_e m||_2=||k u^T||_F`, including zero and
+   sub-epsilon keys, and proves that cache storage uses raw `v`, not `u`.
 7. Exact-cache selection tests prove independent per-head top-`w`, inclusive
    `j<=t` causality, future-prefix invariance, block-boundary persistence,
    score-descending/position-descending ties, eviction, and bounded size.
 8. `scan_with_update_norm()` preserves existing `scan()` output/API and matches
-   the reference in state output, update scores, selected indices, cache read,
+   the reference in state output, exact outer-update scores, selected indices, cache read,
    and gradients for q/k/v, decay, erase/write gates, `out_mix`, cache norms,
    sink, and amplitude. Tests cross `r_out=1/4`, non-one-hot mixing, block
    boundaries, and sequence lengths around both scan and cache chunks.
 9. Exact-cache branch-local tests prove recurrence q/k and `y_state` are
-   unchanged, empty/sink reads are finite and zero-valued, zero amplitude has a
-   finite nonzero opening gradient, and a nonzero amplitude trains the cache
-   parameters.
-10. Stage-1 Qwen rejects padding masks, packed segments, incremental decode,
-    cross-call state, and configurations that cannot exercise eviction.
+   unchanged; fp32 compute with fp32/bf16 storage matches an oracle using the
+   identical cast round-trip; gamma-one/epsilon, zero-sink, and fixed-temperature
+   initializations match their equations; empty reads are finite; zero amplitude
+   has a finite nonzero opening gradient; and cache parameters/optimizer state
+   save and resume strictly.
+10. Initial full-recomputation Qwen exact-cache mode rejects padding masks,
+    packed segments, incremental decode, cross-call state, and configurations
+    that cannot exercise eviction.
 11. The trapezoid recurrence resets its factor carry at every declared boundary,
     exactly matches native update at `rho_head=0`, and produces a nonzero active
     effect when the carry gate is enabled.
@@ -1214,8 +1322,8 @@ fresh:
     completed jobs, and produces valid JSON and CSV summaries.
 15. Statistical classification exercises every mutually exclusive addition and
     reliance label using configured 95% paired intervals, protected-metric
-    vetoes, a complete four-cell synergy contrast, and rejected overlapping
-    thresholds.
+    vetoes, direct `M11-M10-M01+M00` factorial contrasts, complete-current
+    incremental contrasts, and rejected overlapping thresholds.
 16. Exact-cache selector, read, capacity, and intervention screens vary one
     factor at a time, contain matched recency/reservoir/oracle controls, cause
     real eviction, and record hit/read/staleness diagnostics.
@@ -1223,8 +1331,10 @@ fresh:
     rejects unsupported native state-size or Option-3 streaming arms without
     loading large assets.
 18. The exact-cache Qwen job expansion contains paired native, recency, and
-    winning-policy heals with matched seeds/examples/budgets and the declared
-    Option-3 promotion/protected thresholds.
+    winning-policy heals with matched seeds/examples/budgets and mechanically
+    testable Option-3 intervals for retrieval, freshness against both controls,
+    CE/KL, adjacent capacities, gate opening, persistent hits, conditional read,
+    and shuffled-cache dependence.
 19. Two concurrent shards plus an interrupted writer leave valid atomic run
     records and produce byte-identical ledgers across repeated summarization.
 20. Canonical hash sharding is invariant to JSON key order and
@@ -1232,7 +1342,8 @@ fresh:
 21. Forced OOM and malformed-input tests create typed atomic failure records and
     never silently change batch, length, dtype, state, cache, or task settings.
 22. Optional CUDA tests record device, throughput, VRAM, recurrent bytes,
-    persistent-cache bytes, and block-workspace bytes.
+    storage/compute dtypes, formula-derived metadata-inclusive persistent/block
+    bytes, and measured allocator bytes.
 23. Tiny and Qwen upload bundles are each built twice byte-identically, reopened,
     content/hash-checked, extracted fresh, and smoke-tested without the source
     checkout; external large assets and secrets are absent.
