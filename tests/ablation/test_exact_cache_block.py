@@ -348,6 +348,23 @@ def test_exact_cache_state_rejects_nonfinite_scores_only_when_valid() -> None:
     assert torch.isnan(state.scores[0, 0, 0])
 
 
+@pytest.mark.parametrize("field", ["keys", "values"])
+@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), float("-inf")])
+def test_exact_cache_state_rejects_nonfinite_key_values_only_when_valid(
+    field: str,
+    nonfinite: float,
+) -> None:
+    tensors = _valid_state_tensors()
+    tensors[field][0, 0, 0, 0] = nonfinite
+
+    with pytest.raises(ValueError, match=f"{field}.*finite.*valid"):
+        ExactCacheState(**tensors)
+
+    tensors["valid"][0, 0, 0] = False
+    state = ExactCacheState(**tensors)
+    assert not torch.isfinite(getattr(state, field)[0, 0, 0, 0])
+
+
 def _valid_block_inputs() -> list[torch.Tensor]:
     return [
         torch.zeros(2, 3, 4, 5),
@@ -506,6 +523,73 @@ def test_merge_rejects_nonfinite_scores_at_valid_block_positions(
             width=2,
             storage_dtype=torch.float32,
         )
+
+
+@pytest.mark.parametrize("input_index", [0, 1])
+@pytest.mark.parametrize("nonfinite", [float("nan"), float("inf"), float("-inf")])
+def test_merge_rejects_nonfinite_key_values_at_valid_block_positions(
+    input_index: int,
+    nonfinite: float,
+) -> None:
+    inputs = _valid_block_inputs()
+    inputs[input_index][0, 0, 0, 0] = nonfinite
+    field = "block_k" if input_index == 0 else "block_v"
+
+    with pytest.raises(ValueError, match=f"{field}.*finite.*valid"):
+        merge_persistent_cache(
+            None,
+            *inputs,
+            width=2,
+            storage_dtype=torch.float32,
+        )
+
+
+def test_merge_ignores_nonfinite_key_values_at_invalid_block_positions() -> None:
+    state = merge_persistent_cache(
+        None,
+        torch.tensor([[[[float("nan")]], [[7.0]]]]),
+        torch.tensor([[[[float("inf")]], [[17.0]]]]),
+        torch.tensor([[[float("-inf")], [3.0]]]),
+        torch.tensor([[4, 5]]),
+        torch.tensor([[False, True]]),
+        width=2,
+        storage_dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(state.keys, torch.tensor([[[[7.0], [0.0]]]]))
+    torch.testing.assert_close(state.values, torch.tensor([[[[17.0], [0.0]]]]))
+    torch.testing.assert_close(state.positions, torch.tensor([[[5, -1]]]))
+    torch.testing.assert_close(state.valid, torch.tensor([[[True, False]]]))
+    assert torch.isfinite(state.keys).all()
+    assert torch.isfinite(state.values).all()
+
+
+def test_merge_ignores_nonfinite_key_values_in_invalid_persistent_slots() -> None:
+    prior = ExactCacheState(
+        keys=torch.tensor([[[[float("nan")]]]]),
+        values=torch.tensor([[[[float("-inf")]]]]),
+        scores=torch.tensor([[[float("inf")]]]),
+        positions=torch.tensor([[[99]]]),
+        valid=torch.tensor([[[False]]]),
+    )
+
+    state = merge_persistent_cache(
+        prior,
+        torch.tensor([[[[8.0]]]]),
+        torch.tensor([[[[18.0]]]]),
+        torch.tensor([[[4.0]]]),
+        torch.tensor([[6]]),
+        torch.tensor([[True]]),
+        width=2,
+        storage_dtype=torch.float32,
+    )
+
+    torch.testing.assert_close(state.keys, torch.tensor([[[[8.0], [0.0]]]]))
+    torch.testing.assert_close(state.values, torch.tensor([[[[18.0], [0.0]]]]))
+    torch.testing.assert_close(state.positions, torch.tensor([[[6, -1]]]))
+    torch.testing.assert_close(state.valid, torch.tensor([[[True, False]]]))
+    assert torch.isfinite(state.keys).all()
+    assert torch.isfinite(state.values).all()
 
 
 def _cache_config(

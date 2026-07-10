@@ -132,6 +132,10 @@ class ExactCacheState:
             raise ValueError("all ExactCacheState tensors must share a device")
         if self.scores.requires_grad or self.scores.grad_fn is not None:
             raise ValueError("scores must be detached")
+        detached_valid = self.valid.detach()
+        for name, tensor in (("keys", self.keys), ("values", self.values)):
+            if not bool(torch.isfinite(tensor.detach()[detached_valid]).all()):
+                raise ValueError(f"{name} must be finite at every valid cache slot")
         if not bool(torch.isfinite(self.scores[self.valid]).all()):
             raise ValueError("scores must be finite at every valid cache slot")
 
@@ -334,7 +338,11 @@ def _validate_merge_inputs(
         if state.keys.device != block_device:
             raise ValueError("state and completed-block tensors must share a device")
 
-    valid_scores = block_scores.detach()[block_valid.detach()]
+    detached_valid = block_valid.detach()
+    for name, tensor in (("block_k", block_k), ("block_v", block_v)):
+        if not bool(torch.isfinite(tensor.detach()[detached_valid]).all()):
+            raise ValueError(f"{name} must be finite at every valid block position")
+    valid_scores = block_scores.detach()[detached_valid]
     if not bool(torch.isfinite(valid_scores).all()):
         raise ValueError("block_scores must be finite at every valid block position")
 
