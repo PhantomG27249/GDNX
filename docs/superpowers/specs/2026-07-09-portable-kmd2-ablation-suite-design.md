@@ -143,15 +143,12 @@ or proposed mechanism:
 | Rotation | rotation x pair-tied versus independent channel decay |
 | State size / true MIMO | state size x SISO/true-MIMO; current `r_out=4` remains a separate control |
 
-Results are classified as:
-
-- **incremental:** positive effect with the full current baseline;
-- **replacement-only:** useful only when an existing mechanism is removed;
-- **redundant:** incremental effect is below the preregistered useful threshold;
-- **synergistic:** the combined effect exceeds the declared additive
-  expectation;
-- **harmful:** the feature crosses the declared regression threshold; or
-- **inconclusive:** uncertainty includes both useful gain and meaningful harm.
+New additions are classified as **incremental**, **replacement-only**,
+**redundant**, **synergistic**, **harmful**, or **inconclusive** by the mutually
+exclusive rules in "Metrics and Statistical Decisions." Existing rotation and
+convolution are not additions; their on/off arms use the separate reliance
+labels **relied-on**, **dispensable**, **harmful-current**, or
+**inconclusive-reliance**.
 
 ## Architecture
 
@@ -270,7 +267,10 @@ The validated schema includes:
 - optimizer and schedule;
 - model/state dimensions;
 - context-length curriculum and extrapolation lengths;
-- primary metric, useful-effect threshold, and regression threshold;
+- primary metric, metric direction, `min_useful`, `harm_threshold`,
+  `min_reliance`, and equivalence band;
+- protected metrics with one `max_regression` value each;
+- `min_synergy` for a declared four-cell interaction;
 - device/dtype preferences; and
 - required interaction or promotion stage.
 
@@ -370,23 +370,57 @@ also pass.
 
 ### Exponential-trapezoidal state-input carry
 
-Let `U_t = k_t (beta_w,t v_t)^T` denote the additive write factors. The
-experimental reference recurrence retains current decay and erase behavior and
-adds a learned previous/current write mixture. It stores previous k/v factors,
-not a second full write matrix.
+For one head, let `D_t` be the current per-key-channel decay and define:
 
-The parameterization recovers the current write at its identity setting. A
-classical `lambda=0.5` initialization is not native-warm compatible and is not
-used for the Qwen heal arm.
+```text
+S_bar = D_t * S_prev
+m_t = k_t^T S_bar
+E_t = k_t (beta_e,t * m_t)^T
+u_t = beta_w,t * v_t
+U_t = k_t u_t^T
+U_prev = k_prev u_prev^T
+r_t = rho_head * sigmoid(rho_proj(x_t))
+S_t = S_bar - E_t + (1 - r_t) U_t + r_t (D_t * U_prev)
+```
+
+`rho_head` is a projected per-head parameter constrained to `[0, 1]`, initialized
+at exactly zero, and projected back into the interval after each optimizer
+step. This gives it a usable boundary gradient while preserving an exact native
+identity. The token-dependent projection may begin learning once `rho_head`
+moves away from zero.
+
+The carry stores differentiable factors `k_prev` and
+`u_prev = beta_w,prev * v_prev`, not a full `dk x dv` matrix. At the first valid
+token and every explicit sequence/packed-segment boundary, the carry is cleared
+and `r_t` is forced to zero. The previous write is transported by the current
+decay `D_t`; the current erase remains based on `beta_e,t` and the decayed
+pre-update state. Carry tensors are not detached during training.
+
+Identity proof: with `rho_head=0`, `r_t=0` and the equation reduces to
+`S_t = S_bar - E_t + U_t`, exactly the current native update. A classical
+equal-endpoint mixture is not native-warm compatible and is not used for the
+Qwen heal arm.
 
 This is an adaptation of trapezoidal state-input mixing to a delta-style
 associative memory, not a claim of a formally derived second-order KMD-2
-integrator.
+integrator. KMD-2 has no exposed continuous-time `Delta_t`, so the suite does
+not attach an unsupported second-order accuracy claim to this recurrence.
 
 ### B/C-style q/k bias
 
 Adds separate learned head/channel q and k biases after normalization. Qwen
 uses an identity gate initialized to zero so the warm start is preserved.
+
+```text
+q_biased = q_normalized + a_q,head * b_q,head
+k_biased = k_normalized + a_k,head * b_k,head
+```
+
+The per-head amplitudes `a_q` and `a_k` are initialized at exactly zero; bias
+vectors may be initialized independently because their contribution is then
+exactly zero. The active-effect gate sets nonzero amplitudes and bias vectors.
+The tiny affine-regression control replaces the additive vectors with an
+equal-parameter diagonal rescaling, which cannot supply a constant coordinate.
 
 Bias is screened alone first. It is combined with trapezoidal carry only after
 one of the individual arms passes, because their reported language-model role
@@ -443,9 +477,37 @@ The tiny backend sweeps state dimensions under both:
 - fixed surrounding width, to measure raw state-capacity effects; and
 - parameter-matched models, to measure quality/efficiency fairly.
 
-True MIMO uses independent rank-R writes and independent output queries sharing
-one recurrent state. The current `r_out=4` shared-query slots are included as a
-separate control and are never relabelled as true MIMO.
+For each head, true MIMO uses row-normalized independent keys
+`K_t [R, dk]`, values `V_t [R, dv]`, queries `Q_t [R, dk]`, per-slot erase/write
+gates `beta_e [R]` and `beta_w [R]`, and one shared state `S [dk, dv]`.
+All slots update simultaneously:
+
+```text
+S_bar = D_t * S_prev
+K_e = diag(sqrt(beta_e / R)) K_t
+P = inverse(epsilon I_R + K_e K_e^T)
+S_erase = S_bar - K_e^T P (K_e S_bar)
+S_t = S_erase + (1 / sqrt(R)) K_t^T diag(beta_w) V_t
+Y_t = Q_t S_t
+o_t = l2_normalize(o_logits_t), initialized to [1/sqrt(R)] * R
+y_t = o_t^T Y_t
+```
+
+The block solve makes erase invariant to slot order, and tests require forward
+and gradient invariance under a common slot permutation. The `1/sqrt(R)` write
+and unit-L2 output mixing preserve expected update/read scale for independent
+slots instead of granting an automatic R-fold magnitude advantage. `R=1`
+reduces to the SISO equations up to the declared ridge `epsilon`; the exact
+native SISO control remains a separate arm with the production erase formula.
+
+The current `r_out=4` shared-query slots are another separate control and are
+never relabelled as true MIMO. A fixed-width comparison reports the raw added
+parameters. For the parameter-matched comparison, `d_model`, layers, heads,
+`dk`, `dv`, and recurrent state remain fixed while the feed-forward hidden
+dimension is reduced deterministically to the nearest value divisible by 8.
+The resulting trainable-parameter count must be within the larger of 0.5% or
+1,024 parameters of the SISO target; otherwise preflight rejects the matched
+arm. Both the selected hidden dimension and residual mismatch are reported.
 
 Primary reporting includes quality, state bytes, parameter count, training
 throughput, and single-step/reference-loop latency. No automatic 2x efficiency
@@ -464,7 +526,7 @@ Shared language-model and retrieval tasks are secondary transfer measures.
 | Momentum | inertia in a persistent mapping | gradual drift followed by abrupt reversal | adaptation lag and reversal overshoot |
 | Lookahead | causal trajectory extrapolation | linear/sinusoidal motion plus change points | smooth-segment gain versus change-point harm |
 | State size / MIMO | capacity per state byte | MQAR load and length sweep | quality-state-latency Pareto frontier |
-| B/C bias | constant channel basis / interaction | small LM proxy plus integration task | gain alone and with trap/conv |
+| B/C bias | affine constant-basis memory | symmetric affine associative regression | intercept error; zero-intercept negative control |
 
 ### State-tracking tasks
 
@@ -478,10 +540,21 @@ counts. Both raw accuracy and chance-adjusted accuracy are reported.
 
 ### Irregular-time integration
 
-Samples a stable continuous-time driven system with known targets at irregular
-time gaps. Inputs contain the forcing value and elapsed delta. Targets are
-computed analytically where available or by a fixed high-accuracy reference
-solver independent of the model variants.
+Samples the stable scalar/vector system `dh/dt = -a h + u(t)` with `a > 0`,
+piecewise-linear forcing between observed endpoint values, and irregular time
+gaps `Delta`. Inputs contain the forcing endpoint and elapsed delta. For one
+component, with `e = exp(-a Delta)` and
+`m = (u_t - u_prev) / Delta`, the exact target is:
+
+```text
+h_t = e h_prev
+    + u_prev (1 - e) / a
+    + m [Delta / a - (1 - e) / a^2]
+```
+
+The generator evaluates this in float64 with `expm1`-stable branches for small
+`a Delta` and verifies samples against a fixed high-resolution RK4 oracle. The
+oracle is validation-only and is shared by every model variant.
 
 Evaluation stratifies error by delta, sequence length, and forcing curvature.
 This directly tests temporal integration instead of using general perplexity as
@@ -512,6 +585,29 @@ Local binding controls convolution with adjacent and separated key/value
 tokens. MQAR varies number of bindings, queries, overwrite frequency, and
 distance. Results include token accuracy, episode exact match, and distance/load
 bins.
+
+### Affine associative regression
+
+This direct-factor tiny task isolates the constant basis supplied by q/k
+biases. Each episode samples a linear map `A` and intercept `b`, observes
+write pairs `y_i = A x_i + b`, and predicts a held-out query target. Write keys
+are generated in exact `x, -x` pairs so their episode mean is zero and the
+intercept cannot be inferred from a spurious key mean.
+
+The task feeds q/k/v factors directly to the memory-cell harness. q/k
+projections, readout, and all competing paths are bias-free; there is no MLP,
+learned position embedding, constant input coordinate, or token-type feature in
+the q/k path. The query/write role is supplied as an external mask rather than
+an embedded marker. A parameter-matched diagonal-rescaling control has the same
+number of trainable scalars but cannot add a constant basis. An oracle arm
+explicitly appends a constant coordinate.
+
+The primary metric is held-out query MSE, with intercept error and slope error
+reported separately. Evaluation includes more writes and a wider query range
+than training. A balanced `b=0` negative-control split must show no material
+bias advantage; nonzero intercepts are sampled symmetrically and independently
+of `A`, writes, and queries. Generator tests verify symmetry, independence,
+absence of constant q/k inputs, and withheld-query targets.
 
 ## Screening and Promotion
 
@@ -584,6 +680,71 @@ Screening configurations preregister:
 Summaries show each seed, mean/median, paired deltas, and a paired bootstrap
 confidence interval. A best seed is never reported as the aggregate result.
 
+### Normalized effect convention
+
+Every metric declares `direction` as `+1` when larger is better or `-1` when
+smaller is better. For a variant `V` and its paired baseline `B`, the effect in
+the metric's configured raw units is:
+
+```text
+d = direction * (metric(V) - metric(B))
+```
+
+The suite computes a paired 95% bootstrap interval `[L, U]` using matched seeds
+and matched evaluation examples within each seed. Configurations define
+`min_useful > 0`, `harm_threshold > 0`, and, for every protected metric,
+`max_regression >= 0`. A protected metric is certified safe only when its lower
+interval bound is at least `-max_regression`.
+
+### Promotion rule for new additions
+
+A new addition advances from screening only when:
+
+1. the primary effect has `L >= min_useful`; and
+2. every protected metric is certified safe.
+
+Point estimates alone never promote an arm. A replacement-only result does not
+enter a native additive heal unless a separate deployment objective explicitly
+values removal of the replaced feature.
+
+### Mutually exclusive classification for new additions
+
+Rules are evaluated in this order:
+
+1. **failed/invalid:** the run or a required validity gate failed;
+2. **harmful:** `U <= -harm_threshold`, or a protected metric has
+   `U < -max_regression` (confident unacceptable regression);
+3. **synergistic:** interaction arm only; it is protected-safe and the lower
+   interval bound for `I = d_AB - d_A - d_B` is at least the configured
+   `min_synergy`;
+4. **incremental:** `L >= min_useful` against the complete current baseline and
+   all protected metrics are safe;
+5. **replacement-only:** not incremental, but `L >= min_useful` in the declared
+   existing-feature-off contrast and protected metrics are safe;
+6. **redundant:** `U < min_useful`, `L > -harm_threshold`, and no replacement or
+   synergy rule applies; or
+7. **inconclusive:** every remaining valid result, including an interval that
+   still contains both a useful gain and meaningful harm.
+
+All terms in the synergy contrast use the same complete baseline, matched
+examples, seed set, metric direction, and budget. Interactions that do not have
+all four factorial cells are invalid rather than approximated.
+
+### Reliance semantics for existing features
+
+Rotation and convolution on/off tests measure the effect
+`d_reliance = direction * (full_current - ablated)`. They do not use the new
+addition labels:
+
+- **relied-on:** `L >= min_reliance`;
+- **harmful-current:** `U <= -harm_threshold`;
+- **dispensable:** the entire interval lies inside the preregistered equivalence
+  band `[-equivalence, +equivalence]`; or
+- **inconclusive-reliance:** every other valid reliance result.
+
+Reliance results can motivate a later removal design, but cannot be reported as
+evidence that an absent feature is incremental.
+
 ## Result Storage and Resume
 
 Each job writes to a temporary file and atomically renames it only after a
@@ -592,17 +753,33 @@ complete record is serialized. The output tree contains:
 ```text
 results/
 |-- manifest.json
-|-- jobs.jsonl
+|-- jobs.json
 |-- runs/<experiment-id>/<seed>.json
 |-- checkpoints/<experiment-id>/<seed>/
+|-- events/worker-<job-index>-of-<num-jobs>.jsonl
 `-- summary/
+    |-- ledger.jsonl
     |-- results.json
     `-- results.csv
 ```
 
-The shared job ledger is append-only. Concurrent workers own disjoint stable
-job shards. Resume validates the result schema, experiment ID, and provenance;
-a truncated or stale record is rerun.
+`jobs.json` is an immutable canonical job manifest written once by preflight
+before workers start. Workers never append to a shared file. The authoritative
+result is the atomic per-run JSON record: a worker writes a uniquely named
+temporary file in the destination directory, flushes and closes it, then uses
+an atomic same-filesystem rename.
+
+Each shard may append diagnostic events only to its own single-writer event
+file. `summarize` reads the immutable manifest and authoritative per-run files,
+then deterministically creates `summary/ledger.jsonl`; event logs are not used
+to decide completion. Resume validates the result schema, experiment ID, job
+assignment, and provenance. A temporary, truncated, stale, or conflicting
+record is quarantined and rerun.
+
+Concurrent-writer tests launch at least two shards against one result root,
+interrupt one write, and verify that completed run records remain parseable,
+the interrupted job is rerunnable, and repeated summarization produces the
+same ledger bytes.
 
 ## Error Handling
 
@@ -640,18 +817,28 @@ fresh:
 5. Identity-gated variants match the full baseline before training.
 6. Active-effect tests prove every enabled variant changes its intended path.
 7. Invalid and redundant feature combinations fail with actionable messages.
-8. Every task generator is deterministic by seed and passes answer-leak,
-   balance, target, and length-split checks.
-9. A short CPU tiny screening matrix completes, resumes without duplicating
+8. The trapezoid recurrence resets its factor carry at every declared boundary,
+   exactly matches native update at `rho_head=0`, and produces a nonzero active
+   effect when the carry gate is enabled.
+9. True-MIMO tests cover `R=1`, simultaneous slot-permutation invariance,
+   expected-scale normalization, and the declared parameter-match tolerance.
+10. Every task generator is deterministic by seed and passes answer-leak,
+    balance, target, and length-split checks; affine regression additionally
+    proves symmetric keys, withheld queries, and absence of competing constant
+    q/k paths.
+11. A short CPU tiny screening matrix completes, resumes without duplicating
    completed jobs, and produces valid JSON and CSV summaries.
-10. Statistical classification uses the configured primary metric and paired
-    thresholds rather than best-seed selection.
-11. Qwen dry-run/preflight accepts explicit model/checkpoint/data paths and
+12. Statistical classification exercises every mutually exclusive addition and
+    reliance label using configured 95% paired intervals, protected-metric
+    vetoes, and a complete four-cell synergy contrast.
+13. Two concurrent shards plus an interrupted writer leave valid atomic run
+    records and produce byte-identical ledgers across repeated summarization.
+14. Qwen dry-run/preflight accepts explicit model/checkpoint/data paths and
     rejects unsupported native state-size arms without loading large assets.
-12. Optional CUDA tests record device, throughput, VRAM, and state bytes without
+15. Optional CUDA tests record device, throughput, VRAM, and state bytes without
     silently changing configuration.
-13. Tiny and Qwen upload bundles are created, reopened, content-checked, and
+16. Tiny and Qwen upload bundles are created, reopened, content-checked, and
     hash-verified; large external assets are absent unless explicitly included.
-14. Existing production model, trainer, checkpoint, data, and result files are
+17. Existing production model, trainer, checkpoint, data, and result files are
     unchanged.
-15. `git diff --check` passes for all suite, test, and documentation changes.
+18. `git diff --check` passes for all suite, test, and documentation changes.
