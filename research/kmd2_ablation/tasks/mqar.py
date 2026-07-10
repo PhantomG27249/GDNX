@@ -52,7 +52,15 @@ def generate_mqar(
     example_ids: list[str] = []
     metadata: list[dict[str, Any]] = []
     for example in range(batch_size):
-        identity, generator = _example_identity("mqar", seed, split, length, example)
+        identity, generator = _example_identity(
+            "mqar",
+            MQAR_SCHEMA_VERSION,
+            {"overwrite_fraction": overwrite_fraction, "width": width},
+            seed,
+            split,
+            length,
+            example,
+        )
         example_ids.append(identity)
         load_bin = example % len(MQAR_LOAD_FACTORS)
         load = max(2, int(round(width * MQAR_LOAD_FACTORS[load_bin])))

@@ -64,7 +64,13 @@ def generate_affine(
     query_scale = float(_operation_count(1, split))
     for example in range(batch_size):
         identity, generator = _example_identity(
-            "affine_associative_regression", seed, split, length, example
+            "affine_associative_regression",
+            AFFINE_SCHEMA_VERSION,
+            {"input_dim": input_dim, "output_dim": output_dim},
+            seed,
+            split,
+            length,
+            example,
         )
         example_ids.append(identity)
         matrix = torch.randn(

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import ast
+import inspect
 import json
+import os
+import subprocess
+import sys
 from types import MappingProxyType
 
 import pytest
@@ -31,6 +36,7 @@ from research.kmd2_ablation.tasks.dynamics import (
     DRIFT_SLOPE_RANGE,
     DYNAMICS_SCHEMA_VERSION,
     DYNAMICS_TOKENS_PER_STEP,
+    DYNAMICS_WARMUP_OBSERVATIONS,
     TRAJECTORY_FREQUENCY_RANGE,
 )
 from research.kmd2_ablation.tasks.local_binding import (
@@ -157,6 +163,9 @@ def test_episode_contract_and_registry() -> None:
     with pytest.raises(ValueError, match="RULER.*Qwen"):
         generate_task("ruler", 1, 4, 0, "train", {})
 
+    with pytest.raises(ValueError, match="task.*registered"):
+        _minimal_episode(task="not-a-registered-task")
+
 
 def test_all_named_task_families_have_collected_focused_tests() -> None:
     collected_test_names = {
@@ -219,6 +228,80 @@ def test_episode_contract_rejects_non_json_metadata_and_tensor_aliases() -> None
             input_ids=None,
             direct_factors={"q": shared, "k": shared},
         )
+
+
+def test_episode_metadata_is_deeply_immutable_and_json_serializable() -> None:
+    original = {
+        "nested": {"items": [1, {"value": 2}]},
+        "logical_length": 3,
+        "actual_length": 3,
+    }
+    episode = _minimal_episode(metadata=(original, original))
+    assert isinstance(episode.metadata[0], MappingProxyType)
+    encoded = json.dumps([dict(item) for item in episode.metadata], sort_keys=True)
+    assert '"value": 2' in encoded
+
+    with pytest.raises(TypeError):
+        episode.metadata[0]["nested"]["new"] = 3  # type: ignore[index]
+    with pytest.raises(TypeError):
+        episode.metadata[0]["nested"]["items"][1]["value"] = 4  # type: ignore[index]
+    with pytest.raises(TypeError):
+        episode.metadata[0]["nested"]["items"][0] = 9  # type: ignore[index]
+    original["nested"]["items"][1]["value"] = 99  # type: ignore[index]
+    assert episode.metadata[0]["nested"]["items"][1]["value"] == 2
+
+
+def test_example_identity_includes_canonical_validated_params_and_task_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mqar_a = generate_task(
+        "mqar",
+        2,
+        4,
+        113,
+        "train",
+        {"width": 8, "overwrite_fraction": 0.25},
+    )
+    mqar_reordered = generate_task(
+        "mqar",
+        2,
+        4,
+        113,
+        "train",
+        {"overwrite_fraction": 0.25, "width": 8},
+    )
+    assert mqar_a.example_ids == mqar_reordered.example_ids
+    assert mqar_a.example_ids != generate_task(
+        "mqar", 2, 4, 113, "train", {"width": 16, "overwrite_fraction": 0.25}
+    ).example_ids
+
+    assert generate_task(
+        "modular_counter", 2, 5, 127, "train", {"modulus": 5}
+    ).example_ids != generate_task(
+        "modular_counter", 2, 5, 127, "train", {"modulus": 7}
+    ).example_ids
+    assert generate_task(
+        "affine_associative_regression",
+        2,
+        4,
+        131,
+        "train",
+        {"input_dim": 3, "output_dim": 2},
+    ).example_ids != generate_task(
+        "affine_associative_regression",
+        2,
+        4,
+        131,
+        "train",
+        {"input_dim": 4, "output_dim": 2},
+    ).example_ids
+
+    from research.kmd2_ablation.tasks import state_tracking
+
+    before = generate_task("parity", 2, 5, 137, "train", {}).example_ids
+    monkeypatch.setattr(state_tracking, "STATE_TRACKING_SCHEMA_VERSION", "1.0.1")
+    after = generate_task("parity", 2, 5, 137, "train", {}).example_ids
+    assert before != after
 
 
 def _assert_batch_equal(left: EpisodeBatch, right: EpisodeBatch) -> None:
@@ -409,6 +492,33 @@ def test_state_tracking_dispatcher_determinism_and_rng_isolation() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("task", "params", "classes", "batch_size", "length"),
+    [
+        ("parity", {}, 2, 2, 3),
+        ("toggle_fsm", {}, 2, 3, 1),
+        ("modular_counter", {"modulus": 5}, 5, 3, 3),
+    ],
+)
+def test_state_tracking_counterbalances_odd_batches_and_preserves_prefixes(
+    task: str,
+    params: dict[str, int],
+    classes: int,
+    batch_size: int,
+    length: int,
+) -> None:
+    batch = generate_task(task, batch_size, length, 0, "train", params)
+    labels = batch.targets[batch.query_mask]
+    counts = torch.bincount(labels, minlength=classes)
+    assert int(counts.max() - counts.min()) <= 1
+
+    larger = generate_task(task, batch_size + 2, length, 0, "train", params)
+    assert batch.example_ids == larger.example_ids[:batch_size]
+    assert torch.equal(batch.input_ids, larger.input_ids[:batch_size])
+    assert torch.equal(batch.targets, larger.targets[:batch_size])
+    assert torch.equal(batch.source_spans, larger.source_spans[:batch_size])
+
+
 def _independent_rk4_step(
     h0: torch.Tensor,
     u0: torch.Tensor,
@@ -525,48 +635,71 @@ def test_irregular_integration_determinism_boundaries_and_ood() -> None:
         generate_task(
             "irregular_integration", 1, 4, 0, "train", {"components": 0}
         )
+    with pytest.raises(ValueError, match="at least two.*timepoints"):
+        generate_task(
+            "irregular_integration", 1, 1, 0, "train", {"components": 1}
+        )
 
 
 def test_drift_reversal_queries_precede_targets_and_strata() -> None:
     assert DYNAMICS_SCHEMA_VERSION == "1.0.0"
     assert DYNAMICS_TOKENS_PER_STEP == 2
+    assert DYNAMICS_WARMUP_OBSERVATIONS == 3
     assert DRIFT_SLOPE_RANGE == (0.02, 0.12)
     batch = generate_task("drift_reversal", 3, 9, 43, "train", {})
     assert batch.continuous_inputs is not None
-    assert batch.continuous_inputs.shape == (3, 19, 3)
+    assert batch.continuous_inputs.shape == (3, 21, 3)
 
     for example in range(3):
         metadata = batch.metadata[example]
         base = float(metadata["base"])
         slope = float(metadata["slope"])
         reversal_step = int(metadata["reversal_step"])
+        first_changed_query_step = int(metadata["first_changed_query_step"])
         reversal_value = base + slope * reversal_step
         expected_values = []
-        for step in range(10):
+        for step in range(DYNAMICS_WARMUP_OBSERVATIONS + 9):
             if step <= reversal_step:
                 expected_values.append(base + slope * step)
             else:
                 expected_values.append(
                     reversal_value - slope * (step - reversal_step)
                 )
-        assert batch.continuous_inputs[example, 0, 0].item() == pytest.approx(
-            expected_values[0]
-        )
+        for warmup_position in range(DYNAMICS_WARMUP_OBSERVATIONS):
+            assert not batch.query_mask[example, warmup_position]
+            assert not batch.loss_mask[example, warmup_position]
+            assert batch.continuous_inputs[
+                example, warmup_position, 0
+            ].item() == pytest.approx(expected_values[warmup_position])
         for step in range(9):
-            query_position = 1 + 2 * step
+            query_position = DYNAMICS_WARMUP_OBSERVATIONS + 2 * step
             observation_position = query_position + 1
+            target_step = DYNAMICS_WARMUP_OBSERVATIONS + step
             assert batch.query_mask[example, query_position]
             assert batch.continuous_inputs[example, query_position, 0] == 0
             assert batch.targets[example, query_position, 0].item() == pytest.approx(
-                expected_values[step + 1]
+                expected_values[target_step]
             )
             assert batch.continuous_inputs[
                 example, observation_position, 0
-            ].item() == pytest.approx(expected_values[step + 1])
+            ].item() == pytest.approx(expected_values[target_step])
             assert batch.source_spans[example, query_position].tolist() == [
-                query_position - 1,
+                0,
                 query_position,
             ]
+            lag = int(batch.strata["causal_lag"][example, query_position])
+            expected_lag = (
+                -1 if step < first_changed_query_step else step - first_changed_query_step
+            )
+            assert lag == expected_lag
+        zero_lag_positions = torch.nonzero(
+            (batch.strata["causal_lag"][example] == 0)
+            & batch.query_mask[example],
+            as_tuple=False,
+        ).flatten()
+        assert zero_lag_positions.tolist() == [
+            DYNAMICS_WARMUP_OBSERVATIONS + 2 * first_changed_query_step
+        ]
 
     phases = batch.strata["phase"][batch.query_mask]
     counts = torch.bincount(phases, minlength=3)
@@ -583,8 +716,10 @@ def test_drift_reversal_determinism_and_ood_horizons() -> None:
     two_x = generate_task("drift_reversal", 2, 6, 47, "ood_2x", {})
     four_x = generate_task("drift_reversal", 2, 6, 47, "ood_4x", {})
     assert two_x.continuous_inputs is not None and four_x.continuous_inputs is not None
-    assert two_x.continuous_inputs.shape[1] == 25
-    assert four_x.continuous_inputs.shape[1] == 49
+    assert two_x.continuous_inputs.shape[1] == 27
+    assert four_x.continuous_inputs.shape[1] == 51
+    assert int(two_x.query_mask.sum()) == 24
+    assert int(four_x.query_mask.sum()) == 48
     assert set(baseline.example_ids).isdisjoint(two_x.example_ids)
     assert set(two_x.example_ids).isdisjoint(four_x.example_ids)
 
@@ -599,8 +734,11 @@ def test_trajectory_balances_modes_changes_and_causal_targets() -> None:
     assert cases.count(False) == cases.count(True) == 2
 
     for example in range(4):
+        assert not batch.query_mask[
+            example, :DYNAMICS_WARMUP_OBSERVATIONS
+        ].any()
         for step in range(9):
-            query_position = 1 + 2 * step
+            query_position = DYNAMICS_WARMUP_OBSERVATIONS + 2 * step
             observation_position = query_position + 1
             assert batch.query_mask[example, query_position]
             assert not batch.query_mask[example, observation_position]
@@ -610,6 +748,18 @@ def test_trajectory_balances_modes_changes_and_causal_targets() -> None:
                 batch.continuous_inputs[example, observation_position, :1],
             )
             assert batch.source_spans[example, query_position, 1] <= query_position
+            assert batch.source_spans[example, query_position].tolist() == [
+                0,
+                query_position,
+            ]
+        if cases[example]:
+            first_changed = int(batch.metadata[example]["first_changed_query_step"])
+            changed_position = DYNAMICS_WARMUP_OBSERVATIONS + 2 * first_changed
+            assert batch.strata["causal_lag"][example, changed_position] == 0
+        else:
+            assert not torch.any(
+                batch.strata["causal_lag"][example, batch.query_mask[example]] >= 0
+            )
     phases = batch.strata["phase"][batch.query_mask]
     assert torch.equal(torch.bincount(phases, minlength=3), torch.tensor([12, 12, 12]))
     assert set(batch.strata["trajectory_type"][batch.query_mask].tolist()) == {0, 1}
@@ -625,10 +775,10 @@ def test_trajectory_seed_split_and_length_variation() -> None:
     assert generate_task("trajectory", 4, 6, 59, "id", {}).example_ids != baseline.example_ids
     assert generate_task(
         "trajectory", 4, 6, 59, "ood_2x", {}
-    ).continuous_inputs.shape[1] == 25
+    ).continuous_inputs.shape[1] == 27
     assert generate_task(
         "trajectory", 4, 6, 59, "ood_4x", {}
-    ).continuous_inputs.shape[1] == 49
+    ).continuous_inputs.shape[1] == 51
 
 
 def test_local_binding_modes_overwrite_spans_and_width_cells() -> None:
@@ -817,6 +967,65 @@ def test_structured_exceptions_determinism_and_ood() -> None:
     assert int(generate_task("structured_exceptions", 2, 6, 83, "ood_4x", {}).query_mask.sum()) == 48
 
 
+def test_structured_exception_query_order_never_derives_from_a_set() -> None:
+    from research.kmd2_ablation.tasks import structured
+
+    tree = ast.parse(inspect.getsource(structured.generate_structured_exceptions))
+    set_variables: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Call):
+            continue
+        if not isinstance(node.value.func, ast.Name) or node.value.func.id != "set":
+            continue
+        set_variables.update(
+            target.id for target in node.targets if isinstance(target, ast.Name)
+        )
+    list_from_set = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "list"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Name)
+        and node.args[0].id in set_variables
+    ]
+    assert not list_from_set
+
+
+def test_structured_exceptions_are_cross_pythonhashseed_deterministic() -> None:
+    script = """
+import hashlib
+import json
+from research.kmd2_ablation.tasks import generate_task
+
+batch = generate_task('structured_exceptions', 3, 9, 149, 'ood_2x', {})
+payload = {
+    'ids': batch.example_ids,
+    'input_ids': batch.input_ids.tolist(),
+    'targets': batch.targets.tolist(),
+    'source_spans': batch.source_spans.tolist(),
+    'item_type': batch.strata['item_type'].tolist(),
+}
+print(hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest())
+"""
+    digests = []
+    for hash_seed in ("1", "8675309"):
+        environment = os.environ.copy()
+        environment["PYTHONHASHSEED"] = hash_seed
+        completed = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=os.getcwd(),
+            env=environment,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        digests.append(completed.stdout.strip())
+    assert digests[0] == digests[1]
+
+
 def test_far_surprise_early_sources_lose_native_score_to_distractors() -> None:
     assert FAR_SURPRISE_SCHEMA_VERSION == "1.0.0"
     assert FAR_SURPRISE_DEFAULT_WIDTH == 8
@@ -860,6 +1069,24 @@ def test_far_surprise_determinism_seed_split_and_length() -> None:
     )
     assert int(generate_task("far_surprise", 2, 4, 97, "ood_2x", {"width": 8}).query_mask.sum()) == 16
     assert int(generate_task("far_surprise", 2, 4, 97, "ood_4x", {"width": 8}).query_mask.sum()) == 32
+
+
+def test_far_surprise_long_ood_distractor_keys_remain_disjoint() -> None:
+    batch = generate_task(
+        "far_surprise", 1, 128, 151, "ood_4x", {"width": 8}
+    )
+    assert batch.input_ids is not None
+    query_positions = torch.nonzero(batch.query_mask[0], as_tuple=False).flatten()
+    query_keys = set(batch.input_ids[0, query_positions - 1].tolist())
+    distractor_keys = set(
+        batch.input_ids[0, batch.strata["distractor_key"][0].bool()].tolist()
+    )
+    assert len(query_positions) == 512
+    assert query_keys.isdisjoint(distractor_keys)
+    for query_position in query_positions.tolist():
+        source = int(batch.source_spans[0, query_position, 0])
+        assert source < int(batch.metadata[0]["distractor_start"])
+        assert batch.targets[0, query_position] == batch.input_ids[0, source]
 
 
 def test_freshness_latest_and_historical_queries_respect_versions() -> None:

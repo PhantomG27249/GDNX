@@ -39,6 +39,22 @@ _TASK_ENTRY_POINTS = {
 TASK_NAMES = frozenset(_TASK_ENTRY_POINTS)
 
 
+class _FrozenJSONDict(dict[str, Any]):
+    """A JSON-serializable dict whose mutation methods are disabled."""
+
+    @staticmethod
+    def _immutable(*_args: object, **_kwargs: object) -> None:
+        raise TypeError("frozen JSON mappings are immutable")
+
+    __setitem__ = _immutable
+    __delitem__ = _immutable
+    clear = _immutable
+    pop = _immutable
+    popitem = _immutable
+    setdefault = _immutable
+    update = _immutable
+
+
 def _tensor_storage_key(tensor: Tensor) -> int:
     return tensor.untyped_storage().data_ptr()
 
@@ -77,7 +93,7 @@ def _freeze_json(value: Any, path: str) -> Any:
             if type(key) is not str:
                 raise TypeError(f"{path} JSON mapping keys must be strings")
             frozen[key] = _freeze_json(item, f"{path}.{key}")
-        return MappingProxyType(frozen)
+        return _FrozenJSONDict(frozen)
     if isinstance(value, (list, tuple)):
         return tuple(_freeze_json(item, f"{path}[{index}]") for index, item in enumerate(value))
     raise TypeError(f"{path} must contain only JSON-compatible values")
@@ -118,6 +134,8 @@ class EpisodeBatch:
     def __post_init__(self) -> None:
         if type(self.task) is not str or not self.task:
             raise TypeError("task must be a non-empty string")
+        if self.task not in TASK_NAMES:
+            raise ValueError(f"task must be a registered synthetic task; got {self.task!r}")
         if self.split not in SUPPORTED_SPLITS:
             allowed = ", ".join(sorted(SUPPORTED_SPLITS))
             raise ValueError(f"split must be one of: {allowed}")
@@ -308,7 +326,7 @@ class EpisodeBatch:
                 raise TypeError(f"metadata[{index}] must be a JSON mapping")
             frozen = _freeze_json(item, f"metadata[{index}]")
             assert isinstance(frozen, Mapping)
-            frozen_metadata.append(frozen)
+            frozen_metadata.append(MappingProxyType(dict(frozen)))
 
         object.__setattr__(self, "example_ids", example_ids)
         object.__setattr__(self, "input_ids", input_ids)
@@ -381,18 +399,54 @@ __all__ = [
 ]
 
 
+def _canonical_identity_params(value: Any, path: str = "task_params") -> Any:
+    value_type = type(value)
+    if value is None or value_type in (bool, int, str):
+        return value
+    if value_type is float:
+        if not math.isfinite(value):
+            raise ValueError(f"{path} numbers must be finite")
+        return 0.0 if value == 0.0 else value
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for key in sorted(value):
+            if type(key) is not str:
+                raise TypeError(f"{path} keys must be strings")
+            result[key] = _canonical_identity_params(value[key], f"{path}.{key}")
+        return result
+    if isinstance(value, (list, tuple)):
+        return [
+            _canonical_identity_params(item, f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    raise TypeError(f"{path} must contain only JSON-compatible values")
+
+
 def _example_identity(
-    task: str, seed: int, split: str, logical_length: int, index: int
+    task: str,
+    task_schema_version: str,
+    task_params: Mapping[str, Any],
+    seed: int,
+    split: str,
+    logical_length: int,
+    index: int,
 ) -> tuple[str, torch.Generator]:
     """Return a stable identity and isolated CPU generator for one example."""
+    if task not in TASK_NAMES:
+        raise ValueError(f"task must be registered before deriving identity: {task!r}")
+    if type(task_schema_version) is not str or not task_schema_version:
+        raise TypeError("task_schema_version must be a non-empty string")
+    canonical_params = _canonical_identity_params(task_params)
     domain = json.dumps(
         {
             "index": index,
             "length": logical_length,
+            "params": canonical_params,
             "schema": TASK_SCHEMA_VERSION,
             "seed": seed,
             "split": split,
             "task": task,
+            "task_schema": task_schema_version,
         },
         sort_keys=True,
         separators=(",", ":"),

@@ -94,6 +94,26 @@ def _boundary_queries(queries: int) -> frozenset[int]:
     return frozenset({0, queries // 2})
 
 
+def _counterbalance_phase(
+    task: str,
+    params: Mapping[str, Any],
+    seed: int,
+    split: str,
+    length: int,
+    classes: int,
+) -> int:
+    _, generator = _example_identity(
+        task,
+        STATE_TRACKING_SCHEMA_VERSION,
+        params,
+        seed,
+        split,
+        length,
+        -1,
+    )
+    return int(torch.randint(0, classes, (), generator=generator).item())
+
+
 def generate_parity(
     *,
     batch_size: int,
@@ -109,10 +129,18 @@ def generate_parity(
     example_ids: list[str] = []
     metadata: list[dict[str, Any]] = []
     boundaries = _boundary_queries(queries)
+    phase = _counterbalance_phase("parity", {}, seed, split, length, 2)
     for example in range(batch_size):
-        identity, generator = _example_identity("parity", seed, split, length, example)
+        identity, _ = _example_identity(
+            "parity",
+            STATE_TRACKING_SCHEMA_VERSION,
+            {},
+            seed,
+            split,
+            length,
+            example,
+        )
         example_ids.append(identity)
-        phase = int(torch.randint(0, 2, (), generator=generator).item())
         state = 0
         segment_start = 0
         for query_index in range(queries):
@@ -121,7 +149,7 @@ def generate_parity(
                 arrays["boundaries"][example, base] = True
                 state = 0
                 segment_start = base
-            desired = (query_index + phase) % 2
+            desired = (example * queries + query_index + phase) % 2
             operation = (
                 PARITY_TOKENS["ONE"] if state != desired else PARITY_TOKENS["HOLD"]
             )
@@ -166,12 +194,21 @@ def generate_modular_counter(
     example_ids: list[str] = []
     metadata: list[dict[str, Any]] = []
     boundaries = _boundary_queries(queries)
+    identity_params = {"modulus": modulus}
+    phase = _counterbalance_phase(
+        "modular_counter", identity_params, seed, split, length, modulus
+    )
     for example in range(batch_size):
-        identity, generator = _example_identity(
-            "modular_counter", seed, split, length, example
+        identity, _ = _example_identity(
+            "modular_counter",
+            STATE_TRACKING_SCHEMA_VERSION,
+            identity_params,
+            seed,
+            split,
+            length,
+            example,
         )
         example_ids.append(identity)
-        phase = int(torch.randint(0, modulus, (), generator=generator).item())
         state = 0
         segment_start = 0
         for query_index in range(queries):
@@ -183,7 +220,7 @@ def generate_modular_counter(
                 segment_start = base
                 first = MODULAR_TOKENS["RESET"]
             else:
-                desired = (query_index + phase) % modulus
+                desired = (example * queries + query_index + phase) % modulus
                 delta = (desired - state) % modulus
                 first = (
                     MODULAR_TOKENS["HOLD"]
@@ -192,7 +229,7 @@ def generate_modular_counter(
                 )
                 state = desired
             if is_boundary:
-                desired = (query_index + phase) % modulus
+                desired = (example * queries + query_index + phase) % modulus
                 delta = desired
                 second = (
                     MODULAR_TOKENS["HOLD"]
@@ -244,12 +281,18 @@ def generate_toggle_fsm(
     example_ids: list[str] = []
     metadata: list[dict[str, Any]] = []
     boundaries = _boundary_queries(queries)
+    phase = _counterbalance_phase("toggle_fsm", {}, seed, split, length, 2)
     for example in range(batch_size):
-        identity, generator = _example_identity(
-            "toggle_fsm", seed, split, length, example
+        identity, _ = _example_identity(
+            "toggle_fsm",
+            STATE_TRACKING_SCHEMA_VERSION,
+            {},
+            seed,
+            split,
+            length,
+            example,
         )
         example_ids.append(identity)
-        phase = int(torch.randint(0, 2, (), generator=generator).item())
         state = 0
         segment_start = 0
         for query_index in range(queries):
@@ -258,7 +301,7 @@ def generate_toggle_fsm(
                 arrays["boundaries"][example, base] = True
                 state = 0
                 segment_start = base
-            desired = (query_index + phase) % 2
+            desired = (example * queries + query_index + phase) % 2
             if query_index % 3 == 0:
                 operation = TOGGLE_TOKENS["SET1" if desired else "SET0"]
                 state = desired

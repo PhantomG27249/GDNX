@@ -72,7 +72,13 @@ def generate_local_binding(
     metadata: list[dict[str, Any]] = []
     for example in range(batch_size):
         identity, generator = _example_identity(
-            "local_binding", seed, split, length, example
+            "local_binding",
+            LOCAL_BINDING_SCHEMA_VERSION,
+            {"width": width},
+            seed,
+            split,
+            length,
+            example,
         )
         example_ids.append(identity)
         tokens: list[int] = []

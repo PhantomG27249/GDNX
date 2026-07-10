@@ -40,11 +40,20 @@ def generate_far_surprise(
     metadata: list[dict[str, Any]] = []
     for example in range(batch_size):
         identity, generator = _example_identity(
-            "far_surprise", seed, split, length, example
+            "far_surprise",
+            FAR_SURPRISE_SCHEMA_VERSION,
+            {"width": width},
+            seed,
+            split,
+            length,
+            example,
         )
         example_ids.append(identity)
         key_offset = int(torch.randint(0, 128, (), generator=generator).item())
-        relevant_keys = [FAR_SURPRISE_TOKENS["KEY_BASE"] + key_offset + i for i in range(queries)]
+        relevant_keys = [
+            FAR_SURPRISE_TOKENS["KEY_BASE"] + 2 * (key_offset + i)
+            for i in range(queries)
+        ]
         relevant_values = [
             FAR_SURPRISE_TOKENS["VALUE_BASE"]
             + int(torch.randint(0, 700, (), generator=generator).item())
@@ -81,7 +90,9 @@ def generate_far_surprise(
             sources.append(append(value, native_score=1.0))
         distractor_start = len(tokens)
         distractor_keys = [
-            FAR_SURPRISE_TOKENS["KEY_BASE"] + 500 + example * 17 + index
+            FAR_SURPRISE_TOKENS["KEY_BASE"]
+            + 2 * (example * distractor_count + index)
+            + 1
             for index in range(distractor_count)
         ]
         for index, key in enumerate(distractor_keys):

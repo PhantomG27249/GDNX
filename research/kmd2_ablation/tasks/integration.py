@@ -17,6 +17,7 @@ INTEGRATION_FORCING_RANGE = (-1.5, 1.5)
 INTEGRATION_DELTA_VALUES = (1e-7, 1e-4, 0.05, 0.5, 2.5)
 INTEGRATION_RK4_STEPS = 4096
 INTEGRATION_CURVATURE_THRESHOLDS = (0.25, 0.75)
+_FORCING_CURVATURE_STENCIL = (0.0, 0.05, 0.10, 0.55, -0.80)
 
 
 def analytic_piecewise_linear_step(
@@ -123,6 +124,11 @@ def generate_irregular_integration(
         raise ValueError("irregular_integration components must be an int in [1,16]")
 
     time = _operation_count(length, split)
+    if time < 2:
+        raise ValueError(
+            "irregular_integration requires at least two actual timepoints "
+            "to produce a supervised transition"
+        )
     continuous = torch.zeros(
         batch_size, time, 2 * components + 1, dtype=torch.float64
     )
@@ -144,15 +150,43 @@ def generate_irregular_integration(
     decay_low, decay_high = INTEGRATION_DECAY_RANGE
     for example in range(batch_size):
         identity, generator = _example_identity(
-            "irregular_integration", seed, split, length, example
+            "irregular_integration",
+            INTEGRATION_SCHEMA_VERSION,
+            {"components": components},
+            seed,
+            split,
+            length,
+            example,
         )
         example_ids.append(identity)
         decay = decay_low + (decay_high - decay_low) * torch.rand(
             components, generator=generator, dtype=torch.float64
         )
-        forcing = forcing_low + (forcing_high - forcing_low) * torch.rand(
-            time, components, generator=generator, dtype=torch.float64
-        )
+        base = 0.4 * torch.rand(
+            components, generator=generator, dtype=torch.float64
+        ) - 0.2
+        signs = 2.0 * torch.randint(
+            0, 2, (components,), generator=generator, dtype=torch.int64
+        ).to(torch.float64) - 1.0
+        forcing = torch.empty(time, components, dtype=torch.float64)
+        segment_start = 0
+        for token_index in range(time):
+            if token_index in boundary_tokens:
+                segment_start = token_index
+                if token_index:
+                    base = 0.4 * torch.rand(
+                        components, generator=generator, dtype=torch.float64
+                    ) - 0.2
+                    signs = 2.0 * torch.randint(
+                        0, 2, (components,), generator=generator, dtype=torch.int64
+                    ).to(torch.float64) - 1.0
+            local_index = token_index - segment_start
+            offset = _FORCING_CURVATURE_STENCIL[
+                local_index % len(_FORCING_CURVATURE_STENCIL)
+            ]
+            forcing[token_index] = base + signs * offset
+        if torch.any(forcing < forcing_low) or torch.any(forcing > forcing_high):
+            raise AssertionError("integration forcing stencil exceeded its declared range")
         continuous[example, :, :components] = forcing
         continuous[example, :, components + 1 :] = decay
         state = torch.zeros(components, dtype=torch.float64)

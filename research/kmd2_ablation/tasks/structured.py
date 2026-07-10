@@ -43,7 +43,13 @@ def generate_structured_exceptions(
     metadata: list[dict[str, Any]] = []
     for example in range(batch_size):
         identity, generator = _example_identity(
-            "structured_exceptions", seed, split, length, example
+            "structured_exceptions",
+            STRUCTURED_SCHEMA_VERSION,
+            {"exception_fraction": fraction},
+            seed,
+            split,
+            length,
+            example,
         )
         example_ids.append(identity)
         factor = 2 * int(torch.randint(1, 24, (), generator=generator).item()) + 1
@@ -54,7 +60,8 @@ def generate_structured_exceptions(
         keys = [STRUCTURED_TOKENS["KEY_BASE"] + domain_offset + i for i in range(load)]
         exception_count = max(1, int(round(load * fraction)))
         exception_count = min(exception_count, load - 1)
-        exception_keys = set(keys[:exception_count])
+        exception_keys_ordered = keys[:exception_count]
+        exception_keys = set(exception_keys_ordered)
         tokens: list[int] = []
         targets: list[int] = []
         query_mask: list[bool] = []
@@ -94,7 +101,7 @@ def generate_structured_exceptions(
             source_by_key[key] = source
             value_by_key[key] = value
         rule_keys = [key for key in keys if key not in exception_keys]
-        episodic_keys = list(exception_keys)
+        episodic_keys = exception_keys_ordered
         query_details: list[tuple[int, int]] = []
         for query_index in range(queries):
             item_type = query_index % 2

@@ -46,7 +46,15 @@ def generate_freshness(
     example_ids: list[str] = []
     metadata: list[dict[str, Any]] = []
     for example in range(batch_size):
-        identity, generator = _example_identity("freshness", seed, split, length, example)
+        identity, generator = _example_identity(
+            "freshness",
+            FRESHNESS_SCHEMA_VERSION,
+            {"width": width},
+            seed,
+            split,
+            length,
+            example,
+        )
         example_ids.append(identity)
         tokens: list[int] = []
         targets: list[int] = []
