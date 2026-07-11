@@ -575,9 +575,13 @@ The explicit `TinyKMD2Config` constructor declares `d_model`, `heads`, `dk`,
 `dv`, `layers`, `vocab_size`, `r_out`, `mimo_rank`, mechanism gates and dtype.
 `TinyFactors` holds `q[B,T,H,Q,dk]`, `k[B,T,H,R,dk]`,
 `v[B,T,H,R,dv]`, `decay[B,T,H,dk]`, `beta_e/beta_w[B,T,H,R]`,
-`out_mix[B,T,H,Q]`, `valid[B,T]`, and `positions[B,T]`. Native shared-query
-mode has `R=1,Q=r_out`; true MIMO has `R=Q=mimo_rank`; simultaneous true MIMO
-and shared-query widening is rejected. `state=None` creates fp32 zeros
+`out_mix[B,T,H,Q]` for the native/shared-query path or channelwise
+`out_mix[B,T,H,R,dv]` plus `read_gate[B,T,H,R,dv]` for true MIMO,
+`valid[B,T]`, and `positions[B,T]`. Native shared-query mode has
+`R=1,Q=r_out`; true MIMO has `R=Q=mimo_rank`, a base `v/z` projection expanded
+by Mamba-3-style `M_V/M_Z` scalings, nonlinear rank gates, and an `M_O`
+contraction; simultaneous true MIMO and shared-query widening is rejected.
+`state=None` creates fp32 zeros
 `[B,H,dk,dv]`; declared boundaries reset it.
 
 `TinyKMD2Cell.forward(factors, state=None, boundaries=None)` returns frozen

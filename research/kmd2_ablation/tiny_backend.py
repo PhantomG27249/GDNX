@@ -21,7 +21,7 @@ from .exact_cache import (
 )
 
 
-TINY_BACKEND_SCHEMA_VERSION = "1.0.0"
+TINY_BACKEND_SCHEMA_VERSION = "1.1.0"
 _MAX_UNBOUNDED_CACHE_TOKENS = 131_072
 _MAX_CACHE_DIAGNOSTIC_BYTES = 512 * 1024 * 1024
 # Retain the previous private tuning hook while applying the budget to every cache.
@@ -280,7 +280,7 @@ def true_mimo_update(
     )
     write = torch.einsum(
         "bhrd,bhrv->bhdv", key, beta_w.unsqueeze(-1) * value
-    ) / math.sqrt(rank)
+    )
     return state_bar - erase + write
 
 
@@ -587,6 +587,7 @@ class TinyFactors:
     out_mix: Tensor
     valid: Tensor
     positions: Tensor
+    read_gate: Tensor | None = None
     trapezoid_rho: Tensor | None = None
     momentum_gamma: Tensor | None = None
     lookahead_rho: Tensor | None = None
@@ -608,6 +609,8 @@ class TinyFactors:
         }
         if self.trapezoid_rho is not None:
             named["trapezoid_rho"] = self.trapezoid_rho
+        if self.read_gate is not None:
+            named["read_gate"] = self.read_gate
         if self.momentum_gamma is not None:
             named["momentum_gamma"] = self.momentum_gamma
         if self.lookahead_rho is not None:
@@ -649,13 +652,28 @@ class TinyFactors:
             "decay": (batch, steps, heads, key_dim),
             "beta_e": (batch, steps, heads, write_slots),
             "beta_w": (batch, steps, heads, write_slots),
-            "out_mix": (batch, steps, heads, q_slots),
             "valid": (batch, steps),
             "positions": (batch, steps),
         }
         for name, shape in expected_shapes.items():
             if tuple(getattr(self, name).shape) != shape:
                 raise ValueError(f"{name} must have shape {shape}")
+        valid_out_mix_shapes = {
+            (batch, steps, heads, q_slots),
+            (batch, steps, heads, q_slots, value_dim),
+        }
+        if tuple(self.out_mix.shape) not in valid_out_mix_shapes:
+            raise ValueError(
+                "out_mix must have shape [B,T,H,Q] or [B,T,H,Q,dv]"
+            )
+        if self.read_gate is not None and self.read_gate.shape != (
+            batch,
+            steps,
+            heads,
+            q_slots,
+            value_dim,
+        ):
+            raise ValueError("read_gate must have shape [B,T,H,Q,dv]")
         if self.trapezoid_rho is not None:
             if not isinstance(self.trapezoid_rho, Tensor):
                 raise TypeError("trapezoid_rho must be a torch.Tensor or None")
@@ -847,8 +865,14 @@ class TinyKMD2Cell(nn.Module):
         if self.config.mimo_rank == 1:
             if write_slots != 1 or q_slots != self.config.r_out:
                 raise ValueError("native factors require R=1 and Q=config.r_out")
+            if factors.out_mix.ndim != 4:
+                raise ValueError("native factors require scalar output-slot mixing")
         elif write_slots != self.config.mimo_rank or q_slots != self.config.mimo_rank:
             raise ValueError("true-MIMO factors require R=Q=config.mimo_rank")
+        elif factors.out_mix.ndim != 5 or factors.read_gate is None:
+            raise ValueError(
+                "true-MIMO factors require channelwise output mixing and rankwise gates"
+            )
         if self.config.trapezoid and factors.trapezoid_rho is None:
             raise ValueError("trapezoid factors require trapezoid_rho")
         if not self.config.trapezoid and factors.trapezoid_rho is not None:
@@ -958,6 +982,7 @@ class TinyKMD2Cell(nn.Module):
         beta_e = factors.beta_e.float()
         beta_w = factors.beta_w.float()
         out_mix = factors.out_mix.float()
+        read_gate = None if factors.read_gate is None else factors.read_gate.float()
         if self.config.bc_bias_mode == "constant_coordinate_oracle":
             if source_key_dim == self.config.dk - 1:
                 q, k = append_constant_coordinate(q, k)
@@ -977,8 +1002,6 @@ class TinyKMD2Cell(nn.Module):
                 raise ValueError(
                     "constant-coordinate factors must have an exact final q/k coordinate"
                 )
-        if write_slots > 1:
-            out_mix = F.normalize(out_mix, dim=-1, eps=self.config.eps)
         if self.config.bc_bias_mode == "additive":
             q, k = apply_bc_additive(
                 q,
@@ -1180,7 +1203,13 @@ class TinyKMD2Cell(nn.Module):
                     carry_active, current_write_value, previous_write
                 )
             slot_read = torch.matmul(q[:, token], current)
-            read = (slot_read * out_mix[:, token].unsqueeze(-1)).sum(dim=-2)
+            if read_gate is not None:
+                slot_read = slot_read * F.silu(read_gate[:, token])
+            token_mix = out_mix[:, token]
+            if token_mix.ndim == 4:
+                read = (slot_read * token_mix).sum(dim=-2)
+            else:
+                read = (slot_read * token_mix.unsqueeze(-1)).sum(dim=-2)
             read = torch.where(
                 factors.valid[:, token, None, None],
                 read,
@@ -1729,10 +1758,13 @@ class TinyFactorProjector(nn.Module):
         self.factor_dk = factor_dk
         self.q_proj = nn.Linear(config.d_model, h * rank * factor_dk, bias=False)
         self.k_proj = nn.Linear(config.d_model, h * rank * factor_dk, bias=False)
-        self.v_proj = nn.Linear(config.d_model, h * rank * dv, bias=False)
+        # Mamba-3 keeps one base V/Z projection per head and expands it across
+        # the MIMO rank with cheap, data-independent channelwise scalings.
+        self.v_proj = nn.Linear(config.d_model, h * dv, bias=False)
+        self.z_proj = nn.Linear(config.d_model, h * dv, bias=False)
         self.a_proj = nn.Linear(config.d_model, h, bias=False)
         self.b_proj = nn.Linear(config.d_model, h * rank, bias=False)
-        mixed_dim = h * rank * (2 * factor_dk + dv)
+        mixed_dim = h * (2 * rank * factor_dk + dv)
         self.conv = nn.Conv1d(
             mixed_dim,
             mixed_dim,
@@ -1767,14 +1799,20 @@ class TinyFactorProjector(nn.Module):
         self.dt_bias = nn.Parameter(torch.ones(h))
         self.decay_chan = nn.Parameter(torch.zeros(h, factor_dk))
         self.bw_off = nn.Parameter(torch.zeros(h, rank))
-        q_slots = config.r_out if rank == 1 else rank
-        self.q_slot_scale = nn.Parameter(torch.zeros(h, q_slots, factor_dk))
-        mix = torch.zeros(h, q_slots)
         if rank == 1:
+            q_slots = config.r_out
+            self.q_slot_scale = nn.Parameter(torch.zeros(h, q_slots, factor_dk))
+            mix = torch.zeros(h, q_slots)
             mix[:, 0] = 1.0
+            self.out_mix = nn.Parameter(mix)
         else:
-            mix.fill_(1.0 / math.sqrt(rank))
-        self.out_mix = nn.Parameter(mix)
+            # Match the released Mamba-3 parameterization: V is expanded from
+            # one base input, Z gates each rank before contraction, and O is a
+            # channelwise rank-down projection. 1/R initialization keeps the
+            # initial aggregate scale controlled without an artificial norm.
+            self.mimo_v = nn.Parameter(torch.full((h, rank, dv), 1.0 / rank))
+            self.mimo_z = nn.Parameter(torch.ones(h, rank, dv))
+            self.mimo_out = nn.Parameter(torch.full((h, rank, dv), 1.0 / rank))
         if config.rotation_mode != "none":
             self.rot_proj = nn.Linear(config.d_model, h * (dk // 2), bias=True)
             nn.init.zeros_(self.rot_proj.weight)
@@ -1844,7 +1882,8 @@ class TinyFactorProjector(nn.Module):
         hidden = torch.where(valid.unsqueeze(-1), hidden, torch.zeros_like(hidden))
         q_raw = self.q_proj(hidden).view(batch, steps, h, rank, factor_dk)
         k_raw = self.k_proj(hidden).view(batch, steps, h, rank, factor_dk)
-        v_raw = self.v_proj(hidden).view(batch, steps, h, rank, dv)
+        v_raw = self.v_proj(hidden).view(batch, steps, h, dv)
+        z_base = self.z_proj(hidden).float().view(batch, steps, h, dv)
         flattened = torch.cat(
             (q_raw.flatten(2), k_raw.flatten(2), v_raw.flatten(2)), dim=-1
         )
@@ -1854,7 +1893,7 @@ class TinyFactorProjector(nn.Module):
         q_count = h * rank * factor_dk
         k_count = h * rank * factor_dk
         q_raw, k_raw, v_raw = torch.split(
-            mixed, (q_count, k_count, h * rank * dv), dim=-1
+            mixed, (q_count, k_count, h * dv), dim=-1
         )
         q_base = F.normalize(
             q_raw.view(batch, steps, h, rank, factor_dk).float(), dim=-1, eps=c.eps
@@ -1862,12 +1901,22 @@ class TinyFactorProjector(nn.Module):
         k = F.normalize(
             k_raw.view(batch, steps, h, rank, factor_dk).float(), dim=-1, eps=c.eps
         )
-        v = v_raw.view(batch, steps, h, rank, dv).float()
+        v_base = v_raw.view(batch, steps, h, dv).float()
         q_slots = c.r_out if rank == 1 else rank
         if rank == 1:
             q = q_base * (1.0 + self.q_slot_scale[None, None])
+            v = v_base.unsqueeze(3)
+            read_gate = z_base.unsqueeze(3).expand(batch, steps, h, q_slots, dv)
+            out_mix = self.out_mix.float()[None, None].expand(
+                batch, steps, h, q_slots
+            )
         else:
             q = q_base
+            v = v_base.unsqueeze(3) * self.mimo_v.float()[None, None]
+            read_gate = z_base.unsqueeze(3) * self.mimo_z.float()[None, None]
+            out_mix = self.mimo_out.float()[None, None].expand(
+                batch, steps, h, rank, dv
+            )
 
         if c.bc_bias_mode == "constant_coordinate_oracle":
             q, k = append_constant_coordinate(q, k)
@@ -1919,12 +1968,6 @@ class TinyFactorProjector(nn.Module):
         beta_w = torch.sigmoid(
             b + self.write_offset_gate * self.bw_off.float()[None, None]
         )
-        out_mix_logits = self.out_mix.float()
-        if rank > 1:
-            out_mix_logits = F.normalize(out_mix_logits, dim=-1, eps=c.eps)
-        out_mix = out_mix_logits[None, None].expand(
-            batch, steps, h, q_slots
-        )
         trapezoid_rho = None
         if c.trapezoid:
             trapezoid_rho = self.rho_head.float()[None, None] * torch.sigmoid(
@@ -1959,6 +2002,7 @@ class TinyFactorProjector(nn.Module):
             out_mix=out_mix,
             valid=valid,
             positions=positions,
+            read_gate=read_gate,
             trapezoid_rho=trapezoid_rho,
             momentum_gamma=momentum_gamma,
             lookahead_rho=lookahead_rho,
@@ -2249,7 +2293,13 @@ def tiny_factors_from_episode(episode: Any) -> TinyFactors:
     if not isinstance(mapping, Mapping):
         raise TypeError("episode.direct_factors must be a mapping")
     required = {"q", "k", "v", "decay", "beta_e", "beta_w", "out_mix"}
-    allowed = required | {"write_mask", "query_role", "cache_q", "cache_k"}
+    allowed = required | {
+        "write_mask",
+        "query_role",
+        "cache_q",
+        "cache_k",
+        "read_gate",
+    }
     missing = required - set(mapping)
     unknown = set(mapping) - allowed
     if missing or unknown:
@@ -2272,6 +2322,7 @@ def tiny_factors_from_episode(episode: Any) -> TinyFactors:
         out_mix=mapping["out_mix"],
         valid=episode.valid,
         positions=episode.positions,
+        read_gate=mapping.get("read_gate"),
         cache_q=mapping.get("cache_q"),
         cache_k=mapping.get("cache_k"),
     )

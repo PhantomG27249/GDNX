@@ -708,29 +708,36 @@ dimension fixed and reports the resulting parameter-count change, and a
 separate parameter-matched comparison defined below.
 
 For each head, true MIMO uses row-normalized independent keys
-`K_t [R, dk]`, values `V_t [R, dv]`, queries `Q_t [R, dk]`, per-slot erase/write
-gates `beta_e [R]` and `beta_w [R]`, and one shared state `S [dk, dv]`.
-All slots update simultaneously:
+`K_t [R, dk]`, independent queries `Q_t [R, dk]`, one base value and output-gate
+projection `v_t, z_t [dv]`, per-slot erase/write gates `beta_e [R]` and
+`beta_w [R]`, and one shared state `S [dk, dv]`. Following Mamba-3 Appendix C,
+the base value and gate are expanded with learned data-independent channelwise
+rank scalings `M_V, M_Z [R, dv]`, and the gated rank outputs are contracted by
+`M_O [R, dv]`. This is the Mamba-3 lightweight parameterization adapted to
+KMD-2's gated-delta update rather than a claim that the two recurrences are
+identical. All slots update simultaneously:
 
 ```text
 S_bar = D_t * S_prev
 K_e = diag(sqrt(beta_e / R)) K_t
 S_erase = S_bar - K_e^T (K_e S_bar)
-S_t = S_erase + (1 / sqrt(R)) K_t^T diag(beta_w) V_t
+V_t = v_t[None, :] * M_V
+S_t = S_erase + K_t^T diag(beta_w) V_t
 Y_t = Q_t S_t
-o_t = l2_normalize(o_logits_t), initialized to [1/sqrt(R)] * R
-y_t = o_t^T Y_t
+Z_t = z_t[None, :] * M_Z
+Y'_t = Y_t * silu(Z_t)
+y_t = sum_r M_O[r, :] * Y'_t[r, :]
 ```
 
 The erase is the order-invariant average
 `sum_r (beta_e,r / R) k_r (k_r^T S_bar)`. Tests require forward and gradient
-invariance under a common slot permutation. The `1/R` erase scaling,
-`1/sqrt(R)` write scaling, and unit-L2 output mixing prevent an automatic
-R-fold magnitude advantage. At `R=1`, `K_e = sqrt(beta_e) k`, the erase is
-exactly `S_bar - beta_e k (k^T S_bar)`, the write is exactly
-`k (beta_w v)^T`, and the one-slot output mixer is one. The entire recurrence
-therefore reduces exactly to the declared native SISO reference with no ridge
-or limiting argument.
+invariance under a common slot permutation. As in the released Mamba-3
+implementation, `M_V` and `M_O` initialize to `1/R` and `M_Z` initializes to
+one. Unlike the old unit-L2 scalar output mixer, the channelwise contraction
+occurs after the rank-specific nonlinear gate and therefore cannot generally
+collapse to one effective query. At `R=1`, the state update still reduces
+exactly to the declared native SISO recurrence; the Tiny projected path also
+uses the same base output gate in both its SISO and MIMO models.
 
 The current `r_out=4` shared-query slots are another separate control and are
 never relabelled as true MIMO.

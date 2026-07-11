@@ -30,7 +30,7 @@ from .tiny_backend import (
 )
 
 
-TINY_CHECKPOINT_SCHEMA_VERSION = "1.2.0"
+TINY_CHECKPOINT_SCHEMA_VERSION = "1.3.0"
 _CACHE_PARAMETER_NAMES = frozenset(
     {
         "cache_gamma_q",
@@ -421,6 +421,11 @@ class TinyTrainer:
                 out_mix=source.out_mix.to(device),
                 valid=source.valid.to(device),
                 positions=source.positions.to(device),
+                read_gate=(
+                    None
+                    if source.read_gate is None
+                    else source.read_gate.to(device)
+                ),
                 trapezoid_rho=(
                     None
                     if source.trapezoid_rho is None

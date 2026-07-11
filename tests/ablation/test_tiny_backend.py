@@ -70,6 +70,7 @@ def _factors(
     k = torch.zeros(batch, steps, heads, write_slots, dk)
     q[..., 0] = 1.0
     k[..., 0] = 1.0
+    mimo = write_slots > 1
     tensors = {
         "q": q.requires_grad_(requires_grad),
         "k": k.requires_grad_(requires_grad),
@@ -86,18 +87,30 @@ def _factors(
             requires_grad
         ),
         "out_mix": torch.full(
-            (batch, steps, heads, q_slots), 1.0 / q_slots
+            (
+                (batch, steps, heads, q_slots, dv)
+                if mimo
+                else (batch, steps, heads, q_slots)
+            ),
+            1.0 / q_slots,
         ).requires_grad_(requires_grad),
     }
     return TinyFactors(
         **tensors,
         valid=torch.ones(batch, steps, dtype=torch.bool),
         positions=torch.arange(steps, dtype=torch.int64).repeat(batch, 1),
+        read_gate=(
+            torch.ones(batch, steps, heads, q_slots, dv).requires_grad_(
+                requires_grad
+            )
+            if mimo
+            else None
+        ),
     )
 
 
 def test_tiny_api_shapes_and_validation() -> None:
-    assert TINY_BACKEND_SCHEMA_VERSION == "1.0.0"
+    assert TINY_BACKEND_SCHEMA_VERSION == "1.1.0"
     config = _config()
     with pytest.raises(FrozenInstanceError):
         config.dk = 4  # type: ignore[misc]
@@ -1346,8 +1359,14 @@ def test_tiny_disabled_identity_convolution_uses_logical_valid_positions() -> No
     hole_valid = torch.tensor([[True, False, True, True, True]])
     hole_positions = torch.tensor([[0, -1, 1, 2, 3]])
     hole = projector(hole_hidden, hole_valid, hole_positions)
-    for name in ("q", "k", "v", "decay", "beta_e", "beta_w", "out_mix"):
-        assert torch.equal(getattr(hole, name)[:, selected], getattr(compact, name)), name
+    for name in ("q", "k", "v", "decay", "beta_e", "beta_w", "out_mix", "read_gate"):
+        torch.testing.assert_close(
+            getattr(hole, name)[:, selected],
+            getattr(compact, name),
+            atol=1.0e-7,
+            rtol=1.0e-7,
+            msg=name,
+        )
 
 
 def test_tiny_disabled_identity_shared_query_slots_match_siso() -> None:

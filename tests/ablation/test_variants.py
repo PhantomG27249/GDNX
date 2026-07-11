@@ -1684,6 +1684,7 @@ def test_bc_bias_constant_coordinate_direct_and_projected_decay_semantics_match(
         out_mix=projected.out_mix,
         valid=projected.valid,
         positions=projected.positions,
+        read_gate=projected.read_gate,
     )
     cell = TinyKMD2Cell(config)
     projected_output = cell(projected)
@@ -1915,7 +1916,8 @@ def _true_mimo_factors(*, rank: int = 3, requires_grad: bool = False):
         "decay": torch.sigmoid(torch.randn(1, 3, 1, 2, generator=generator)),
         "beta_e": torch.sigmoid(torch.randn(1, 3, 1, rank, generator=generator)),
         "beta_w": torch.sigmoid(torch.randn(1, 3, 1, rank, generator=generator)),
-        "out_mix": torch.randn(1, 3, 1, rank, generator=generator),
+        "out_mix": torch.randn(1, 3, 1, rank, 2, generator=generator),
+        "read_gate": torch.randn(1, 3, 1, rank, 2, generator=generator),
     }
     if requires_grad:
         for tensor in tensors.values():
@@ -1949,16 +1951,25 @@ def test_true_mimo_cell_matches_simultaneous_equations_and_finite_gradients() ->
             "bhrd,bhrv->bhdv",
             key,
             factors.beta_w[:, token].unsqueeze(-1) * value,
-        ) / math.sqrt(rank)
+        )
         slots = torch.matmul(factors.q[:, token], state)
-        mix = torch.nn.functional.normalize(factors.out_mix[:, token], dim=-1)
-        reads.append((slots * mix.unsqueeze(-1)).sum(-2))
+        gated = slots * torch.nn.functional.silu(factors.read_gate[:, token])
+        reads.append((gated * factors.out_mix[:, token]).sum(-2))
     expected_read = torch.stack(reads, dim=1)
     assert torch.allclose(output.final_state, state, atol=1.0e-6, rtol=1.0e-6)
     assert torch.allclose(output.read, expected_read, atol=1.0e-6, rtol=1.0e-6)
 
     output.read.square().sum().backward()
-    for name in ("q", "k", "v", "decay", "beta_e", "beta_w", "out_mix"):
+    for name in (
+        "q",
+        "k",
+        "v",
+        "decay",
+        "beta_e",
+        "beta_w",
+        "out_mix",
+        "read_gate",
+    ):
         gradient = getattr(factors, name).grad
         assert gradient is not None and torch.isfinite(gradient).all(), name
 
@@ -1979,6 +1990,7 @@ def test_true_mimo_common_slot_permutation_is_forward_invariant() -> None:
         out_mix=factors.out_mix.index_select(3, permutation),
         valid=factors.valid,
         positions=factors.positions,
+        read_gate=factors.read_gate.index_select(3, permutation),
     )
     cell = TinyKMD2Cell(_tiny_config(mimo_rank=rank))
     original = cell(factors)
@@ -1988,24 +2000,27 @@ def test_true_mimo_common_slot_permutation_is_forward_invariant() -> None:
     assert torch.allclose(reordered.scores, original.scores, atol=1.0e-6)
 
 
-def test_true_mimo_output_logits_are_unit_scaled_and_distinct_from_r_out() -> None:
+def test_true_mimo_uses_mamba3_channelwise_rank_scalings_and_gates() -> None:
     from research.kmd2_ablation.tiny_backend import TinyFactorProjector
     from research.kmd2_ablation.variants import get_variant
 
     rank = 3
     projector = TinyFactorProjector(_tiny_config(mimo_rank=rank))
-    with torch.no_grad():
-        projector.out_mix.copy_(torch.tensor([[3.0, 4.0, 0.0]]))
     hidden = torch.randn(1, 2, 8, generator=torch.Generator().manual_seed(51))
     factors = projector(
         hidden,
         torch.ones(1, 2, dtype=torch.bool),
         torch.arange(2, dtype=torch.int64).view(1, 2),
     )
-    assert torch.allclose(
-        torch.linalg.vector_norm(factors.out_mix, dim=-1),
-        torch.ones(1, 2, 1),
+    assert factors.out_mix.shape == (1, 2, 1, rank, 2)
+    assert factors.read_gate.shape == (1, 2, 1, rank, 2)
+    assert torch.equal(projector.mimo_v, torch.full_like(projector.mimo_v, 1 / rank))
+    assert torch.equal(projector.mimo_z, torch.ones_like(projector.mimo_z))
+    assert torch.equal(
+        projector.mimo_out, torch.full_like(projector.mimo_out, 1 / rank)
     )
+    assert not hasattr(projector, "q_slot_scale")
+    assert not hasattr(projector, "out_mix")
     assert factors.k.shape[3] == factors.q.shape[3] == rank
     assert get_variant("true_mimo.sweep").compatible_backends == frozenset({"tiny"})
     with pytest.raises(ValueError, match="r_out.*mimo_rank"):
@@ -2724,6 +2739,7 @@ def test_registry_parameter_metadata_matches_instantiated_tiny_tensors() -> None
         "q_proj.weight",
         "k_proj.weight",
         "v_proj.weight",
+        "z_proj.weight",
         "conv.weight",
         "decay_chan",
         "q_slot_scale",
@@ -2735,12 +2751,12 @@ def test_registry_parameter_metadata_matches_instantiated_tiny_tensors() -> None
     expected_true_mimo = (
         "q_proj.weight",
         "k_proj.weight",
-        "v_proj.weight",
         "b_proj.weight",
         "conv.weight",
         "bw_off",
-        "q_slot_scale",
-        "out_mix",
+        "mimo_v",
+        "mimo_z",
+        "mimo_out",
     )
     expected_diagonal = (
         "bc_q_amplitude",
@@ -2751,7 +2767,7 @@ def test_registry_parameter_metadata_matches_instantiated_tiny_tensors() -> None
     assert get_variant("state_size.sweep").changed_parameters == expected_state_size
     assert get_variant("true_mimo.sweep").changed_parameters == expected_true_mimo
     assert get_variant("bc_bias.diagonal_rescale").changed_parameters == expected_diagonal
-    assert not any(name.startswith("mimo_") for name in expected_true_mimo)
+    assert {"mimo_v", "mimo_z", "mimo_out"}.issubset(expected_true_mimo)
 
     def shapes(model: TinyKMD2Model) -> dict[str, tuple[int, ...]]:
         return {name: tuple(parameter.shape) for name, parameter in model.named_parameters()}
@@ -2773,6 +2789,7 @@ def test_registry_parameter_metadata_matches_instantiated_tiny_tensors() -> None
             local_name(name)
             for name in native_shapes.keys() | variant_shapes.keys()
             if native_shapes.get(name) != variant_shapes.get(name)
+            and name in variant_shapes
         }
         assert changed == set(expected)
         assert all(
@@ -2840,7 +2857,7 @@ def test_true_mimo_zero_erase_gate_has_finite_correct_boundary_gradient() -> Non
         "bhrd,bhrv->bhdv",
         ref_key,
         ref_beta_w.unsqueeze(-1) * ref_value,
-    ) / math.sqrt(rank)
+    )
     expected = ref_state - erase + write
     torch.testing.assert_close(actual, expected)
     assert torch.isfinite(actual).all()

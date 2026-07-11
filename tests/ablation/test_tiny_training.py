@@ -1106,7 +1106,7 @@ def test_tiny_checkpoint_schema_is_complete_atomic_and_cpu_portable(
         "metric_state",
     )
     assert payload["schema_version"] == TINY_CHECKPOINT_SCHEMA_VERSION
-    assert payload["schema_version"] == "1.2.0"
+    assert payload["schema_version"] == "1.3.0"
     assert payload["job_id"] == "checkpoint-job"
     assert len(payload["model_config_signature"]) == 64
     assert len(payload["training_config_signature"]) == 64
