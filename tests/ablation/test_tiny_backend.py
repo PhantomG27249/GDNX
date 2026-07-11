@@ -70,6 +70,7 @@ def _factors(
     k = torch.zeros(batch, steps, heads, write_slots, dk)
     q[..., 0] = 1.0
     k[..., 0] = 1.0
+    mimo = write_slots > 1
     tensors = {
         "q": q.requires_grad_(requires_grad),
         "k": k.requires_grad_(requires_grad),
@@ -86,18 +87,30 @@ def _factors(
             requires_grad
         ),
         "out_mix": torch.full(
-            (batch, steps, heads, q_slots), 1.0 / q_slots
+            (
+                (batch, steps, heads, q_slots, dv)
+                if mimo
+                else (batch, steps, heads, q_slots)
+            ),
+            1.0 / q_slots,
         ).requires_grad_(requires_grad),
     }
     return TinyFactors(
         **tensors,
         valid=torch.ones(batch, steps, dtype=torch.bool),
         positions=torch.arange(steps, dtype=torch.int64).repeat(batch, 1),
+        read_gate=(
+            torch.ones(batch, steps, heads, q_slots, dv).requires_grad_(
+                requires_grad
+            )
+            if mimo
+            else None
+        ),
     )
 
 
 def test_tiny_api_shapes_and_validation() -> None:
-    assert TINY_BACKEND_SCHEMA_VERSION == "1.0.0"
+    assert TINY_BACKEND_SCHEMA_VERSION == "1.2.0"
     config = _config()
     with pytest.raises(FrozenInstanceError):
         config.dk = 4  # type: ignore[misc]
@@ -1274,6 +1287,129 @@ def _projector_inputs(config: TinyKMD2Config) -> tuple[torch.Tensor, ...]:
     return hidden, valid, positions
 
 
+def test_gdn2_projector_has_independent_token_channel_gates() -> None:
+    config = _config(gdn2_decoupled=True)
+    projector = _projector(config, seed=1201)
+    hidden, valid, positions = _projector_inputs(config)
+    baseline = projector(hidden, valid, positions)
+
+    assert baseline.beta_e.shape == (2, 5, config.heads, 1, config.dk)
+    assert baseline.beta_w.shape == (2, 5, config.heads, 1, config.dv)
+    assert hasattr(projector, "erase_proj")
+    assert hasattr(projector, "write_proj")
+    assert not hasattr(projector, "b_proj")
+    assert not hasattr(projector, "bw_off")
+    assert not torch.equal(baseline.beta_e[:, 0], baseline.beta_e[:, 1])
+    assert not torch.equal(baseline.beta_w[:, 0], baseline.beta_w[:, 1])
+
+    with torch.no_grad():
+        projector.write_proj.weight.add_(0.5)
+    write_changed = projector(hidden, valid, positions)
+    assert torch.equal(baseline.beta_e, write_changed.beta_e)
+    assert not torch.equal(baseline.beta_w, write_changed.beta_w)
+
+    with torch.no_grad():
+        projector.erase_proj.weight.sub_(0.25)
+    erase_changed = projector(hidden, valid, positions)
+    assert not torch.equal(write_changed.beta_e, erase_changed.beta_e)
+    assert torch.equal(write_changed.beta_w, erase_changed.beta_w)
+
+    gradients = torch.autograd.grad(
+        erase_changed.beta_e.sum() + erase_changed.beta_w.sum(),
+        (projector.erase_proj.weight, projector.write_proj.weight),
+    )
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+    assert all(torch.count_nonzero(gradient) > 0 for gradient in gradients)
+
+
+def test_gdn2_recurrence_matches_paper_equation_and_all_gradients() -> None:
+    generator = torch.Generator().manual_seed(1203)
+    batch, steps, heads, dk, dv = 2, 4, 2, 3, 2
+
+    def leaf(shape: tuple[int, ...]) -> torch.Tensor:
+        return torch.randn(shape, generator=generator).requires_grad_()
+
+    key = leaf((batch, steps, heads, 1, dk))
+    value = leaf((batch, steps, heads, 1, dv))
+    decay_raw = leaf((batch, steps, heads, dk))
+    erase_raw = leaf((batch, steps, heads, 1, dk))
+    write_raw = leaf((batch, steps, heads, 1, dv))
+    initial = leaf((batch, heads, dk, dv))
+    decay = torch.sigmoid(decay_raw)
+    beta_e = torch.sigmoid(erase_raw)
+    beta_w = torch.sigmoid(write_raw)
+    valid = torch.ones(batch, steps, dtype=torch.bool)
+    factors = TinyFactors(
+        q=torch.zeros(batch, steps, heads, 1, dk),
+        k=key,
+        v=value,
+        decay=decay,
+        beta_e=beta_e,
+        beta_w=beta_w,
+        out_mix=torch.ones(batch, steps, heads, 1),
+        valid=valid,
+        positions=torch.arange(steps).repeat(batch, 1),
+    )
+    actual = TinyKMD2Cell(
+        _config(heads=heads, dk=dk, dv=dv, gdn2_decoupled=True)
+    )(factors, state=initial)
+
+    expected = initial
+    for token in range(steps):
+        state_bar = decay[:, token].unsqueeze(-1) * expected
+        key_t = key[:, token, :, 0]
+        erase_direction = beta_e[:, token, :, 0] * key_t
+        old_content = torch.matmul(
+            erase_direction.unsqueeze(-2), state_bar
+        ).squeeze(-2)
+        write_value = beta_w[:, token, :, 0] * value[:, token, :, 0]
+        expected = state_bar + key_t.unsqueeze(-1) * (
+            write_value - old_content
+        ).unsqueeze(-2)
+
+    assert torch.allclose(actual.final_state, expected, rtol=1e-6, atol=1e-7)
+    leaves = (key, value, decay_raw, erase_raw, write_raw, initial)
+    actual_gradients = torch.autograd.grad(
+        actual.final_state.square().sum(), leaves, retain_graph=True
+    )
+    expected_gradients = torch.autograd.grad(expected.square().sum(), leaves)
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients, expected_gradients
+    ):
+        assert torch.allclose(
+            actual_gradient, expected_gradient, rtol=1e-6, atol=1e-7
+        )
+
+
+def test_gdn2_channel_gates_recover_tied_scalar_delta_rule() -> None:
+    generator = torch.Generator().manual_seed(1205)
+    state = torch.randn(2, 2, 3, 4, generator=generator)
+    key = torch.randn(2, 2, 1, 3, generator=generator)
+    value = torch.randn(2, 2, 1, 4, generator=generator)
+    beta_e = torch.sigmoid(torch.randn(2, 2, 1, generator=generator))
+    beta_w = torch.sigmoid(torch.randn(2, 2, 1, generator=generator))
+    scalar = tiny_backend_module.true_mimo_update(
+        state, key, value, beta_e, beta_w
+    )
+    channelwise = tiny_backend_module.true_mimo_update(
+        state,
+        key,
+        value,
+        beta_e.unsqueeze(-1).expand(-1, -1, -1, 3),
+        beta_w.unsqueeze(-1).expand(-1, -1, -1, 4),
+    )
+    assert torch.allclose(scalar, channelwise, rtol=1e-6, atol=1e-7)
+
+
+def test_gdn2_config_rejects_undefined_cache_mimo_and_factor_combinations() -> None:
+    with pytest.raises(ValueError, match="mimo_rank=1"):
+        _config(gdn2_decoupled=True, mimo_rank=2)
+    with pytest.raises(ValueError, match="exact-cache"):
+        _config(gdn2_decoupled=True, cache=CacheConfig(width=2))
+    with pytest.raises(ValueError, match="channelwise"):
+        TinyKMD2Cell(_config(gdn2_decoupled=True))(_factors(dv=3))
+
+
 @pytest.mark.parametrize(
     "rotation_mode",
     ["current", "constant_rate", "non_cumulative", "fixed_rope", "moving_frame"],
@@ -1346,8 +1482,14 @@ def test_tiny_disabled_identity_convolution_uses_logical_valid_positions() -> No
     hole_valid = torch.tensor([[True, False, True, True, True]])
     hole_positions = torch.tensor([[0, -1, 1, 2, 3]])
     hole = projector(hole_hidden, hole_valid, hole_positions)
-    for name in ("q", "k", "v", "decay", "beta_e", "beta_w", "out_mix"):
-        assert torch.equal(getattr(hole, name)[:, selected], getattr(compact, name)), name
+    for name in ("q", "k", "v", "decay", "beta_e", "beta_w", "out_mix", "read_gate"):
+        torch.testing.assert_close(
+            getattr(hole, name)[:, selected],
+            getattr(compact, name),
+            atol=1.0e-7,
+            rtol=1.0e-7,
+            msg=name,
+        )
 
 
 def test_tiny_disabled_identity_shared_query_slots_match_siso() -> None:

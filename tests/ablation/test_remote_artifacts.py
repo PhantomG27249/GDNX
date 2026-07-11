@@ -22,6 +22,7 @@ REQUIRED_CONFIGS = {
     "promotion.json",
     "qwen_exact_cache.json",
     "trapezoid_screening.json",
+    "gdn2_decoupled_screening.json",
 }
 
 
@@ -56,6 +57,10 @@ def test_committed_configs_are_complete_portable_and_cover_required_matrices():
     assert configs["trapezoid_screening.json"].mechanism == "trapezoid"
     assert configs["corrected_momentum_screening.json"].mechanism == "corrected_momentum"
     assert configs["causal_lookahead_screening.json"].mechanism == "causal_lookahead"
+    gdn2 = configs["gdn2_decoupled_screening.json"]
+    assert gdn2.mechanism == "gdn2_decoupled"
+    assert gdn2.variant == "channelwise_erase_write"
+    assert len(gdn2.seeds) == 3
     qwen = configs["qwen_exact_cache.json"]
     assert qwen.backend == "qwen"
     assert qwen.required_stage == "qwen_heal"

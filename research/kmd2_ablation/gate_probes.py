@@ -66,6 +66,7 @@ def _probe_config(config: ExperimentConfig, spec: Any) -> TinyKMD2Config:
         causal_lookahead=spec.mechanism == "causal_lookahead",
         bc_bias_mode="additive" if spec.mechanism == "bc_bias" else "none",
         selector_seed=1729,
+        gdn2_decoupled=spec.mechanism == "gdn2_decoupled",
     )
 
 
@@ -298,6 +299,46 @@ def measure_scientific_gates(config: ExperimentConfig, spec: Any) -> dict[str, A
                 "native_state_elements": native_state,
                 "active_state_elements": active_state,
             },
+        }
+    if spec.mechanism == "gdn2_decoupled":
+        probe = _probe_config(config, spec)
+        missing, disconnected, frozen = _parameter_evidence(
+            probe, spec, gate_connected=True
+        )
+        model = TinyKMD2Model(probe, init_seed=1729)
+        projector = model.blocks[0].projector
+        cell = model.blocks[0].cell
+        hidden = torch.randn(
+            1, 4, probe.d_model, generator=torch.Generator().manual_seed(1731)
+        )
+        valid = torch.ones(1, 4, dtype=torch.bool)
+        positions = torch.arange(4, dtype=torch.int64).view(1, 4)
+        factors = projector(hidden, valid, positions)
+        output = cell(factors)
+        gradients = torch.autograd.grad(
+            output.final_state.square().sum(),
+            (projector.erase_proj.weight, projector.write_proj.weight),
+        )
+        connected = all(_finite_nonzero(gradient) for gradient in gradients)
+        shape_correct = (
+            factors.beta_e.shape == (1, 4, probe.heads, 1, probe.dk)
+            and factors.beta_w.shape == (1, 4, probe.heads, 1, probe.dv)
+        )
+        details = {
+            "kind": "gdn2_channelwise_recurrence_probe",
+            "erase_gate_shape": list(factors.beta_e.shape),
+            "write_gate_shape": list(factors.beta_w.shape),
+            "independent_projection_gradients": connected,
+        }
+        return {
+            "available": True,
+            "identity_passed": False,
+            "active_effect_passed": shape_correct and connected,
+            "missing_parameters": missing,
+            "disconnected_parameters": disconnected,
+            "frozen_zero_gates": frozen,
+            "native_feature_present": False,
+            "probe": details,
         }
     return {"available": False, "reason": "unsupported_addition_probe"}
 

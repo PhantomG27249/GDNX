@@ -30,7 +30,7 @@ from .tiny_backend import (
 )
 
 
-TINY_CHECKPOINT_SCHEMA_VERSION = "1.2.0"
+TINY_CHECKPOINT_SCHEMA_VERSION = "1.4.0"
 _CACHE_PARAMETER_NAMES = frozenset(
     {
         "cache_gamma_q",
@@ -110,6 +110,7 @@ _TINY_ARM_STATUS: Mapping[str, str] = {
     "causal_lookahead": "supported",
     "state_size.sweep": "supported",
     "true_mimo.sweep": "supported",
+    "gdn2_decoupled.channelwise": "supported",
     "exact_cache.off": "supported",
     "exact_cache.current_block_only": "supported",
     "exact_cache.selector.exact_outer": "supported",
@@ -421,6 +422,11 @@ class TinyTrainer:
                 out_mix=source.out_mix.to(device),
                 valid=source.valid.to(device),
                 positions=source.positions.to(device),
+                read_gate=(
+                    None
+                    if source.read_gate is None
+                    else source.read_gate.to(device)
+                ),
                 trapezoid_rho=(
                     None
                     if source.trapezoid_rho is None
@@ -1680,6 +1686,7 @@ def _tiny_model_config(
             rotation_gate_init=rotation_gate,
             channel_decay_gate_init=1.0,
             write_offset_gate_init=1.0,
+            gdn2_decoupled=arm_id == "gdn2_decoupled.channelwise",
             trapezoid=arm_id == "trapezoid",
             corrected_momentum=arm_id == "corrected_momentum",
             causal_lookahead=arm_id == "causal_lookahead",

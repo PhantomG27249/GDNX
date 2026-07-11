@@ -2,7 +2,8 @@
 
 This package runs preregistered paired tests for native KMD-2, trapezoidal
 write carry, corrected/Nesterov-style momentum, causal lookahead, true
-MIMO/state-size controls, B/C bias, and the HOLA-inspired bounded exact cache.
+MIMO/state-size controls, Gated DeltaNet-2 channelwise erase/write gates,
+B/C bias, and the HOLA-inspired bounded exact cache.
 It records evidence; it does not claim an arm is better until the configured
 paired promotion gates pass.
 
@@ -20,6 +21,7 @@ python -m research.kmd2_ablation.run_ablation --help
 | `configs/trapezoid_screening.json` | native + trapezoidal carry | 3 | irregular-time integration |
 | `configs/corrected_momentum_screening.json` | native + corrected momentum | 3 | drift/reversal adaptation |
 | `configs/causal_lookahead_screening.json` | native + causal lookahead | 3 | trajectory extrapolation |
+| `configs/gdn2_decoupled_screening.json` | scalar-offset native + GDN-2 channelwise gates | 3 | MQAR erase/write control |
 | `configs/screening.json` | native + exact surprise cache | 3 | MQAR screen |
 | `configs/promotion.json` | native + exact surprise cache | 5 | structured exceptions promotion |
 | `configs/qwen_exact_cache.json` | native + matched recency + surprise | 3 | mandatory long-cell RULER heal |

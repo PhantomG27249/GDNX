@@ -840,6 +840,32 @@ def test_tiny_dispatcher_uses_explicit_true_mimo_rank_and_parameter_match(
     )
 
 
+def test_tiny_dispatcher_activates_exact_gdn2_channelwise_gate_path(
+    tmp_path: Path,
+) -> None:
+    job = _dispatcher_job(
+        "gdn2_decoupled.channelwise", task="mqar", params={"width": 4}
+    )
+    captured: list[TinyKMD2Config] = []
+
+    def build_model(config: TinyKMD2Config, *, init_seed: int):
+        captured.append(config)
+        return TinyKMD2Model(config, init_seed=init_seed)
+
+    payload = build_job_dispatcher(
+        _dispatcher_runtime(tmp_path), dependencies={"build_model": build_model}
+    )(job)
+    assert captured[0].gdn2_decoupled is True
+    assert captured[0].mimo_rank == 1
+    model = TinyKMD2Model(captured[0], init_seed=211)
+    names = set(dict(model.named_parameters()))
+    assert any(name.endswith("erase_proj.weight") for name in names)
+    assert any(name.endswith("write_proj.weight") for name in names)
+    assert not any(name.endswith("b_proj.weight") for name in names)
+    assert not any(name.endswith("bw_off") for name in names)
+    assert payload["metrics"]
+
+
 def test_matched_native_state_size_comparator_uses_declared_target_dimensions(
     tmp_path: Path,
 ) -> None:
@@ -1106,7 +1132,7 @@ def test_tiny_checkpoint_schema_is_complete_atomic_and_cpu_portable(
         "metric_state",
     )
     assert payload["schema_version"] == TINY_CHECKPOINT_SCHEMA_VERSION
-    assert payload["schema_version"] == "1.2.0"
+    assert payload["schema_version"] == "1.4.0"
     assert payload["job_id"] == "checkpoint-job"
     assert len(payload["model_config_signature"]) == 64
     assert len(payload["training_config_signature"]) == 64

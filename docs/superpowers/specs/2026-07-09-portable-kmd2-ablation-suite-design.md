@@ -67,7 +67,7 @@ The suite must inventory the current implementation before creating jobs.
 | Rotation | Cumulative data-dependent paired q/k rotation |
 | Output slots | `r_out=4` scaled copies of a shared query plus learned mixing |
 | Decay | Native per-head decay plus learned per-key-channel offsets |
-| Write control | Per-head write-beta offset decoupled from erase |
+| Write control | Shared token logit plus a static per-head write offset; not independently token-controlled |
 | Recurrent state | Dense `dk x dv` state, zeroed on every forward call |
 
 ### Features not currently present
@@ -77,6 +77,7 @@ The suite must inventory the current implementation before creating jobs.
 | Trapezoidal state-input carry | Previous and current write factors blended inside the recurrence |
 | B/C-style bias | New gated q/k channel biases after normalization |
 | True MIMO | Independent rank-R write inputs and output queries sharing one state |
+| Gated DeltaNet-2 gates | Independent token-conditioned key-channel erase and value-channel write projections |
 | Momentum | A second full velocity state with a coherent lookahead update |
 | Lookahead target | A causal, identity-gated value-space derivative correction |
 | Native state-size knob | A changed native state shape; not warm-load compatible |
@@ -88,6 +89,29 @@ architectures. They are not valid substitutes for the native baseline.
 inventory records that conceptual overlap. It is inactive when native KMD-2 is
 selected, position/recency based, read linearly as part of state, and compacted
 lossily; it is not the proposed top-surprise, sharply read cache.
+
+### Gated DeltaNet-2 erase/write ablation
+
+The native scalar-offset control remains unchanged. The tiny-only
+`gdn2_decoupled.channelwise` arm implements the Gated DeltaNet-2 recurrence
+with independent token projections:
+
+```text
+b_t = sigmoid(W_b x_t) in [0,1]^dk
+w_t = sigmoid(W_w x_t) in [0,1]^dv
+S_bar = D_t * S_prev
+e_t = b_t * k_t
+z_t = w_t * v_t
+r_t = S_bar^T e_t
+S_t = S_bar + k_t (z_t - r_t)^T
+```
+
+The left outer-product address remains `k_t`; only the erase/read direction is
+gated as `b_t * k_t`. This is deliberately not implemented as two scalar
+logits. Broadcasting scalar `beta_e` and `beta_w` across their respective
+channels recovers the prior delta-rule update exactly. The initial arm is a
+cold redesign at `mimo_rank=1`; exact-cache scoring and a fused scan are out of
+scope until their gate-aware definitions and parity tests are added.
 
 ## Redundancy and No-Op Gates
 
@@ -708,29 +732,36 @@ dimension fixed and reports the resulting parameter-count change, and a
 separate parameter-matched comparison defined below.
 
 For each head, true MIMO uses row-normalized independent keys
-`K_t [R, dk]`, values `V_t [R, dv]`, queries `Q_t [R, dk]`, per-slot erase/write
-gates `beta_e [R]` and `beta_w [R]`, and one shared state `S [dk, dv]`.
-All slots update simultaneously:
+`K_t [R, dk]`, independent queries `Q_t [R, dk]`, one base value and output-gate
+projection `v_t, z_t [dv]`, per-slot erase/write gates `beta_e [R]` and
+`beta_w [R]`, and one shared state `S [dk, dv]`. Following Mamba-3 Appendix C,
+the base value and gate are expanded with learned data-independent channelwise
+rank scalings `M_V, M_Z [R, dv]`, and the gated rank outputs are contracted by
+`M_O [R, dv]`. This is the Mamba-3 lightweight parameterization adapted to
+KMD-2's gated-delta update rather than a claim that the two recurrences are
+identical. All slots update simultaneously:
 
 ```text
 S_bar = D_t * S_prev
 K_e = diag(sqrt(beta_e / R)) K_t
 S_erase = S_bar - K_e^T (K_e S_bar)
-S_t = S_erase + (1 / sqrt(R)) K_t^T diag(beta_w) V_t
+V_t = v_t[None, :] * M_V
+S_t = S_erase + K_t^T diag(beta_w) V_t
 Y_t = Q_t S_t
-o_t = l2_normalize(o_logits_t), initialized to [1/sqrt(R)] * R
-y_t = o_t^T Y_t
+Z_t = z_t[None, :] * M_Z
+Y'_t = Y_t * silu(Z_t)
+y_t = sum_r M_O[r, :] * Y'_t[r, :]
 ```
 
 The erase is the order-invariant average
 `sum_r (beta_e,r / R) k_r (k_r^T S_bar)`. Tests require forward and gradient
-invariance under a common slot permutation. The `1/R` erase scaling,
-`1/sqrt(R)` write scaling, and unit-L2 output mixing prevent an automatic
-R-fold magnitude advantage. At `R=1`, `K_e = sqrt(beta_e) k`, the erase is
-exactly `S_bar - beta_e k (k^T S_bar)`, the write is exactly
-`k (beta_w v)^T`, and the one-slot output mixer is one. The entire recurrence
-therefore reduces exactly to the declared native SISO reference with no ridge
-or limiting argument.
+invariance under a common slot permutation. As in the released Mamba-3
+implementation, `M_V` and `M_O` initialize to `1/R` and `M_Z` initializes to
+one. Unlike the old unit-L2 scalar output mixer, the channelwise contraction
+occurs after the rank-specific nonlinear gate and therefore cannot generally
+collapse to one effective query. At `R=1`, the state update still reduces
+exactly to the declared native SISO recurrence; the Tiny projected path also
+uses the same base output gate in both its SISO and MIMO models.
 
 The current `r_out=4` shared-query slots are another separate control and are
 never relabelled as true MIMO.

@@ -1321,6 +1321,7 @@ def test_production_tiny_preflight_uses_measured_gate_probe_and_matched_baseline
         ("causal_lookahead", "trajectory"),
         ("state_size.sweep", "mqar"),
         ("true_mimo.sweep", "mqar"),
+        ("gdn2_decoupled.channelwise", "mqar"),
         ("exact_cache.selector.exact_outer", "mqar"),
     ],
 )

@@ -29,6 +29,7 @@ _MECHANISMS = {
     "causal_lookahead",
     "state_size",
     "true_mimo",
+    "gdn2_decoupled",
     "exact_cache",
     "current_block_only",
 }
@@ -50,6 +51,7 @@ _VARIANTS = {
     "causal_lookahead",
     "state_size_sweep",
     "true_mimo_sweep",
+    "channelwise_erase_write",
     "cache_off",
     "chunk_only",
     "top_surprise",

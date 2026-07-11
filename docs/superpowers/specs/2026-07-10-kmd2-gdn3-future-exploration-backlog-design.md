@@ -297,10 +297,12 @@ channel.
 the value coordinates that need correction, improving repeated-key overwrite
 and multi-key retrieval without increasing persistent matrix-state size.
 
-**First experiment:** Complete four-cell factorial: scalar/scalar,
-channel-erase only, channel-write only, and both channel-wise. Identity-load
-the scalar behavior, FFN-match added projection parameters, and test repeated
-key replacement plus multi-key RULER.
+**Implemented first experiment:** The portable tiny suite now includes the
+paper-exact both-channel arm `gdn2_decoupled.channelwise` against the existing
+scalar-offset native control on MQAR. It uses independent token projections and
+the asymmetric `k_t (w_t*v_t - S_bar^T(b_t*k_t))^T` update. The complete
+scalar/scalar, erase-only, write-only, both-channel factorial, parameter
+matching, and Qwen/kernel port remain follow-up work.
 
 **Risk:** Medium. It requires new projections and a gate-aware chunk scan and
 backward implementation.
