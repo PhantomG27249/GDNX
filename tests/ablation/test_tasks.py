@@ -1238,3 +1238,13 @@ def test_affine_determinism_no_constant_path_and_ood_writes() -> None:
     assert two_x.direct_factors is not None and four_x.direct_factors is not None
     assert two_x.direct_factors["q"].shape[1] == 17
     assert four_x.direct_factors["q"].shape[1] == 33
+def test_ruler_parity_and_modular_state_tracking_and_lm_loss() -> None:
+    from research.kmd2_ablation.tasks.ruler import score_state_tracking
+
+    parity = score_state_tracking("parity", [1, 0, 1, 1], [1, 1, 0, 1], lm_loss=0.25)
+    modular = score_state_tracking("modular", [4, 5, 7], [4, 0, 2], modulus=5, lm_loss=0.5)
+    assert parity.correct == (True, False, False, True)
+    assert modular.correct == (True, True, True)
+    assert parity.lm_loss == 0.25 and modular.lm_loss == 0.5
+    with pytest.raises(ValueError, match="modulus"):
+        score_state_tracking("modular", [1], [1], lm_loss=0.1)

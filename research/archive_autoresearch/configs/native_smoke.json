@@ -1,1 +1,0 @@
-{"name":"native_smoke","arch":"native","reinit":true,"steps":8,"eval_every":4,"warmup":4,"grad_accum":1,"n_keys":4,"seq_len":512,"lr_memory":2.5e-4}

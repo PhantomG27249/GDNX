@@ -1,3 +1,0 @@
-{"name":"lrmem4e4_dclamp995_steps500","hypothesis":"the ~0.30 format plateau is an optimization-rate ceiling, not a retention one (exp002 showed more retention didn't help); push both LRs up ~60% (memory 2.5e-4->4e-4, coproduct 1.5e-4->2.5e-4) with a tighter decay_clamp 0.999->0.995 to absorb the extra energy and hold skip=0 — if tokacc rises past 0.30 the bottleneck is the optimizer, if it stays flat the plateau is fundamental (-> Phase 2).",
- "steps":500,"eval_every":50,"warmup":50,"grad_accum":1,"n_keys":4,"seq_len":512,
- "lr_memory":4e-4,"lr_coproduct":2.5e-4,"decay_clamp":0.995,"slow_decay":0.97,"residual_rank":16,"seed":0}

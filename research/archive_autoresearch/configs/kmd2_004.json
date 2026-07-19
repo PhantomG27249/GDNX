@@ -1,5 +1,0 @@
-{"name":"kmd2_fable_v4_probe_init","hypothesis":"CE provably never CREATES q->k alignment (trained gap -0.04) though the info is there (pooled probe 95%). Seed q_proj/k_slots[slot0] from offline InfoNCE probes (per-token eval 29% mean, 40-64% best layers vs 8% chance) so alignment EXISTS at init; test whether CE amplifies it into recall or the format attractor destroys it. No proxy/loss/freeze change.",
- "kmd2":true,"kmd2_r":4,"kmd2_h":16,"kmd2_dk":64,"kmd2_dv":64,"kmd2_eps":0.5,"kmd2_decay_bias":6.0,
- "kmd2_qk_init":"/home/dev/gdn3_fable/research/runs_fable/qk_probe_init.pt",
- "steps":400,"eval_every":80,"warmup":40,"grad_accum":1,"n_keys":4,"seq_len":512,
- "lr_memory":2.5e-4,"lr_coproduct":1.5e-4,"seed":0}

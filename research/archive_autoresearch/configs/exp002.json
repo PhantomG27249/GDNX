@@ -1,3 +1,0 @@
-{"name":"slowdecay099_steps600","hypothesis":"slow_decay 0.97 lets the slow track decay to ~0 over 512 tokens (0.97^512~=2e-7), leaving only the clamped fast track; raising it to 0.99 (~1000x more slow-track retention) plus 600 steps gives real two-timescale retention and room for true retrieval to emerge past the ~0.30 format plateau.",
- "steps":600,"eval_every":60,"warmup":40,"grad_accum":1,"n_keys":4,"seq_len":512,
- "lr_memory":2.5e-4,"lr_coproduct":1.5e-4,"decay_clamp":0.999,"slow_decay":0.99,"residual_rank":16,"seed":0}

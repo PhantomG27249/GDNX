@@ -37,6 +37,11 @@ _PRODUCTION_HANDLERS = {
     "summarize": ("research.kmd2_ablation.summarize", "cli_handler"),
     "bundle": ("research.kmd2_ablation.bundle", "cli_handler"),
 }
+MAXIMUM_HYBRID_CONTROL_IDS = (
+    "gdn2-r1", "gdn2-mimo-r2", "gdn2-mimo-r4", "package-a-native-decay",
+    "package-a-braid-no-cache", "package-a-recency-w64", "package-a-hola-w64",
+    "package-b-recency-w64", "package-b-hola-w64", "shared-query-widening", "stock-qwen",
+)
 
 
 def _path(value: str) -> Path:
@@ -59,6 +64,11 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
 
 def _add_qwen_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
+        "--maximum-control",
+        choices=MAXIMUM_HYBRID_CONTROL_IDS,
+        help="frozen eleven-control campaign identity (the config remains authoritative)",
+    )
+    parser.add_argument(
         "--mode",
         choices=("reliance", "heal", "initial_exact_cache"),
     )
@@ -76,6 +86,7 @@ def _add_qwen_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--student-device", "--device", dest="student_device")
     parser.add_argument("--teacher-device")
     parser.add_argument("--dtype", choices=("bfloat16", "float32"))
+    parser.add_argument("--checkpoint-every", type=int, metavar="N")
     parser.add_argument("--model-sha256")
     parser.add_argument("--tokenizer-sha256")
     parser.add_argument("--checkpoint-sha256")
@@ -100,6 +111,12 @@ def build_parser() -> argparse.ArgumentParser:
         subparser = subparsers.add_parser(command)
         _add_common_arguments(subparser)
         _add_qwen_arguments(subparser)
+        if command == "bundle":
+            subparser.add_argument(
+                "--maximum-package",
+                choices=("A", "B"),
+                help="build the complete maximum-hybrid Package A or B archive",
+            )
         if command == "preflight":
             subparser.add_argument("--dry-run", action="store_true")
     return parser
@@ -161,14 +178,18 @@ def main(
 
     command = options.command
     try:
-        handler = (
-            handlers.get(command)
-            if handlers is not None
-            else _load_production_handler(command)
-        )
-        if not callable(handler):
-            raise RuntimeError(f"no handler registered for {command}")
-        raw_report = handler(options)
+        # Optional ML libraries occasionally emit diagnostics to stdout during
+        # import. Keep stdout machine-readable by routing all incidental handler
+        # output to stderr; this CLI emits the sole JSON document below.
+        with contextlib.redirect_stdout(errors), contextlib.redirect_stderr(errors):
+            handler = (
+                handlers.get(command)
+                if handlers is not None
+                else _load_production_handler(command)
+            )
+            if not callable(handler):
+                raise RuntimeError(f"no handler registered for {command}")
+            raw_report = handler(options)
         if not isinstance(raw_report, Mapping):
             raise TypeError("command handler must return a mapping")
         report = {

@@ -16,6 +16,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from research.kmd2_ablation.architecture import TARGET_LAYERS
+
 
 def _execute_pickle_marker(path: str, payload_kind: str) -> object:
     Path(path).write_text("pickle executed", encoding="utf-8")
@@ -38,6 +40,729 @@ class _PickleMarkerPayload:
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+_R1_SUFFIXES = (
+    "in_proj_qkv.weight", "in_proj_z.weight", "in_proj_b.weight", "in_proj_a.weight",
+    "conv1d.weight", "dt_bias", "A_log", "norm.weight", "out_proj.weight",
+    "rot_proj.weight", "rot_proj.bias", "decay_chan", "bw_off",
+)
+
+
+def _canonical_architecture_case(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, key_head_dim: int = 4,
+):
+    from gdn3.kmd2_native import KMD2NativeAttn
+    from research.kmd2_ablation.architecture import registry_sha256
+    from research.kmd2_ablation.qwen_backend import QwenArmLoadSpec
+    config = SimpleNamespace(hidden_size=12, linear_num_value_heads=2, linear_num_key_heads=2, linear_key_head_dim=key_head_dim, linear_value_head_dim=3, linear_conv_kernel_dim=3, rms_norm_eps=1e-6)
+    class Block(torch.nn.Module):
+        def __init__(self): super().__init__(); self.linear_attn = torch.nn.Linear(2, 2)
+    class Backbone(torch.nn.Module):
+        def __init__(self): super().__init__(); self.layers = torch.nn.ModuleList([Block() for _ in range(23)])
+    class Model(torch.nn.Module):
+        def __init__(self): super().__init__(); self.config = config; self.model = Backbone(); self.outside = torch.nn.Parameter(torch.ones(1))
+    class Manager:
+        def __init__(self, model): self.model = model
+        def apply_upgrade(self):
+            for index in TARGET_LAYERS:
+                self.model.model.layers[index].linear_attn = KMD2NativeAttn(config, layer_idx=index)
+            return list(TARGET_LAYERS)
+    monkeypatch.setenv("GDN3_KMD2_ROUT", "1")
+    reference = KMD2NativeAttn(config, layer_idx=0)
+    reference_state = reference.state_dict()
+    assert tuple(sorted(reference_state)) == tuple(sorted(_R1_SUFFIXES))
+    checkpoint = {
+        f"model.layers.{index}.linear_attn.{suffix}": reference_state[suffix].detach().clone()
+        for index in TARGET_LAYERS for suffix in _R1_SUFFIXES
+    }
+    model_path, checkpoint_path, data_path = (tmp_path / "model", tmp_path / "checkpoint.pt", tmp_path / "data")
+    model_path.write_bytes(b"model"); torch.save(checkpoint, checkpoint_path); data_path.write_bytes(b"data")
+    def spec():
+        return QwenArmLoadSpec(arm="native", job_id="canonical-r1", model_asset=_asset("model", model_path), native_checkpoint=_asset("native_checkpoint", checkpoint_path), data_asset=_asset("data", data_path), cache_resume=None, trainable_names=("model.layers.0.linear_attn.in_proj_qkv.weight",), pre_replacement_checkpoint_sha256=_sha256(checkpoint_path), architecture_arm_id="gdn2-channel-r1", architecture_registry_sha256=registry_sha256())
+    return Model, Manager, KMD2NativeAttn, checkpoint, checkpoint_path, spec, config
+
+
+def test_canonical_architecture_checkpoint_accepts_exact_18_by_13_and_orders_events(tmp_path, monkeypatch):
+    from research.kmd2_ablation.qwen_backend import load_qwen_arm
+    Model, Manager, Native, checkpoint, _path, spec, config = _canonical_architecture_case(tmp_path, monkeypatch)
+    class Replacement(Native):
+        def transformation_manifest(self):
+            return {"copied": tuple(self.state_dict()), "transformed": (), "new": ()}
+    calls = []
+    def factory(clone, _config): clone.__class__ = Replacement; calls.append(clone.layer_idx); return clone
+    events = []
+    loaded = load_qwen_arm(spec(), model_config=config, cache_config=None, base_model_loader=lambda *_a, **_k: Model(), manager_factory=lambda model, _c: Manager(model), architecture_factory=factory, architecture_expected_type=Replacement, architecture_verifier=lambda _m, indices: (indices == TARGET_LAYERS) or (_ for _ in ()).throw(AssertionError(indices)), event=events.append)
+    assert len(checkpoint) == 18 * 13
+    assert loaded.upgraded_indices == TARGET_LAYERS
+    assert calls == list(TARGET_LAYERS)
+    assert events == ["validate_assets", "load_model", "native_install_r1", "checkpoint_overlay_complete", "prepare_replacements", "swap_replacements", "configure_trainables", "verify_conversion"]
+
+
+def test_production_architecture_rejects_nonexact_trainable_manifest(tmp_path, monkeypatch):
+    from research.kmd2_ablation.qwen_backend import load_qwen_arm
+    Model, Manager, _Native, _checkpoint, _path, spec, config = _canonical_architecture_case(tmp_path, monkeypatch)
+    with pytest.raises(ValueError, match="architecture_trainable_manifest_mismatch"):
+        load_qwen_arm(
+            spec(), model_config=config, cache_config=None,
+            base_model_loader=lambda *_a, **_k: Model(),
+            manager_factory=lambda model, _c: Manager(model),
+        )
+
+
+@pytest.mark.parametrize("arm,module_name", [
+    ("gdn2-mimo-r4-braid-shared-hola-w64", "QwenSharedBraidHybrid"),
+    ("gdn2-mimo-r4-braid-four-state-hola-w64", "QwenFourStateHybrid"),
+])
+def test_real_loader_accepts_canonical_hybrid_trainable_manifest(tmp_path, monkeypatch, arm, module_name):
+    from research.kmd2_ablation.qwen_backend import load_qwen_arm
+    from research.kmd2_ablation.qwen_hybrid_math import REFERENCE_IMPLEMENTATION
+    Model, Manager, Native, _checkpoint, _path, spec_factory, config = _canonical_architecture_case(
+        tmp_path, monkeypatch, key_head_dim=(4 if "shared" in arm else 8),
+    )
+    if "shared" in arm:
+        from research.kmd2_ablation.qwen_hybrid_shared import QwenSharedBraidHybrid as Hybrid
+    else:
+        from research.kmd2_ablation.qwen_hybrid_four_state import QwenFourStateHybrid as Hybrid
+    prototype = Hybrid.from_native(Native(config, layer_idx=0))
+    names = tuple(sorted(
+        f"model.layers.{index}.linear_attn.{suffix}"
+        for index in TARGET_LAYERS for suffix, _ in prototype.named_parameters()
+    ))
+    spec = dataclasses.replace(spec_factory(), architecture_arm_id=arm, trainable_names=names)
+    loaded = load_qwen_arm(spec, model_config=config, cache_config=None,
+        base_model_loader=lambda *_a, **_k: Model(), manager_factory=lambda model, _c: Manager(model))
+    assert loaded.architecture_implementation == REFERENCE_IMPLEMENTATION
+    assert "hybrid_r4_scan" not in loaded.architecture_implementation
+    assert "triton" not in loaded.architecture_implementation.lower()
+    assert all(type(loaded.model.model.layers[i].linear_attn).__name__ == module_name for i in TARGET_LAYERS)
+    assert loaded.trainable_names == names
+
+
+@pytest.mark.parametrize("arm", [
+    "gdn2-mimo-r4-braid-shared-hola-w64",
+    "gdn2-mimo-r4-braid-four-state-hola-w64",
+])
+def test_hybrid_checkpoint_element_counts_match_materialized_module(monkeypatch, arm):
+    from gdn3.kmd2_native import KMD2NativeAttn
+    from research.kmd2_ablation.qwen_checkpoint import hybrid_tensor_element_counts
+
+    key_head_dim = 4 if arm.endswith("shared-hola-w64") else 8
+    config = SimpleNamespace(
+        hidden_size=12,
+        linear_num_value_heads=2,
+        linear_num_key_heads=2,
+        linear_key_head_dim=key_head_dim,
+        linear_value_head_dim=3,
+        linear_conv_kernel_dim=3,
+        rms_norm_eps=1e-6,
+    )
+    monkeypatch.setenv("GDN3_KMD2_ROUT", "1")
+    native = KMD2NativeAttn(config, layer_idx=0)
+    if arm.endswith("shared-hola-w64"):
+        from research.kmd2_ablation.qwen_hybrid_shared import QwenSharedBraidHybrid
+        module = QwenSharedBraidHybrid.from_native(native)
+    else:
+        from research.kmd2_ablation.qwen_hybrid_four_state import QwenFourStateHybrid
+        module = QwenFourStateHybrid.from_native(native)
+    parameter_names = {name for name, _parameter in module.named_parameters()}
+    persistent_buffers = {
+        name: tensor
+        for name, tensor in module.state_dict().items()
+        if name not in parameter_names
+    }
+
+    counts = hybrid_tensor_element_counts(
+        architecture_arm_id=arm,
+        heads=2,
+        key_dim=key_head_dim,
+        value_dim=3,
+        hidden_size=12,
+        conv_kernel=3,
+    )
+
+    assert counts["parameter_elements"] == sum(
+        parameter.numel() for parameter in module.parameters()
+    )
+    assert counts["persistent_buffer_elements"] == sum(
+        tensor.numel() for tensor in persistent_buffers.values()
+    )
+
+
+def test_hybrid_checkpoint_element_counts_reject_overflow():
+    from research.kmd2_ablation.qwen_checkpoint import hybrid_tensor_element_counts
+
+    with pytest.raises(ValueError, match="exact element-count bound"):
+        hybrid_tensor_element_counts(
+            architecture_arm_id="gdn2-mimo-r4-braid-four-state-hola-w64",
+            heads=16,
+            key_dim=128,
+            value_dim=128,
+            hidden_size=1 << 62,
+            conv_kernel=4,
+        )
+
+
+@pytest.mark.parametrize("shared", [True, False])
+def test_metadata_state_history_formula_matches_materialized_cache(monkeypatch, shared):
+    from gdn3.kmd2_native import KMD2NativeAttn
+    from research.kmd2_ablation.resource_probes import _hybrid_state_history_components
+
+    key_head_dim = 4 if shared else 8
+    native_config = SimpleNamespace(
+        hidden_size=12,
+        linear_num_value_heads=2,
+        linear_num_key_heads=2,
+        linear_key_head_dim=key_head_dim,
+        linear_value_head_dim=3,
+        linear_conv_kernel_dim=3,
+        rms_norm_eps=1e-6,
+    )
+    monkeypatch.setenv("GDN3_KMD2_ROUT", "1")
+    native = KMD2NativeAttn(native_config, layer_idx=0)
+    if shared:
+        from research.kmd2_ablation.qwen_hybrid_shared import QwenSharedBraidHybrid
+        module = QwenSharedBraidHybrid.from_native(native)
+    else:
+        from research.kmd2_ablation.qwen_hybrid_four_state import QwenFourStateHybrid
+        module = QwenFourStateHybrid.from_native(native)
+    cache = module._initial_cache(torch.zeros(2, 1, 12))
+    actual = sum(
+        value.numel() * value.element_size()
+        for name, value in cache.__dict__.items()
+        if name != "hola_state"
+    )
+    experiment = SimpleNamespace(model=SimpleNamespace(
+        num_layers=1, num_heads=2, state_key_dim=key_head_dim, state_value_dim=3,
+    ))
+
+    components = _hybrid_state_history_components(
+        experiment,
+        shared=shared,
+        hidden_size=12,
+        conv_kernel=3,
+        batch_size=2,
+        convolution_element_bytes=4,
+    )
+
+    assert sum(components.values()) == actual
+    assert module.resource_report(batch_size=2)["persistent_bytes"] == actual
+
+
+def test_hybrid_conversion_preloader_negative_identity_matrix_never_calls_loader(tmp_path, monkeypatch):
+    from gdn3.kmd2_native import KMD2NativeAttn
+    from research.kmd2_ablation.architecture import registry_sha256
+    from research.kmd2_ablation.qwen_backend import (ExternalAssetIdentity,
+        NativeCheckpointError, QwenArmLoadSpec, _directory_identity, load_qwen_arm)
+    from research.kmd2_ablation.qwen_checkpoint import (QwenHybridCheckpointIdentity,
+        build_qwen_architecture_checkpoint, expected_hybrid_tensor_contract,
+        source_conversion_sha256)
+    config = SimpleNamespace(hidden_size=12, linear_num_value_heads=2,
+        linear_num_key_heads=2, linear_key_head_dim=4, linear_value_head_dim=3,
+        linear_conv_kernel_dim=3, rms_norm_eps=1e-6)
+    frozen = {"hidden_size":12,"linear_num_value_heads":2,"linear_num_key_heads":2,
+        "linear_key_head_dim":4,"linear_value_head_dim":3,"linear_conv_kernel_dim":3,
+        "rms_norm_eps":1e-6,"rms_norm_type":"RMSNorm","dtype":"torch.float32",
+        "use_cache":False,"num_hidden_layers":23,"tie_word_embeddings":False,
+        "rope_theta":10000.0,"rope_scaling":None,"max_position_embeddings":4096,
+        "partial_rotary_factor":1.0}
+    model_dir=tmp_path/"model"; model_dir.mkdir(); (model_dir/"config.json").write_text(json.dumps(frozen),encoding="utf-8")
+    size,model_hash=_directory_identity(model_dir)
+    model_asset=ExternalAssetIdentity("model",model_dir,"directory",size,model_hash)
+    data=tmp_path/"data"; teacher=tmp_path/"teacher"; data.write_bytes(b"data"); teacher.write_bytes(b"teacher")
+    class Block(torch.nn.Module):
+        def __init__(self, index): super().__init__(); self.linear_attn=KMD2NativeAttn(config,index) if index in TARGET_LAYERS else torch.nn.Linear(2,2)
+    class Source(torch.nn.Module):
+        def __init__(self): super().__init__(); self.model=torch.nn.Module(); self.model.layers=torch.nn.ModuleList([Block(i) for i in range(23)])
+    monkeypatch.setenv("GDN3_KMD2_ROUT","1"); source=Source()
+    arm="gdn2-mimo-r4-braid-shared-hola-w64"
+    targets=tuple(sorted(f"model.layers.{i}.linear_attn" for i in TARGET_LAYERS))
+    provisional=QwenHybridCheckpointIdentity(architecture_registry_sha256=registry_sha256(),
+        implementation_sha256="2"*64,model_tree_sha256=model_hash,ordered_examples_sha256=_sha256(data),
+        pre_replacement_checkpoint_sha256=source_conversion_sha256(source,targets),teacher_sha256=_sha256(teacher),
+        frozen_qwen_config=frozen,cache_policy={"policy":"exact_outer","width":64,"block_size":256},
+        trainable_manifest=({"name":"placeholder","shape":[],"dtype":"torch.float32"},),target_module_names=targets)
+    contract=expected_hybrid_tensor_contract(provisional,arm)
+    manifest=tuple(sorted(({"name":f"{target}.{name}","shape":list(shape),"dtype":dtype}
+        for target in targets for name,(shape,dtype) in contract.items()),key=lambda row:row["name"]))
+    identity=dataclasses.replace(provisional,trainable_manifest=manifest)
+    payload=build_qwen_architecture_checkpoint(source,target_module_names=targets,architecture_arm_id=arm,identity=identity)
+    checkpoint=tmp_path/"conversion.pt"; torch.save(payload,checkpoint)
+    bad_teacher=tmp_path/"bad-teacher"; bad_teacher.write_bytes(b"different teacher")
+    bad_model=tmp_path/"bad-model"; bad_model.mkdir(); (bad_model/"config.json").write_text(json.dumps(frozen),encoding="utf-8"); (bad_model/"extra").write_bytes(b"x")
+    bad_size,bad_model_hash=_directory_identity(bad_model)
+    bad_model_asset=ExternalAssetIdentity("model",bad_model,"directory",bad_size,bad_model_hash)
+    def make_spec(**changes):
+        base=QwenArmLoadSpec(arm="native",job_id="hybrid",model_asset=model_asset,
+            native_checkpoint=_asset("checkpoint",checkpoint),data_asset=_asset("data",data),cache_resume=None,
+            trainable_names=tuple(row["name"] for row in manifest),pre_replacement_checkpoint_sha256=_sha256(checkpoint),
+            architecture_arm_id=arm,architecture_registry_sha256=registry_sha256(),teacher_asset=_asset("teacher",teacher),
+            architecture_implementation_sha256="2"*64,source_checkpoint_sha256=identity.pre_replacement_checkpoint_sha256,
+            frozen_qwen_config=frozen,architecture_cache_policy={"policy":"exact_outer","width":64,"block_size":256})
+        return dataclasses.replace(base,**changes)
+    cases=[{"architecture_implementation_sha256":None},{"architecture_implementation_sha256":"9"*64},
+        {"source_checkpoint_sha256":"9"*64},{"frozen_qwen_config":{**frozen,"rope_theta":9.0}},
+        {"architecture_cache_policy":{"policy":"recency","width":64,"block_size":256}},
+        {"trainable_names":tuple(row["name"] for row in manifest[:-1])},
+        {"teacher_asset":_asset("teacher",bad_teacher)},{"model_asset":bad_model_asset}]
+    calls=[]
+    for changes in cases:
+        with pytest.raises(NativeCheckpointError):
+            load_qwen_arm(make_spec(**changes),model_config=config,cache_config=None,
+                base_model_loader=lambda *_a,**_k:calls.append(1))
+    base_payload=copy.deepcopy(payload)
+    corruptions=[]
+    duplicate=copy.deepcopy(base_payload); duplicate["identity"]["target_module_names"][1]=duplicate["identity"]["target_module_names"][0]; corruptions.append(duplicate)
+    wrong=copy.deepcopy(base_payload); first=next(iter(wrong["model_state"])); wrong["model_state"][first]=wrong["model_state"][first][:-1]
+    for row in wrong["tensor_manifest"]:
+        if row["name"]==first: row["shape"]=list(wrong["model_state"][first].shape)
+    target,suffix=first.rsplit(".",1)[0],None
+    for layer_name,layer in wrong["conversion_manifest"]["layers"].items():
+        prefix=layer_name+"."
+        if first.startswith(prefix):
+            local=first[len(prefix):]
+            for row in layer["target_tensors"]:
+                if row["name"]==local: row["shape"]=list(wrong["model_state"][first].shape)
+    corruptions.append(wrong)
+    for corrupted in corruptions:
+        torch.save(corrupted,checkpoint)
+        with pytest.raises(NativeCheckpointError):
+            load_qwen_arm(make_spec(),model_config=config,cache_config=None,
+                base_model_loader=lambda *_a,**_k:calls.append(1))
+    assert calls == []
+
+
+def test_realistic_hf_qwen35_config_normalizes_to_frozen_identity(tmp_path):
+    from research.kmd2_ablation.qwen_backend import (
+        NativeCheckpointError, _read_frozen_model_config,
+    )
+    expected = {"hidden_size":1024,"linear_num_value_heads":16,"linear_num_key_heads":16,
+        "linear_key_head_dim":128,"linear_value_head_dim":128,"linear_conv_kernel_dim":4,
+        "rms_norm_eps":1e-6,"rms_norm_type":"RMSNorm","dtype":"torch.bfloat16",
+        "use_cache":False,"num_hidden_layers":24,"tie_word_embeddings":True,
+        "rope_theta":10000000,"rope_scaling":{"mrope_interleaved":True,
+            "mrope_section":[11,11,10],"rope_type":"default"},
+        "max_position_embeddings":262144,"partial_rotary_factor":0.25}
+    text = {key:value for key,value in expected.items()
+            if key not in {"dtype","rms_norm_type","rope_theta","rope_scaling",
+                           "partial_rotary_factor"}}
+    text["dtype"]="bfloat16"; text["use_cache"]=True
+    text["model_type"]="qwen3_5_text"
+    text["rope_parameters"]={**expected["rope_scaling"],
+        "rope_theta":expected["rope_theta"],
+        "partial_rotary_factor":expected["partial_rotary_factor"]}
+    raw = {"model_type":"qwen3_5","architectures":["Qwen3_5ForConditionalGeneration"],
+           "text_config":text,"tie_word_embeddings":True}
+    model=tmp_path/"qwen"; model.mkdir(); (model/"config.json").write_text(json.dumps(raw),encoding="utf-8")
+    assert _read_frozen_model_config(model,expected) == expected
+    raw["text_config"]["dtype"]="float32"
+    (model/"config.json").write_text(json.dumps(raw),encoding="utf-8")
+    float_expected={**expected,"dtype":"torch.float32"}
+    assert _read_frozen_model_config(model,float_expected)["dtype"] == "torch.float32"
+    raw["model_type"]="llama"; raw["architectures"]=["LlamaForCausalLM"]
+    raw["text_config"]["model_type"]="llama"
+    (model/"config.json").write_text(json.dumps(raw),encoding="utf-8")
+    with pytest.raises(NativeCheckpointError,match="rms_norm_type"):
+        _read_frozen_model_config(model,float_expected)
+
+
+def test_default_loader_extracts_official_multimodal_text_model(monkeypatch, tmp_path):
+    import transformers
+    from research.kmd2_ablation.qwen_backend import _default_base_model_loader
+
+    text_config = SimpleNamespace(model_type="qwen3_5_text")
+    config = SimpleNamespace(text_config=text_config)
+    language_model = torch.nn.Linear(3, 3)
+    lm_head = torch.nn.Linear(3, 5, bias=False)
+
+    class Wrapper(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.language_model = language_model
+            self.model.visual = torch.nn.Linear(7, 7)
+            self.lm_head = lm_head
+
+    class Shell(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Linear(1, 1, device="meta")
+            self.lm_head = torch.nn.Linear(1, 1, device="meta")
+
+    monkeypatch.setattr(
+        transformers.AutoConfig, "from_pretrained", lambda *_a, **_k: config
+    )
+    monkeypatch.setattr(
+        transformers.AutoModelForMultimodalLM,
+        "from_pretrained",
+        lambda *_a, **_k: Wrapper(),
+    )
+    monkeypatch.setattr(
+        transformers.AutoModelForCausalLM,
+        "from_config",
+        lambda *_a, **_k: Shell(),
+    )
+
+    loaded = _default_base_model_loader(tmp_path, dtype=torch.bfloat16)
+    assert loaded.model is language_model
+    assert loaded.lm_head is lm_head
+    assert not any("visual" in name for name, _ in loaded.named_parameters())
+    assert not any(parameter.is_meta for parameter in loaded.parameters())
+
+
+@pytest.mark.parametrize("field,value,code", [
+    ("output_width", None, "architecture_output_width_invalid"),
+    ("output_width", "4", "architecture_output_width_invalid"),
+    ("output_width", 3, "architecture_output_width_invalid"),
+    ("r_out", None, "architecture_output_width_invalid"),
+    ("r_out", True, "architecture_output_width_invalid"),
+])
+def test_rout_4_production_verifier_requires_exact_integer_width(field, value, code):
+    from research.kmd2_ablation.qwen_backend import _verify_architecture_module
+    class Widen(torch.nn.Module):
+        output_width = 4
+        r_out = 4
+    module = Widen()
+    if value is None:
+        delattr(Widen, field)
+    else:
+        setattr(module, field, value)
+    with pytest.raises(ValueError, match=code):
+        _verify_architecture_module(module, Widen, 1, expected_output_width=4)
+
+
+def test_rout_4_production_verifier_rejects_heterogeneous_widths():
+    from research.kmd2_ablation.qwen_backend import _verify_architecture_modules
+    class Widen(torch.nn.Module):
+        def __init__(self, width):
+            super().__init__(); self.output_width = width; self.r_out = width
+    model = SimpleNamespace(model=SimpleNamespace(layers=[
+        SimpleNamespace(linear_attn=Widen(4)), SimpleNamespace(linear_attn=Widen(3))]))
+    with pytest.raises(ValueError, match="architecture_output_width_heterogeneous"):
+        _verify_architecture_modules(model, (0, 1), Widen, 1, expected_output_width=4)
+
+
+def test_rout_4_loader_rejects_bad_width_before_trainables_and_rolls_back(tmp_path, monkeypatch):
+    from research.kmd2_ablation.architecture import TARGET_LAYERS, registry_sha256
+    from research.kmd2_ablation.qwen_backend import load_qwen_arm
+    Model, Manager, Native, _checkpoint, _path, make_spec, config = (
+        _canonical_architecture_case(tmp_path, monkeypatch)
+    )
+    class BadWiden(Native):
+        output_width = 4
+        r_out = 3
+    trainables = tuple(sorted(
+        f"model.layers.{index}.linear_attn.{suffix}"
+        for index in TARGET_LAYERS for suffix in ("q_slot_scale", "out_mix")
+    ))
+    spec = dataclasses.replace(
+        make_spec(), architecture_arm_id="rout-4",
+        architecture_registry_sha256=registry_sha256(), trainable_names=trainables,
+    )
+    captured = []
+    def load_model(*_args, **_kwargs):
+        model = Model(); captured.append(model); return model
+    def factory(clone, _config):
+        clone.__class__ = BadWiden
+        clone.q_slot_scale = torch.nn.Parameter(torch.zeros(1))
+        clone.out_mix = torch.nn.Parameter(torch.zeros(1))
+        return clone
+    events = []
+    with pytest.raises(Exception, match="architecture_output_width_invalid"):
+        load_qwen_arm(
+            spec, model_config=config, cache_config=None,
+            base_model_loader=load_model,
+            manager_factory=lambda model, _c: Manager(model),
+            architecture_factory=factory, architecture_expected_type=BadWiden,
+            event=events.append,
+        )
+    assert "configure_trainables" not in events
+    assert all(type(captured[0].model.layers[index].linear_attn) is Native
+               for index in TARGET_LAYERS)
+
+
+def test_rout_4_production_loader_accepts_real_converted_modules(tmp_path, monkeypatch):
+    from research.kmd2_ablation.architecture import TARGET_LAYERS, registry_sha256
+    from research.kmd2_ablation.qwen_architecture import KMD2SharedQueryWideningAttn
+    from research.kmd2_ablation.qwen_backend import load_qwen_arm
+    Model, Manager, _Native, _checkpoint, _path, make_spec, config = (
+        _canonical_architecture_case(tmp_path, monkeypatch)
+    )
+    trainables = tuple(sorted(
+        f"model.layers.{index}.linear_attn.{suffix}"
+        for index in TARGET_LAYERS for suffix in ("q_slot_scale", "out_mix")
+    ))
+    spec = dataclasses.replace(
+        make_spec(), architecture_arm_id="rout-4",
+        architecture_registry_sha256=registry_sha256(), trainable_names=trainables,
+    )
+    loaded = load_qwen_arm(
+        spec, model_config=config, cache_config=None,
+        base_model_loader=lambda *_a, **_k: Model(),
+        manager_factory=lambda model, _c: Manager(model),
+    )
+    assert loaded.trainable_names == trainables
+    assert all(type(loaded.model.model.layers[index].linear_attn)
+               is KMD2SharedQueryWideningAttn
+               and loaded.model.model.layers[index].linear_attn.output_width == 4
+               and loaded.model.model.layers[index].linear_attn.r_out == 4
+               for index in TARGET_LAYERS)
+
+
+@pytest.mark.parametrize(("arm_id", "rank"), [("mimo-r2", 2), ("mimo-r4", 4)])
+def test_true_mimo_dispatch_contract_has_exact_rankwise_trainables(arm_id, rank):
+    from research.kmd2_ablation.architecture import TARGET_LAYERS, registry_sha256
+    from research.kmd2_ablation.qwen_training import _architecture_dispatch_contract
+
+    job = {
+        "arm_id": arm_id,
+        "architecture_registry_sha256": registry_sha256(),
+    }
+    config = {
+        "architecture": {
+            "arm_id": arm_id,
+            "registry_sha256": registry_sha256(),
+            "mimo_rank": rank,
+        }
+    }
+
+    contract = _architecture_dispatch_contract(job, config)
+
+    assert contract.arm == "native"
+    assert contract.architecture_arm_id == arm_id
+    assert contract.registry_sha256 == registry_sha256()
+    assert contract.mimo_rank == rank
+    assert contract.trainable_names == tuple(sorted(
+        f"model.layers.{index}.linear_attn.{suffix}"
+        for index in TARGET_LAYERS
+        for suffix in (
+            "mimo_q_transform", "mimo_k_transform", "mimo_v", "mimo_z", "mimo_out"
+        )
+    ))
+    assert len(contract.trainable_names) == 90
+    assert not any(
+        forbidden in name
+        for name in contract.trainable_names
+        for forbidden in ("erase_proj", "write_proj", "write_offset", "cache", "q_slot")
+    )
+
+
+@pytest.mark.parametrize("case", ["arm", "missing_hash", "hash", "rank", "combination"])
+def test_true_mimo_dispatch_contract_rejects_invalid_identity_preconstruction(case):
+    from research.kmd2_ablation.architecture import registry_sha256
+    from research.kmd2_ablation.qwen_training import (
+        QwenRuntimeConfigurationError,
+        _architecture_dispatch_contract,
+    )
+
+    job = {"arm_id": "mimo-r2", "architecture_registry_sha256": registry_sha256()}
+    architecture = {
+        "arm_id": "mimo-r2", "registry_sha256": registry_sha256(), "mimo_rank": 2
+    }
+    if case == "arm":
+        architecture["arm_id"] = "mimo-r4"
+    elif case == "missing_hash":
+        job.pop("architecture_registry_sha256")
+    elif case == "hash":
+        architecture["registry_sha256"] = "0" * 64
+    elif case == "rank":
+        architecture["mimo_rank"] = 4
+    else:
+        architecture["output_width"] = 4
+
+    with pytest.raises(QwenRuntimeConfigurationError):
+        _architecture_dispatch_contract(job, {"architecture": architecture})
+
+
+@pytest.mark.parametrize("job_arm", ["native", "gdn2-channel-r1", "recency"])
+def test_execute_rejects_mimo_config_arm_mismatch_before_any_dependency(job_arm):
+    from research.kmd2_ablation.architecture import registry_sha256
+    from research.kmd2_ablation.qwen_training import (
+        QwenRuntimeConfigurationError, execute_job,
+    )
+
+    job = _qwen_adapter_job("a" * 64, "b" * 64)
+    job["arm_id"] = job_arm
+    job["architecture_registry_sha256"] = registry_sha256()
+    job["canonical_config"]["architecture"] = {
+        "arm_id": "mimo-r2", "registry_sha256": registry_sha256(), "mimo_rank": 2,
+    }
+    calls = {"load_data": 0, "load_arm": 0}
+    def touched(name):
+        def fail(**_kwargs):
+            calls[name] += 1
+            raise AssertionError(f"{name} must not run")
+        return fail
+
+    with pytest.raises(QwenRuntimeConfigurationError, match="architecture_arm_mismatch"):
+        execute_job(
+            job, runtime={},
+            dependencies={"load_data": touched("load_data"), "load_arm": touched("load_arm")},
+        )
+    assert calls == {"load_data": 0, "load_arm": 0}
+
+
+@pytest.mark.parametrize(("arm_id", "rank"), [("mimo-r2", 2), ("mimo-r4", 4)])
+def test_production_loader_overlays_native_r1_then_builds_rank_specific_true_mimo(
+    tmp_path, monkeypatch, arm_id, rank
+):
+    from research.kmd2_ablation.architecture import TARGET_LAYERS, registry_sha256
+    from research.kmd2_ablation.qwen_architecture import KMD2TrueMIMOAttn
+    from research.kmd2_ablation.qwen_backend import load_qwen_arm
+
+    Model, Manager, _Native, _checkpoint, _path, make_spec, config = (
+        _canonical_architecture_case(tmp_path, monkeypatch)
+    )
+    trainables = tuple(sorted(
+        f"model.layers.{index}.linear_attn.{suffix}"
+        for index in TARGET_LAYERS
+        for suffix in (
+            "mimo_q_transform", "mimo_k_transform", "mimo_v", "mimo_z", "mimo_out"
+        )
+    ))
+    spec = dataclasses.replace(
+        make_spec(), architecture_arm_id=arm_id,
+        architecture_registry_sha256=registry_sha256(), trainable_names=trainables,
+    )
+    events = []
+
+    loaded = load_qwen_arm(
+        spec, model_config=config, cache_config=None,
+        base_model_loader=lambda *_a, **_k: Model(),
+        manager_factory=lambda model, _c: Manager(model), event=events.append,
+    )
+
+    assert loaded.arm == "native"
+    assert loaded.architecture_arm_id == arm_id
+    assert loaded.architecture_registry_sha256 == registry_sha256()
+    assert loaded.architecture_classification == "cold_redesign"
+    assert loaded.architecture_identity_passed is False
+    assert loaded.architecture_implementation == "qwen_architecture.KMD2TrueMIMOAttn.reference_fp32"
+    assert loaded.architecture_tensor_manifest["mimo_rank"] == rank
+    assert loaded.architecture_tensor_manifest["layer_count"] == 18
+    assert len(loaded.architecture_tensor_manifest["new"]) == 18 * 5
+    assert loaded.trainable_names == trainables
+    assert len(loaded.trainable_names) == 90
+    assert all(
+        type(loaded.model.model.layers[index].linear_attn) is KMD2TrueMIMOAttn
+        and loaded.model.model.layers[index].linear_attn.rank == rank
+        for index in TARGET_LAYERS
+    )
+    assert events[:3] == ["validate_assets", "load_model", "native_install_r1"]
+    assert "checkpoint_overlay_complete" in events
+
+
+@pytest.mark.parametrize(("case", "code"), [
+    ("missing", "native_checkpoint_tensor_missing"),
+    ("unexpected", "native_checkpoint_tensor_unexpected"),
+    ("wrong_layer", "native_checkpoint_target_invalid"),
+    ("shape", "native_checkpoint_shape_mismatch"),
+    ("dtype", "native_checkpoint_dtype_mismatch"),
+])
+def test_architecture_checkpoint_rejects_each_typed_contract_error_before_prepare(tmp_path, monkeypatch, case, code):
+    from research.kmd2_ablation.qwen_backend import NativeCheckpointError, load_qwen_arm
+    Model, Manager, Native, checkpoint, path, spec, config = _canonical_architecture_case(tmp_path, monkeypatch)
+    key = f"model.layers.0.linear_attn.{_R1_SUFFIXES[0]}"
+    if case == "missing": checkpoint.pop(key)
+    elif case == "unexpected": checkpoint[key.replace(_R1_SUFFIXES[0], "q_slot_scale")] = torch.zeros(1)
+    elif case == "wrong_layer": checkpoint[key.replace("layers.0", "layers.3")] = checkpoint.pop(key)
+    elif case == "shape": checkpoint[key] = checkpoint[key][:-1]
+    else: checkpoint[key] = checkpoint[key].double()
+    torch.save(checkpoint, path)
+    prepared = []
+    with pytest.raises(NativeCheckpointError) as error:
+        load_qwen_arm(spec(), model_config=config, cache_config=None, base_model_loader=lambda *_a, **_k: Model(), manager_factory=lambda model, _c: Manager(model), architecture_factory=lambda *_: prepared.append(1), architecture_expected_type=torch.nn.Module)
+    assert error.value.code == code
+    assert prepared == []
+
+
+def test_qwen_load_spec_architecture_identity_is_atomic_and_canonical(tmp_path: Path):
+    from research.kmd2_ablation.architecture import registry_sha256
+    from research.kmd2_ablation.qwen_backend import QwenArmLoadSpec
+
+    files = [tmp_path / name for name in ("model", "checkpoint", "data")]
+    for path in files:
+        path.write_bytes(b"x")
+    common = dict(
+        arm="native", job_id="job", model_asset=_asset("model", files[0]),
+        native_checkpoint=_asset("native_checkpoint", files[1]),
+        data_asset=_asset("data", files[2]), cache_resume=None,
+        trainable_names=("x",), pre_replacement_checkpoint_sha256=_sha256(files[1]),
+    )
+    with pytest.raises(ValueError, match="architecture_identity_incomplete"):
+        QwenArmLoadSpec(**common, architecture_arm_id="gdn2-channel-r1")
+    spec = QwenArmLoadSpec(
+        **common, architecture_arm_id="gdn2-channel-r1",
+        architecture_registry_sha256=registry_sha256(),
+    )
+    assert spec.architecture_arm_id == "gdn2-channel-r1"
+
+
+@pytest.mark.parametrize("arm", ["rot-off", "rot-constant", "rot-noncumulative", "rot-fixed-rope", "rot-moving-frame-oracle"])
+def test_qwen_load_spec_accepts_exact_rotation_identity_and_explicit_diagnostic_flag(tmp_path: Path, arm: str):
+    from research.kmd2_ablation.architecture import registry_sha256
+    from research.kmd2_ablation.qwen_backend import QwenArmLoadSpec
+    files = [tmp_path / name for name in ("model", "checkpoint", "data")]
+    for path in files: path.write_bytes(b"x")
+    spec = QwenArmLoadSpec(
+        arm="native", job_id="job", model_asset=_asset("model", files[0]),
+        native_checkpoint=_asset("native_checkpoint", files[1]), data_asset=_asset("data", files[2]),
+        cache_resume=None, trainable_names=(), pre_replacement_checkpoint_sha256=_sha256(files[1]),
+        architecture_arm_id=arm, architecture_registry_sha256=registry_sha256(),
+        diagnostic_training=arm == "rot-moving-frame-oracle",
+    )
+    assert spec.architecture_arm_id == arm
+    assert spec.diagnostic_training is (arm == "rot-moving-frame-oracle")
+
+
+def test_qwen_load_spec_rejects_diagnostic_flag_for_nonmoving_and_legacy_non_native(tmp_path: Path):
+    from research.kmd2_ablation.architecture import registry_sha256
+    from research.kmd2_ablation.qwen_backend import QwenArmLoadSpec
+    files = [tmp_path / name for name in ("model", "checkpoint", "data")]
+    for path in files: path.write_bytes(b"x")
+    common = dict(job_id="job", model_asset=_asset("model", files[0]),
+        native_checkpoint=_asset("native_checkpoint", files[1]), data_asset=_asset("data", files[2]),
+        cache_resume=None, trainable_names=(), pre_replacement_checkpoint_sha256=_sha256(files[1]),
+        architecture_arm_id="rot-off", architecture_registry_sha256=registry_sha256())
+    with pytest.raises(ValueError, match="diagnostic_training"):
+        QwenArmLoadSpec(arm="native", diagnostic_training=True, **common)
+    with pytest.raises(ValueError, match="legacy_architecture_arm_mismatch"):
+        QwenArmLoadSpec(arm="recency", diagnostic_training=False, **common)
+
+
+def test_architecture_tensor_manifest_aggregates_and_qualifies_all_18_layers():
+    from research.kmd2_ablation.qwen_backend import _aggregate_architecture_tensor_manifest
+    manifest = {
+        "copied": ("in_proj_qkv.weight",),
+        "transformed": (("in_proj_b.weight", "erase_proj.weight", "row_copy_dk"),),
+        "new": ("write_offset",),
+    }
+    model = SimpleNamespace(model=SimpleNamespace(layers=[]))
+    for _ in range(23):
+        module = SimpleNamespace(transformation_manifest=lambda manifest=manifest: manifest)
+        model.model.layers.append(SimpleNamespace(linear_attn=module))
+    aggregated = _aggregate_architecture_tensor_manifest(model, TARGET_LAYERS)
+    assert len(aggregated["copied"]) == 18
+    assert len(aggregated["transformed"]) == 18
+    assert len(aggregated["new"]) == 18
+    assert aggregated["copied"][0].startswith("model.layers.0.linear_attn.")
+    assert aggregated["copied"][-1].startswith("model.layers.22.linear_attn.")
+
+
+@pytest.mark.parametrize("case", ["missing", "heterogeneous"])
+def test_architecture_tensor_manifest_rejects_missing_or_heterogeneous_layers(case):
+    from research.kmd2_ablation.qwen_backend import _aggregate_architecture_tensor_manifest
+    base = {"copied": ("x",), "transformed": (("a", "b", "copy"),), "new": ()}
+    model = SimpleNamespace(model=SimpleNamespace(layers=[]))
+    for index in range(23):
+        if case == "missing" and index == TARGET_LAYERS[-1]:
+            module = SimpleNamespace()
+        else:
+            value = base if not (case == "heterogeneous" and index == TARGET_LAYERS[-1]) else {**base, "copied": ("y",)}
+            module = SimpleNamespace(transformation_manifest=lambda value=value: value)
+        model.model.layers.append(SimpleNamespace(linear_attn=module))
+    with pytest.raises(ValueError, match="architecture_tensor_manifest"):
+        _aggregate_architecture_tensor_manifest(model, TARGET_LAYERS)
 
 
 def test_qwen_backend_import_never_imports_transformers(
@@ -843,6 +1568,84 @@ def test_qwen_heal_layerwise_matches_canonical_normalized_residual_fixture() -> 
     )
 
 
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()),
+    reason="CUDA BF16 is unavailable",
+)
+def test_qwen_heal_layerwise_cuda_bf16_rematerialization_matches_reference() -> None:
+    from research.kmd2_ablation.qwen_training import layerwise_alignment_loss
+
+    student_device = torch.device("cuda:0")
+    teacher_device = (
+        torch.device("cuda:1")
+        if torch.cuda.device_count() > 1
+        else student_device
+    )
+    generator = torch.Generator(device=student_device).manual_seed(73021)
+    student_values = [
+        torch.randn(
+            1,
+            1025,
+            1024,
+            device=student_device,
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        for _ in range(2)
+    ]
+    teacher_values = [
+        torch.randn(
+            value.shape,
+            device=student_device,
+            dtype=torch.bfloat16,
+            generator=generator,
+        ).to(teacher_device)
+        for value in student_values
+    ]
+
+    actual_students = [value.clone().requires_grad_(True) for value in student_values]
+    saved: list[torch.Tensor] = []
+
+    def pack(tensor: torch.Tensor) -> torch.Tensor:
+        saved.append(tensor)
+        return tensor
+
+    with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
+        actual = layerwise_alignment_loss(
+            (student_values[0], *actual_students),
+            (teacher_values[0], *teacher_values),
+        )
+    actual.backward()
+
+    reference_students = [
+        value.clone().requires_grad_(True) for value in student_values
+    ]
+    expected_layers = []
+    for student, teacher in zip(reference_students, teacher_values, strict=True):
+        teacher_float = teacher.to(student_device, dtype=torch.float32)
+        expected_layers.append(
+            (student.float() - teacher_float).square().mean()
+            / teacher_float.square().mean().clamp_min(1.0e-8)
+        )
+    expected = torch.stack(expected_layers).mean()
+    expected.backward()
+
+    torch.testing.assert_close(actual, expected, rtol=0.0, atol=3.0e-7)
+    for actual_student, reference_student in zip(
+        actual_students, reference_students, strict=True
+    ):
+        torch.testing.assert_close(
+            actual_student.grad,
+            reference_student.grad,
+            rtol=0.0,
+            atol=3.0e-8,
+        )
+    assert all(
+        tensor.dtype == torch.bfloat16 or tensor.numel() == 1
+        for tensor in saved
+    )
+
+
 class _HealModel(torch.nn.Module):
     def __init__(self, *, nan_output: bool = False) -> None:
         super().__init__()
@@ -983,11 +1786,71 @@ def test_qwen_heal_optimizer_groups_are_exact_named_and_zero_decay_cache() -> No
     assert optimizer.param_groups[0]["weight_decay"] == 0.1
     assert optimizer.param_groups[1]["weight_decay"] == 0.0
     assert optimizer.param_groups[1]["lr"] == 2.0e-3
+    assert optimizer.defaults["fused"] is None
     with torch.no_grad():
         model.cache_amplitude.fill_(1.7)
     projected = project_cache_amplitudes_(model)
     assert projected == ("cache_amplitude",)
     assert model.cache_amplitude.item() == 1.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_qwen_heal_optimizer_uses_fused_adamw_for_cuda_parameters() -> None:
+    from research.kmd2_ablation.qwen_training import build_qwen_heal_optimizer
+
+    model = _HealModel().to("cuda")
+    optimizer = build_qwen_heal_optimizer(
+        model,
+        memory_parameter_names=("memory_weight",),
+        cache_parameter_names=("cache_amplitude",),
+        learning_rate=2.0e-5,
+        lr_cache=2.0e-3,
+        betas=(0.9, 0.95),
+        eps=1.0e-8,
+        weight_decay=0.1,
+    )
+    assert optimizer.defaults["fused"] is True
+    assert all(group["fused"] is True for group in optimizer.param_groups)
+    assert optimizer._gdnx_cpu_state_offload is False
+    sum(parameter.square().sum() for parameter in model.parameters()).backward()
+    optimizer.step()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_large_adam_state_phase_offload_preserves_exact_updates() -> None:
+    from research.kmd2_ablation.qwen_training import (
+        _move_optimizer_state_,
+        _optimizer_state_is_offloaded,
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(718)
+    resident_parameter = torch.nn.Parameter(
+        torch.randn(257, device="cuda", dtype=torch.bfloat16, generator=generator)
+    )
+    offloaded_parameter = torch.nn.Parameter(resident_parameter.detach().clone())
+    resident = torch.optim.AdamW(
+        (resident_parameter,), lr=1.0e-3, betas=(0.9, 0.95), fused=True
+    )
+    offloaded = torch.optim.AdamW(
+        (offloaded_parameter,), lr=1.0e-3, betas=(0.9, 0.95), fused=True
+    )
+    offloaded._gdnx_cpu_state_offload = True
+
+    for _ in range(3):
+        gradient = torch.randn(
+            resident_parameter.shape,
+            device="cuda",
+            dtype=torch.bfloat16,
+            generator=generator,
+        )
+        resident_parameter.grad = gradient.clone()
+        offloaded_parameter.grad = gradient.clone()
+        resident.step()
+        _move_optimizer_state_(offloaded, to_parameter_devices=True)
+        offloaded.step()
+        _move_optimizer_state_(offloaded, to_parameter_devices=False)
+        assert _optimizer_state_is_offloaded(offloaded)
+        assert torch.equal(resident_parameter, offloaded_parameter)
 
 
 def test_qwen_heal_one_update_accumulates_fixed_windows_projects_and_logs() -> None:
@@ -1119,6 +1982,51 @@ def test_qwen_heal_routes_teacher_inputs_to_the_explicit_teacher_device() -> Non
     assert teacher.input_devices == [torch.device("cpu"), torch.device("cpu")]
 
 
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="two CUDA devices are required")
+def test_qwen_heal_queues_cross_device_teacher_before_student() -> None:
+    from research.kmd2_ablation.qwen_training import QwenHealTrainer
+
+    calls: list[tuple[str, torch.device]] = []
+
+    class RecordingStudent(_HealModel):
+        def forward(self, input_ids: torch.Tensor, **kwargs: object) -> SimpleNamespace:
+            calls.append(("student", input_ids.device))
+            return super().forward(input_ids, **kwargs)
+
+    class RecordingTeacher(_HealTeacher):
+        def forward(self, input_ids: torch.Tensor, **kwargs: object) -> SimpleNamespace:
+            calls.append(("teacher", input_ids.device))
+            return super().forward(input_ids, **kwargs)
+
+    model = RecordingStudent().to("cuda:0")
+    teacher = RecordingTeacher().to("cuda:1")
+    optimizer, scheduler = _optimizer_and_scheduler(model)
+    trainer = QwenHealTrainer(
+        model=model,
+        teacher=teacher,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        config=_training_config(accumulation_steps=1, max_tokens=3),
+        job_id="cross-device-teacher",
+        pairing_id="f" * 64,
+        arm="surprise",
+        expected_example_windows=(("e0",),),
+        teacher_device=torch.device("cuda:1"),
+    )
+    batch = _batch("e0", (0, 1, 2))
+    batch = {
+        name: value.to("cuda:0") if isinstance(value, torch.Tensor) else value
+        for name, value in batch.items()
+    }
+
+    trainer.train_update((batch,))
+
+    assert calls == [
+        ("teacher", torch.device("cuda:1")),
+        ("student", torch.device("cuda:0")),
+    ]
+
+
 def test_qwen_heal_rejects_mismatched_window_before_forward_or_mutation() -> None:
     from research.kmd2_ablation.qwen_training import QwenHealTrainer, QwenTrainingError
 
@@ -1178,12 +2086,21 @@ def test_qwen_heal_nonfinite_loss_is_a_skipped_failure_without_optimizer_step() 
     ("interruption_type", "interruption_value"),
     [(KeyboardInterrupt, "scheduler interrupted"), (SystemExit, 37)],
 )
+@pytest.mark.parametrize("device", [
+    "cpu",
+    pytest.param(
+        "cuda",
+        marks=pytest.mark.skipif(
+            not torch.cuda.is_available(), reason="CUDA is unavailable"
+        ),
+    ),
+])
 def test_qwen_heal_base_exception_after_optimizer_step_rolls_back_exactly(
-    interruption_type: type[BaseException], interruption_value: object
+    interruption_type: type[BaseException], interruption_value: object, device: str,
 ) -> None:
     from research.kmd2_ablation.qwen_training import QwenHealTrainer
 
-    model = _HealModel()
+    model = _HealModel().to(device)
     optimizer, _ = _optimizer_and_scheduler(model)
     interruption = interruption_type(interruption_value)
 
@@ -1225,8 +2142,13 @@ def test_qwen_heal_base_exception_after_optimizer_step_rolls_back_exactly(
     optimizer_snapshot = copy.deepcopy(optimizer.state_dict())
     scheduler_snapshot = copy.deepcopy(scheduler.state_dict())
 
+    batch = _batch("e0", (0, 1, 2))
+    batch = {
+        name: value.to(device) if isinstance(value, torch.Tensor) else value
+        for name, value in batch.items()
+    }
     with pytest.raises(interruption_type) as caught:
-        trainer.train_update((_batch("e0", (0, 1, 2)),))
+        trainer.train_update((batch,))
 
     assert caught.value is interruption
     _assert_nested_equal(model.state_dict(), parameter_snapshot)
@@ -1306,11 +2228,133 @@ class _CheckpointModel(torch.nn.Module):
             parameter.requires_grad_(False)
 
 
-def _checkpoint_parts():
+def test_hybrid_save_load_resume_preserves_cache_history(tmp_path, monkeypatch):
+    from gdn3.kmd2_native import KMD2NativeAttn
+    from research.kmd2_ablation.qwen_hybrid_shared import QwenSharedBraidHybrid
+    from research.kmd2_ablation.qwen_checkpoint import (
+        load_hybrid_resume_checkpoint, save_hybrid_resume_checkpoint,
+    )
+    config = SimpleNamespace(hidden_size=12, linear_num_value_heads=2,
+        linear_num_key_heads=2, linear_key_head_dim=4, linear_value_head_dim=3,
+        linear_conv_kernel_dim=3, rms_norm_eps=1e-6)
+    monkeypatch.setenv("GDN3_KMD2_ROUT", "1")
+    module = QwenSharedBraidHybrid.from_native(KMD2NativeAttn(config, layer_idx=0))
+    hidden = torch.randn(1, 3, 12)
+    _, cache = module.scan(hidden)
+    optimizer = torch.optim.AdamW(module.parameters(), lr=1e-3)
+    identity = {"architecture": "gdn2-mimo-r4-braid-shared-hola-w64", "hash": "a" * 64}
+    path = save_hybrid_resume_checkpoint(tmp_path / "hybrid.pt", module=module,
+        cache=cache, optimizer=optimizer, identity=identity)
+    with torch.no_grad():
+        next(module.parameters()).add_(1)
+    restored = load_hybrid_resume_checkpoint(path, module=module, optimizer=optimizer,
+        identity=identity)
+    for name in ("state", "phase", "previous_value", "previous_write", "conv_tail", "has_history"):
+        torch.testing.assert_close(getattr(restored, name), getattr(cache, name))
+    for name in ("epochs", "block_epochs", "block_count", "next_position", "current_epoch",
+                 "admission_count", "age_sum", "age_count"):
+        torch.testing.assert_close(getattr(restored.hola_state, name), getattr(cache.hola_state, name))
+    assert module.last_recurrent_cache is restored
+
+
+def test_hybrid_resume_rejects_malformed_hola_before_assignment(tmp_path, monkeypatch):
+    from gdn3.kmd2_native import KMD2NativeAttn
+    from research.kmd2_ablation.qwen_hybrid_shared import QwenSharedBraidHybrid
+    from research.kmd2_ablation.qwen_checkpoint import (
+        QwenCheckpointError, load_hybrid_resume_checkpoint, save_hybrid_resume_checkpoint,
+    )
+    config = SimpleNamespace(hidden_size=12, linear_num_value_heads=2,
+        linear_num_key_heads=2, linear_key_head_dim=4, linear_value_head_dim=3,
+        linear_conv_kernel_dim=3, rms_norm_eps=1e-6)
+    monkeypatch.setenv("GDN3_KMD2_ROUT", "1")
+    module = QwenSharedBraidHybrid.from_native(KMD2NativeAttn(config, layer_idx=0))
+    _, cache = module.scan(torch.randn(1, 2, 12))
+    optimizer = torch.optim.AdamW(module.parameters(), lr=1e-3)
+    identity = {"architecture": "shared", "hash": "a" * 64}
+    path = save_hybrid_resume_checkpoint(tmp_path / "bad.pt", module=module,
+        cache=cache, optimizer=optimizer, identity=identity)
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    payload["cache_state"]["hola_state"]["block_count"].fill_(257)
+    torch.save(payload, path)
+    sentinel = object(); module.last_recurrent_cache = sentinel
+    before = {name: value.clone() for name, value in module.state_dict().items()}
+    with pytest.raises(QwenCheckpointError, match="cache_state_invalid"):
+        load_hybrid_resume_checkpoint(path, module=module, optimizer=optimizer,
+            identity=identity)
+    assert module.last_recurrent_cache is sentinel
+    for name, value in module.state_dict().items(): torch.testing.assert_close(value, before[name])
+
+
+@pytest.mark.parametrize("corruption", ["class", "group", "state"])
+def test_hybrid_resume_rejects_optimizer_identity_matrix(tmp_path, monkeypatch, corruption):
+    from gdn3.kmd2_native import KMD2NativeAttn
+    from research.kmd2_ablation.qwen_hybrid_shared import QwenSharedBraidHybrid
+    from research.kmd2_ablation.qwen_checkpoint import (
+        QwenCheckpointError, load_hybrid_resume_checkpoint, save_hybrid_resume_checkpoint,
+    )
+    config = SimpleNamespace(hidden_size=12, linear_num_value_heads=2,
+        linear_num_key_heads=2, linear_key_head_dim=4, linear_value_head_dim=3,
+        linear_conv_kernel_dim=3, rms_norm_eps=1e-6)
+    monkeypatch.setenv("GDN3_KMD2_ROUT", "1")
+    module = QwenSharedBraidHybrid.from_native(KMD2NativeAttn(config, layer_idx=0))
+    _, cache = module.scan(torch.randn(1, 2, 12))
+    optimizer = torch.optim.AdamW(module.parameters(), lr=1e-3)
+    identity = {"architecture": "shared", "hash": "a" * 64}
+    path = save_hybrid_resume_checkpoint(tmp_path / f"optimizer-{corruption}.pt",
+        module=module, cache=cache, optimizer=optimizer, identity=identity)
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    if corruption == "class": payload["optimizer_identity"]["class"] = "torch.optim.SGD"
+    elif corruption == "group": payload["optimizer_identity"]["param_groups"][0]["hyperparameters"]["lr"] = 9.0
+    else: payload["optimizer_identity"]["state_manifest"] = [{"parameter_id": 0, "slots": []}]
+    torch.save(payload, path)
+    with pytest.raises(QwenCheckpointError, match="optimizer_(parameter_mismatch|state_invalid)"):
+        load_hybrid_resume_checkpoint(path, module=module, optimizer=optimizer, identity=identity)
+
+
+@pytest.mark.parametrize("corruption", ["model_nan", "slot_nan", "slot_shape", "state_group_lr"])
+def test_hybrid_resume_rejects_nonfinite_or_wrong_slots_before_mutation_and_remains_trainable(tmp_path, monkeypatch, corruption):
+    from gdn3.kmd2_native import KMD2NativeAttn
+    from research.kmd2_ablation.qwen_hybrid_shared import QwenSharedBraidHybrid
+    from research.kmd2_ablation.qwen_checkpoint import (
+        QwenCheckpointError, load_hybrid_resume_checkpoint, save_hybrid_resume_checkpoint,
+    )
+    config = SimpleNamespace(hidden_size=12, linear_num_value_heads=2,
+        linear_num_key_heads=2, linear_key_head_dim=4, linear_value_head_dim=3,
+        linear_conv_kernel_dim=3, rms_norm_eps=1e-6)
+    monkeypatch.setenv("GDN3_KMD2_ROUT", "1")
+    module = QwenSharedBraidHybrid.from_native(KMD2NativeAttn(config, layer_idx=0))
+    _, cache = module.scan(torch.randn(1, 2, 12)); optimizer = torch.optim.AdamW(module.parameters(), lr=1e-3)
+    sum(parameter.float().sum() for parameter in module.parameters()).backward(); optimizer.step(); optimizer.zero_grad()
+    identity={"architecture":"shared","hash":"a"*64}; path=save_hybrid_resume_checkpoint(
+        tmp_path/f"deep-{corruption}.pt",module=module,cache=cache,optimizer=optimizer,identity=identity)
+    payload=torch.load(path,map_location="cpu",weights_only=True)
+    if corruption == "model_nan":
+        first=next(iter(payload["model_state"])); payload["model_state"][first].view(-1)[0]=float("nan")
+    elif corruption == "state_group_lr":
+        payload["optimizer_state"]["param_groups"][0]["lr"] = 9.0
+    else:
+        parameter_id=next(iter(payload["optimizer_state"]["state"])); slot=payload["optimizer_state"]["state"][parameter_id]
+        if corruption == "slot_nan": slot["exp_avg"].view(-1)[0]=float("inf")
+        else:
+            slot["exp_avg"]=slot["exp_avg"].reshape(-1)[:1]
+            for row in payload["optimizer_identity"]["state_manifest"]:
+                if row["parameter_id"]==parameter_id:
+                    for field in row["slots"]:
+                        if field["name"]=="exp_avg": field["shape"]=list(slot["exp_avg"].shape)
+    torch.save(payload,path)
+    model_before={name:value.clone() for name,value in module.state_dict().items()}; optimizer_before=copy.deepcopy(optimizer.state_dict())
+    with pytest.raises(QwenCheckpointError):
+        load_hybrid_resume_checkpoint(path,module=module,optimizer=optimizer,identity=identity)
+    for name,value in module.state_dict().items(): torch.testing.assert_close(value,model_before[name])
+    assert optimizer.state_dict()["param_groups"] == optimizer_before["param_groups"]
+    sum(parameter.float().sum() for parameter in module.parameters()).backward(); optimizer.step()
+
+
+def _checkpoint_parts(device: torch.device | str | None = None):
     from research.kmd2_ablation.qwen_checkpoint import QwenCheckpointMetadata
     from research.kmd2_ablation.qwen_training import build_qwen_heal_optimizer
 
-    model = _CheckpointModel()
+    model = _CheckpointModel().to(device=device) if device is not None else _CheckpointModel()
     optimizer = build_qwen_heal_optimizer(
         model,
         memory_parameter_names=("layer0.memory", "layer1.memory"),
@@ -1341,8 +2385,38 @@ def _checkpoint_parts():
         data_identity={"sha256": "3" * 64, "row_count": 3},
         example_ids=("e0", "e1", "e2"),
         promotion_config={"width": 64, "policy": "exact_outer", "min_gate_mean": 0.005},
+        architecture_arm_id="exact-cache-surprise-r1",
+        architecture_registry_sha256=__import__(
+            "research.kmd2_ablation.architecture", fromlist=["registry_sha256"]
+        ).registry_sha256(),
     )
     return model, optimizer, scheduler, metadata
+
+
+def test_qwen_checkpoint_schema_three_requires_architecture_identity() -> None:
+    from research.kmd2_ablation.architecture import registry_sha256
+    from research.kmd2_ablation.qwen_checkpoint import (
+        QWEN_CHECKPOINT_SCHEMA_VERSION,
+        QwenCheckpointMetadata,
+        QwenResumeExpectation,
+    )
+
+    assert QWEN_CHECKPOINT_SCHEMA_VERSION == 3
+    with pytest.raises(TypeError):
+        QwenCheckpointMetadata(
+            job_id="job", pairing_id="d" * 64, arm="native", step=0, tokens_seen=0,
+            source_hashes={"source": "1" * 64}, data_identity={"sha256": "2" * 64},
+            example_ids=("e0",), promotion_config={"policy": "none"},
+        )
+    metadata = QwenCheckpointMetadata(
+        job_id="job", pairing_id="d" * 64, arm="native", step=0, tokens_seen=0,
+        source_hashes={"source": "1" * 64}, data_identity={"sha256": "2" * 64},
+        example_ids=("e0",), promotion_config={"policy": "none"},
+        architecture_arm_id="kmd2-r1", architecture_registry_sha256=registry_sha256(),
+    )
+    expectation = QwenResumeExpectation.from_metadata(metadata)
+    assert expectation.architecture_arm_id == "kmd2-r1"
+    assert expectation.architecture_registry_sha256 == registry_sha256()
 
 
 def _assert_nested_equal(actual: object, expected: object) -> None:
@@ -1391,10 +2465,11 @@ def test_qwen_checkpoint_is_atomic_complete_and_records_exact_manifests(
         "optimizer_parameter_names",
         "optimizer_state",
         "scheduler_state",
+        "grad_scaler_state",
         "rng_state",
         "amplitude_range",
     }
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 3
     assert payload["target_module_names"] == ["layer0", "layer1"]
     assert tuple(payload["model_state"]) == (
         "layer0.cache_amplitude",
@@ -1424,7 +2499,78 @@ def test_qwen_checkpoint_is_atomic_complete_and_records_exact_manifests(
     assert payload["amplitude_range"][0] >= 0.0
     assert payload["amplitude_range"][1] <= 1.0
     assert set(payload["rng_state"]) == {"python", "torch_cpu", "torch_cuda"}
+    assert payload["grad_scaler_state"] is None
     assert list(tmp_path.glob(".heal.pt.*.tmp")) == []
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA checkpoint portability regression")
+def test_qwen_checkpoint_round_trips_cuda_optimizer_slots_through_cpu(
+    tmp_path: Path,
+) -> None:
+    from research.kmd2_ablation.qwen_checkpoint import (
+        QwenResumeExpectation, load_qwen_checkpoint, save_qwen_checkpoint,
+    )
+
+    model, optimizer, scheduler, metadata = _checkpoint_parts("cuda")
+    assert optimizer.defaults["fused"] is True
+    expected = copy.deepcopy(optimizer.state_dict())
+    path = tmp_path / "cuda-heal.pt"
+    save_qwen_checkpoint(
+        path, model=model, optimizer=optimizer, scheduler=scheduler,
+        metadata=metadata, target_module_names=("layer0", "layer1"),
+    )
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    saved_slots = payload["optimizer_state"]["state"].values()
+    assert all(
+        value.device.type == "cpu"
+        for slot in saved_slots for value in slot.values()
+        if isinstance(value, torch.Tensor)
+    )
+    load_qwen_checkpoint(
+        path, model=model, optimizer=optimizer, scheduler=scheduler,
+        expectation=QwenResumeExpectation.from_metadata(metadata),
+        target_module_names=("layer0", "layer1"),
+    )
+    restored = optimizer.state_dict()
+    for parameter_id, expected_slot in expected["state"].items():
+        for name, expected_value in expected_slot.items():
+            actual = restored["state"][parameter_id][name]
+            if isinstance(expected_value, torch.Tensor):
+                assert torch.equal(actual.cpu(), expected_value.cpu())
+            else:
+                assert actual == expected_value
+    assert any(
+        value.device.type == "cuda"
+        for slot in optimizer.state.values() for value in slot.values()
+        if isinstance(value, torch.Tensor) and value.ndim > 0
+    )
+    assert all(group["fused"] is True for group in optimizer.param_groups)
+    sum(
+        parameter.square().sum()
+        for parameter in model.parameters() if parameter.requires_grad
+    ).backward()
+    optimizer.step()
+
+
+def test_qwen_checkpoint_rejects_actual_pre_aux_v2_shape_as_unsupported_schema(tmp_path: Path) -> None:
+    from research.kmd2_ablation.qwen_checkpoint import (
+        QwenCheckpointError, QwenResumeExpectation, load_qwen_checkpoint, save_qwen_checkpoint)
+
+    model, optimizer, scheduler, metadata = _checkpoint_parts()
+    current = tmp_path / "v3.pt"
+    save_qwen_checkpoint(current, model=model, optimizer=optimizer, scheduler=scheduler,
+                         metadata=metadata, target_module_names=("layer0", "layer1"))
+    legacy = torch.load(current, map_location="cpu", weights_only=True)
+    legacy["schema_version"] = 2
+    legacy.pop("grad_scaler_state")
+    legacy["metadata"].pop("example_cursor")
+    legacy["metadata"].pop("auxiliary_identity")
+    v2 = tmp_path / "v2.pt"; torch.save(legacy, v2)
+    with pytest.raises(QwenCheckpointError, match="schema version.*incompatible") as caught:
+        load_qwen_checkpoint(v2, model=model, optimizer=optimizer, scheduler=scheduler,
+                             expectation=QwenResumeExpectation.from_metadata(metadata),
+                             target_module_names=("layer0", "layer1"))
+    assert caught.value.code == "checkpoint_schema_mismatch"
 
 
 def test_qwen_checkpoint_interrupted_save_preserves_destination_and_cleans_temp(
@@ -1747,6 +2893,36 @@ def test_qwen_checkpoint_resume_restores_model_optimizer_scheduler_and_rng(
     assert torch.equal(torch.get_rng_state(), expected_torch_rng)
 
 
+def test_qwen_checkpoint_freezes_auxiliary_identity_scaler_and_sampler_cursor(tmp_path: Path) -> None:
+    from research.kmd2_ablation.qwen_checkpoint import (
+        QwenCheckpointError, QwenResumeExpectation, load_qwen_checkpoint, save_qwen_checkpoint)
+
+    class Scaler:
+        def __init__(self, scale): self.scale = scale
+        def state_dict(self): return {"scale": self.scale}
+        def load_state_dict(self, state): self.scale = state["scale"]
+
+    model, optimizer, scheduler, metadata = _checkpoint_parts()
+    identity = {"lambda_spec": .1, "lambda_gate": .2, "specialization_updates": 8,
+                "probe_sha256": "a" * 64,
+                "coefficients": [-3 / 20 ** .5, -1 / 20 ** .5, 1 / 20 ** .5, 3 / 20 ** .5]}
+    metadata = dataclasses.replace(metadata, example_cursor=2, auxiliary_identity=identity)
+    scaler = Scaler(16.0); path = tmp_path / "amp.pt"
+    save_qwen_checkpoint(path, model=model, optimizer=optimizer, scheduler=scheduler,
+                         metadata=metadata, target_module_names=("layer0", "layer1"),
+                         grad_scaler=scaler)
+    scaler.scale = 2.0
+    resumed = load_qwen_checkpoint(path, model=model, optimizer=optimizer, scheduler=scheduler,
+                                   expectation=QwenResumeExpectation.from_metadata(metadata),
+                                   target_module_names=("layer0", "layer1"), grad_scaler=scaler)
+    assert scaler.scale == 16.0 and resumed.example_cursor == 2
+    wrong = dataclasses.replace(metadata, auxiliary_identity={**identity, "lambda_gate": .3})
+    with pytest.raises(QwenCheckpointError, match="auxiliary_identity"):
+        load_qwen_checkpoint(path, model=model, optimizer=optimizer, scheduler=scheduler,
+                             expectation=QwenResumeExpectation.from_metadata(wrong),
+                             target_module_names=("layer0", "layer1"), grad_scaler=scaler)
+
+
 @pytest.mark.parametrize(
     ("interruption_type", "interruption_value"),
     [(KeyboardInterrupt, "stop-now"), (SystemExit, 17)],
@@ -1837,19 +3013,21 @@ def test_qwen_checkpoint_resume_rolls_back_exactly_before_reraising_base_excepti
 
 
 @pytest.mark.parametrize(
-    ("field", "replacement"),
+    ("field", "replacement", "expected_code"),
     [
-        ("job_id", "other-job"),
-        ("pairing_id", "e" * 64),
-        ("arm", "recency"),
-        ("source_hashes", {"gdn3/kmd2_native.py": "4" * 64}),
-        ("data_identity", {"sha256": "5" * 64, "row_count": 3}),
-        ("example_ids", ("e1", "e0", "e2")),
-        ("promotion_config", {"width": 32, "policy": "exact_outer"}),
+        ("job_id", "other-job", "resume_identity_mismatch"),
+        ("pairing_id", "e" * 64, "resume_identity_mismatch"),
+        ("arm", "recency", "resume_identity_mismatch"),
+        ("source_hashes", {"gdn3/kmd2_native.py": "4" * 64}, "resume_identity_mismatch"),
+        ("data_identity", {"sha256": "5" * 64, "row_count": 3}, "resume_identity_mismatch"),
+        ("example_ids", ("e1", "e0", "e2"), "resume_identity_mismatch"),
+        ("promotion_config", {"width": 32, "policy": "exact_outer"}, "resume_identity_mismatch"),
+        ("architecture_arm_id", "gdn2-channel-r1", "architecture_identity_mismatch"),
+        ("architecture_registry_sha256", "a" * 64, "architecture_identity_mismatch"),
     ],
 )
 def test_qwen_checkpoint_resume_rejects_every_identity_mismatch_without_mutation(
-    tmp_path: Path, field: str, replacement: object
+    tmp_path: Path, field: str, replacement: object, expected_code: str
 ) -> None:
     from research.kmd2_ablation.qwen_checkpoint import (
         QwenCheckpointError,
@@ -1874,7 +3052,7 @@ def test_qwen_checkpoint_resume_rejects_every_identity_mismatch_without_mutation
     before_model = copy.deepcopy(model.state_dict())
     before_optimizer = copy.deepcopy(optimizer.state_dict())
     before_scheduler = copy.deepcopy(scheduler.state_dict())
-    with pytest.raises(QwenCheckpointError, match="resume_identity_mismatch") as error:
+    with pytest.raises(QwenCheckpointError, match=expected_code) as error:
         load_qwen_checkpoint(
             path,
             model=model,
@@ -1883,7 +3061,7 @@ def test_qwen_checkpoint_resume_rejects_every_identity_mismatch_without_mutation
             expectation=expectation,
             target_module_names=("layer0", "layer1"),
         )
-    assert error.value.code == "resume_identity_mismatch"
+    assert error.value.code == expected_code
     _assert_nested_equal(model.state_dict(), before_model)
     _assert_nested_equal(optimizer.state_dict(), before_optimizer)
     _assert_nested_equal(scheduler.state_dict(), before_scheduler)
@@ -2169,6 +3347,59 @@ def _qwen_adapter_job(
     return job
 
 
+def test_stock_qwen_execute_job_returns_complete_no_training_payload(tmp_path: Path) -> None:
+    from dataclasses import asdict
+    from research.kmd2_ablation.qwen_backend import LoadedQwenArm
+    from research.kmd2_ablation.qwen_training import QwenJobData, derive_three_arm_pairing, execute_job
+    from research.kmd2_ablation.qwen_variants import maximum_control_contract
+
+    paths = {name: tmp_path / f"{name}.bin" for name in ("model", "checkpoint", "data", "teacher_model")}
+    for name, path in paths.items(): path.write_bytes(name.encode())
+    hashes = {name: _sha256(path) for name, path in paths.items()}
+    job = _qwen_adapter_job(hashes["checkpoint"], hashes["data"])
+    contract = maximum_control_contract("stock-qwen")
+    job["arm_id"] = "native"
+    job["canonical_config"]["qwen"]["run_mode"] = "reliance"
+    params = job["canonical_config"]["task"]["params"]
+    serialized_contract = json.loads(json.dumps(asdict(contract)))
+    params.update({"maximum_control": "stock-qwen", "maximum_contract": serialized_contract,
+                   "maximum_features": serialized_contract, "maximum_contract_sha256": contract.identity_sha256})
+    pairing = derive_three_arm_pairing(job, example_ids=("e0", "e1"),
+        pre_replacement_checkpoint_sha256=hashes["checkpoint"], data_sha256=hashes["data"])
+    job["pairing_id"] = pairing.pairing_id
+    model = _HealModel()
+    data = QwenJobData(train_microbatches=(_batch("e0", (0,1,2)), _batch("e1", (2,1,0))),
+        eval_microbatches=(_batch("eval0", (0,2,1)),), data_identity={"sha256": hashes["data"]})
+    forbidden = lambda **_kwargs: (_ for _ in ()).throw(AssertionError("training boundary called"))
+    ticks = iter((1.0, 2.0))
+    payload = execute_job(job, runtime={**paths, "output": tmp_path / "out", "student_device": "cpu",
+        "teacher_device": "cpu", "dtype": "float32", "asset_hashes": hashes, "resume": False},
+        dependencies={"load_data": lambda **_kwargs: data,
+            "load_arm": lambda spec, **_kwargs: LoadedQwenArm(model, "native", spec.job_id, (), (), ()),
+            "load_teacher": forbidden, "build_optimizer": forbidden, "build_scheduler": forbidden,
+            "evaluate": lambda **_kwargs: {"metrics": {"accuracy": .75},
+                "recurrent_state": {"elements": 0, "bytes": 0}},
+            "monotonic": lambda: next(ticks), "reset_peak_vram": lambda _device: None,
+            "peak_vram_bytes": lambda _device: 0})
+    assert payload["stock_evaluation"] and not payload["optimizer_created"] and not payload["architecture_replaced"]
+    assert payload["loss_curves"] == {"train": [], "validation": []}
+    assert payload["parameters"] == {"trainable": 0, "total": sum(p.numel() for p in model.parameters())}
+    assert payload["counts"] == {"nonfinite_loss": 0, "nonfinite_gradient": 0, "skipped_steps": 0}
+    assert payload["identities"]["implementation"] == "stock_qwen_source_evaluator"
+    from research.kmd2_ablation.results import RESULT_SCHEMA_VERSION, canonical_json_bytes, validate_completed_run
+    from research.kmd2_ablation.runner import build_completed_record
+    provenance = {"schema_version": RESULT_SCHEMA_VERSION, "suite_version": "1.0.0",
+        "source_hashes": {"research/kmd2_ablation/qwen_training.py": "a" * 64},
+        "config_hash": hashlib.sha256(canonical_json_bytes(job["canonical_config"])).hexdigest(),
+        "asset_hashes": hashes,
+        "git": {"revision": "0123456789abcdef", "diff_hash": "b" * 64, "dirty": True},
+        "environment": {"python": "3.13", "pytorch": "2.10", "cuda": None, "gpu": None,
+                        "dependencies": {"torch": "2.10"}}}
+    record = build_completed_record(job, provenance, shard_index=0, num_jobs=1,
+        command=("python", "-m", "research.kmd2_ablation.run_ablation", "run"), payload=payload)
+    validate_completed_run(record, job, provenance)
+
+
 def _exact_cache_result_diagnostics() -> dict[str, object]:
     return {
         "width": 2,
@@ -2213,10 +3444,24 @@ def test_qwen_source_hashes_cover_the_exact_semantic_execution_graph() -> None:
     root = Path(__file__).resolve().parents[2]
     expected = {
         "research/kmd2_ablation/config.py",
+        "research/kmd2_ablation/architecture.py",
         "research/kmd2_ablation/exact_cache.py",
         "research/kmd2_ablation/qwen_backend.py",
+        "research/kmd2_ablation/qwen_architecture.py",
         "research/kmd2_ablation/qwen_checkpoint.py",
         "research/kmd2_ablation/qwen_exact_cache.py",
+        "research/kmd2_ablation/qwen_fused_loss.py",
+        "research/kmd2_ablation/qwen_gdn2_triton.py",
+        "research/kmd2_ablation/qwen_hybrid_chunkwise.py",
+        "research/kmd2_ablation/qwen_hybrid_components.py",
+        "research/kmd2_ablation/qwen_hybrid_four_state.py",
+        "research/kmd2_ablation/qwen_hybrid_hola.py",
+        "research/kmd2_ablation/qwen_hybrid_liger_chunked.py",
+        "research/kmd2_ablation/qwen_hybrid_liger_dplr.py",
+        "research/kmd2_ablation/qwen_hybrid_liger_wy.py",
+        "research/kmd2_ablation/qwen_hybrid_math.py",
+        "research/kmd2_ablation/qwen_hybrid_shared.py",
+        "research/kmd2_ablation/qwen_hybrid_triton.py",
         "research/kmd2_ablation/qwen_training.py",
         "research/kmd2_ablation/qwen_variants.py",
         "research/kmd2_ablation/results.py",
@@ -2261,6 +3506,31 @@ def test_qwen_source_hashes_change_only_ruler_digest_when_ruler_source_changes(
     assert {
         relative for relative in baseline if mutated[relative] != baseline[relative]
     } == {"research/kmd2_ablation/tasks/ruler.py"}
+
+
+@pytest.mark.parametrize("relative", [
+    "research/kmd2_ablation/architecture.py",
+    "research/kmd2_ablation/qwen_architecture.py",
+])
+def test_qwen_architecture_source_digest_changes_resume_identity(
+    monkeypatch: pytest.MonkeyPatch, relative: str
+) -> None:
+    from io import BytesIO
+    from research.kmd2_ablation.qwen_training import _source_hashes
+
+    root = Path(__file__).resolve().parents[2]
+    target = root / relative
+    source = target.read_bytes()
+    baseline = _source_hashes()
+    original_open = Path.open
+    def mutated_open(path: Path, mode: str = "r", *args, **kwargs):
+        if path == target and mode == "rb":
+            return BytesIO(source + b"\n# identity mutation\n")
+        return original_open(path, mode, *args, **kwargs)
+    monkeypatch.setattr(Path, "open", mutated_open)
+    changed = _source_hashes()
+    assert {name for name in baseline if baseline[name] != changed[name]} == {relative}
+    assert changed != baseline
 
 
 class _RunnerQwenHealConfig:
@@ -2515,6 +3785,395 @@ def test_qwen_run_job_requires_bound_runtime_but_is_runner_discoverable() -> Non
     assert caught.value.code == "runtime_required"
 
 
+def test_production_qwen_dispatch_binds_gdn2_identity_and_exact_trainables(
+    tmp_path: Path,
+) -> None:
+    from research.kmd2_ablation.architecture import TARGET_LAYERS, registry_sha256
+    from research.kmd2_ablation.qwen_training import QwenJobData, QwenRuntimeConfigurationError, execute_job
+
+    paths = {
+        "model": tmp_path / "model.bin",
+        "checkpoint": tmp_path / "native.pt",
+        "data": tmp_path / "data.jsonl",
+        "teacher_model": tmp_path / "teacher.bin",
+    }
+    for name, path in paths.items():
+        path.write_bytes(name.encode())
+    hashes = {name: _sha256(path) for name, path in paths.items()}
+    job = _qwen_adapter_job(hashes["checkpoint"], hashes["data"])
+    job["arm_id"] = "gdn2-channel-r1"
+    job["canonical_config"]["architecture"] = {
+        "arm_id": "gdn2-channel-r1", "registry_sha256": registry_sha256()
+    }
+    captured = []
+    class Stop(RuntimeError): pass
+    def load_arm(spec, **_kwargs):
+        captured.append(spec)
+        raise Stop
+    data = QwenJobData(
+        train_microbatches=(_batch("e0", (0, 1, 2)), _batch("e1", (2, 1, 0))),
+        eval_microbatches=(_batch("eval0", (0, 2, 1)),),
+        data_identity={"sha256": hashes["data"]},
+    )
+    runtime = {**paths, "output": tmp_path / "out", "student_device": "cpu",
+        "teacher_device": "cpu", "dtype": "float32", "asset_hashes": hashes,
+        "resume": False}
+    with pytest.raises(Stop):
+        execute_job(job, runtime=runtime, dependencies={
+            "load_data": lambda **_kwargs: data, "load_arm": load_arm,
+        })
+    spec = captured[0]
+    assert spec.arm == "native"
+    assert spec.architecture_arm_id == "gdn2-channel-r1"
+    assert spec.architecture_registry_sha256 == registry_sha256()
+    assert spec.trainable_names == tuple(sorted(
+        f"model.layers.{index}.linear_attn.{suffix}"
+        for index in TARGET_LAYERS
+        for suffix in ("erase_proj.weight", "write_proj.weight", "write_offset")
+    ))
+
+
+def test_rout_4_dispatch_contract_binds_exact_identity_and_trainables() -> None:
+    from research.kmd2_ablation.architecture import TARGET_LAYERS, registry_sha256
+    from research.kmd2_ablation.qwen_training import _architecture_dispatch_contract
+
+    digest = registry_sha256()
+    contract = _architecture_dispatch_contract(
+        {"arm_id": "rout-4", "architecture_registry_sha256": digest},
+        {"architecture": {"arm_id": "rout-4", "registry_sha256": digest,
+                          "output_width": 4}},
+    )
+    assert contract is not None
+    assert contract.arm == "native"
+    assert contract.architecture_arm_id == "rout-4"
+    assert contract.registry_sha256 == digest
+    assert contract.trainable_names == tuple(sorted(
+        f"model.layers.{index}.linear_attn.{suffix}"
+        for index in TARGET_LAYERS for suffix in ("q_slot_scale", "out_mix")
+    ))
+    assert len(contract.trainable_names) == 36
+    assert not any(token in name for name in contract.trainable_names
+                   for token in ("mimo", "erase_proj", "write_proj", "cache"))
+
+
+@pytest.mark.parametrize("mutation,code", [
+    ({"output_width": "4"}, "architecture_width_invalid"),
+    ({"output_width": 1}, "architecture_width_mismatch"),
+])
+def test_rout_4_dispatch_rejects_malformed_width_with_typed_error(mutation, code) -> None:
+    from research.kmd2_ablation.architecture import registry_sha256
+    from research.kmd2_ablation.qwen_training import (
+        QwenRuntimeConfigurationError, _architecture_dispatch_contract,
+    )
+    digest = registry_sha256()
+    architecture = {"arm_id": "rout-4", "registry_sha256": digest, **mutation}
+    with pytest.raises(QwenRuntimeConfigurationError, match=code) as caught:
+        _architecture_dispatch_contract(
+            {"arm_id": "rout-4", "architecture_registry_sha256": digest},
+            {"architecture": architecture},
+        )
+    assert caught.value.code == code
+
+
+@pytest.mark.parametrize(("arm", "diagnostic", "suffixes"), [
+    ("rot-off", False, ()), ("rot-constant", False, ("rotation_rate",)),
+    ("rot-noncumulative", False, ("rot_proj.weight", "rot_proj.bias")),
+    ("rot-fixed-rope", False, ()),
+    ("rot-moving-frame-oracle", False, ()),
+    ("rot-moving-frame-oracle", True, ("rot_proj.weight", "rot_proj.bias")),
+])
+def test_execute_job_routes_each_rotation_identity_to_load_spec(tmp_path: Path, arm, diagnostic, suffixes):
+    from research.kmd2_ablation.architecture import TARGET_LAYERS, registry_sha256
+    from research.kmd2_ablation.qwen_training import QwenJobData, QwenRuntimeConfigurationError, execute_job
+    paths = {name: tmp_path / f"{name}.bin" for name in ("model", "checkpoint", "data", "teacher_model")}
+    for name, path in paths.items(): path.write_bytes(name.encode())
+    hashes = {name: _sha256(path) for name, path in paths.items()}
+    job = _qwen_adapter_job(hashes["checkpoint"], hashes["data"])
+    job["arm_id"] = arm; job["architecture_registry_sha256"] = registry_sha256()
+    job["architecture_diagnostic_training"] = diagnostic
+    job["canonical_config"]["architecture"] = {
+        "arm_id": arm, "registry_sha256": registry_sha256(), "diagnostic_training": diagnostic,
+    }
+    data = QwenJobData(train_microbatches=(_batch("e0", (0,1,2)), _batch("e1", (2,1,0))),
+        eval_microbatches=(_batch("eval0", (0,2,1)),), data_identity={"sha256": hashes["data"]})
+    captured = []
+    class Stop(RuntimeError): pass
+    def load_arm(spec, **_kwargs): captured.append(spec); raise Stop
+    runtime = {**paths, "output": tmp_path / "out", "student_device": "cpu", "teacher_device": "cpu",
+        "dtype": "float32", "asset_hashes": hashes, "resume": False}
+    with pytest.raises(Stop):
+        execute_job(job, runtime=runtime, dependencies={"load_data": lambda **_k: data, "load_arm": load_arm})
+    spec = captured[0]
+    assert spec.arm == "native" and spec.architecture_arm_id == arm
+    assert spec.architecture_registry_sha256 == registry_sha256()
+    assert spec.diagnostic_training is diagnostic
+    assert spec.trainable_names == tuple(sorted(
+        f"model.layers.{index}.linear_attn.{suffix}" for index in TARGET_LAYERS for suffix in suffixes))
+    tampered = dict(job)
+    tampered["architecture_diagnostic_training"] = not diagnostic
+    predata_calls = []
+    with pytest.raises(QwenRuntimeConfigurationError, match="architecture_diagnostic_training_mismatch"):
+        execute_job(tampered, runtime=runtime, dependencies={
+            "load_data": lambda **_k: predata_calls.append(True), "load_arm": load_arm,
+        })
+    assert predata_calls == []
+
+
+@pytest.mark.parametrize("case", ["stale_hash", "arm_mismatch"])
+def test_production_qwen_dispatch_rejects_invalid_submitted_architecture_before_loader(
+    tmp_path: Path, case: str
+) -> None:
+    from research.kmd2_ablation.architecture import registry_sha256
+    from research.kmd2_ablation.qwen_training import (
+        QwenJobData, QwenRuntimeConfigurationError, execute_job,
+    )
+    paths = {name: tmp_path / f"{name}.bin" for name in ("model", "checkpoint", "data", "teacher_model")}
+    for name, path in paths.items(): path.write_bytes(name.encode())
+    hashes = {name: _sha256(path) for name, path in paths.items()}
+    job = _qwen_adapter_job(hashes["checkpoint"], hashes["data"])
+    job["arm_id"] = "gdn2-channel-r1"
+    job["canonical_config"]["architecture"] = {
+        "arm_id": "gdn2-channel-r1" if case == "stale_hash" else "kmd2-r1",
+        "registry_sha256": "a" * 64 if case == "stale_hash" else registry_sha256(),
+    }
+    data = QwenJobData(train_microbatches=(_batch("e0", (0,1,2)), _batch("e1", (2,1,0))),
+        eval_microbatches=(_batch("eval0", (0,2,1)),), data_identity={"sha256": hashes["data"]})
+    loader_calls = []
+    runtime = {**paths, "output": tmp_path / "out", "student_device": "cpu", "teacher_device": "cpu",
+        "dtype": "float32", "asset_hashes": hashes, "resume": False}
+    expected = "architecture_registry_hash_mismatch" if case == "stale_hash" else "architecture_arm_mismatch"
+    error_type = ValueError if case == "stale_hash" else QwenRuntimeConfigurationError
+    with pytest.raises(error_type, match=expected):
+        execute_job(job, runtime=runtime, dependencies={
+            "load_data": lambda **_k: data,
+            "load_arm": lambda *_a, **_k: loader_calls.append(True),
+        })
+    assert loader_calls == []
+
+
+def test_gdn2_training_payload_emits_bound_manifest_and_exact_resources(tmp_path: Path):
+    from research.kmd2_ablation.architecture import TARGET_LAYERS, registry_sha256
+    from research.kmd2_ablation.qwen_backend import LoadedQwenArm, _aggregate_architecture_tensor_manifest
+    from research.kmd2_ablation.qwen_training import QwenJobData, execute_job
+    class Attention(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.erase_proj = torch.nn.Linear(1, 1, bias=False)
+            self.write_proj = torch.nn.Linear(1, 1, bias=False)
+            self.write_offset = torch.nn.Parameter(torch.ones(1))
+            self.conv1d = torch.nn.Conv1d(1, 1, 1, bias=False)
+            self.conv1d.weight.requires_grad_(False)
+        def transformation_manifest(self):
+            return {"copied": ("conv1d.weight",), "transformed": (
+                ("in_proj_b.weight", "erase_proj.weight", "row_copy_dk"),
+                ("in_proj_b.weight", "write_proj.weight", "row_copy_dv"),
+                ("bw_off", "write_offset", "copy")), "new": ()}
+    class Block(torch.nn.Module):
+        def __init__(self, target):
+            super().__init__(); self.linear_attn = Attention() if target else torch.nn.Identity()
+    class Model(_HealModel):
+        def __init__(self):
+            super().__init__()
+            self.memory_weight.requires_grad_(False); self.cache_amplitude.requires_grad_(False)
+            self.model = torch.nn.Module(); self.model.layers = torch.nn.ModuleList(
+                [Block(i in TARGET_LAYERS) for i in range(23)])
+        def forward(self, input_ids, *, output_hidden_states, use_cache):
+            one_hot = F.one_hot(input_ids, num_classes=3).float()
+            scale = sum(p.sum() for n, p in self.named_parameters() if n.endswith(("erase_proj.weight", "write_proj.weight", "write_offset")))
+            logits = one_hot * scale
+            return SimpleNamespace(logits=logits, hidden_states=(one_hot, logits))
+    paths = {name: tmp_path / f"{name}.bin" for name in ("model", "checkpoint", "data", "teacher_model")}
+    for name, path in paths.items(): path.write_bytes(name.encode())
+    hashes = {name: _sha256(path) for name, path in paths.items()}
+    job = _qwen_adapter_job(hashes["checkpoint"], hashes["data"])
+    job["arm_id"] = "gdn2-channel-r1"
+    job["canonical_config"]["architecture"] = {"arm_id": "gdn2-channel-r1", "registry_sha256": registry_sha256()}
+    data = QwenJobData(train_microbatches=(_batch("e0", (0,1,2)), _batch("e1", (2,1,0))),
+        eval_microbatches=(_batch("eval0", (0,2,1)),), data_identity={"sha256": hashes["data"]})
+    def load_arm(spec, **_kwargs):
+        model = Model(); manifest = _aggregate_architecture_tensor_manifest(model, TARGET_LAYERS)
+        return LoadedQwenArm(model, "native", spec.job_id, TARGET_LAYERS, spec.trainable_names, (),
+            "gdn2-channel-r1", registry_sha256(), "replacement", True,
+            "qwen_architecture.KMD2ChannelwiseGDN2Attn.reference_fp32", manifest)
+    runtime = {**paths, "output": tmp_path / "out", "student_device": "cpu", "teacher_device": "cpu",
+        "dtype": "float32", "asset_hashes": hashes, "resume": False}
+    ticks = iter((1.0, 2.0))
+    payload = execute_job(job, runtime=runtime, dependencies={
+        "load_data": lambda **_k: data, "load_arm": load_arm,
+        "load_teacher": lambda **_k: _HealTeacher(), "save_checkpoint": lambda path, **_k: path,
+        "evaluate": lambda **_k: {"metrics": {"loss": 1.0}, "recurrent_state": {"elements": 8, "bytes": 32}},
+        "monotonic": lambda: next(ticks), "reset_peak_vram": lambda _d: None,
+        "peak_vram_bytes": lambda _d: 0})
+    assert payload["architecture_classification"] == "replacement"
+    assert payload["architecture_identity_passed"] is True
+    assert payload["architecture_implementation"] == "qwen_architecture.KMD2ChannelwiseGDN2Attn.reference_fp32"
+    assert len(payload["architecture_tensor_manifest"]["copied"]) == 18
+    assert len(payload["architecture_tensor_manifest"]["transformed"]) == 54
+    assert payload["resources"] == {"total_parameters": 83, "trainable_parameters": 54,
+        "recurrent_state_elements": 8, "recurrent_state_bytes": 32, "convolution_parameters": 18,
+        "transformed_parameters": 54, "new_parameters": 0,
+        "architecture_new_buffer_elements": 0, "architecture_new_buffer_bytes": 0,
+        "reference_implementation": "qwen_architecture.KMD2ChannelwiseGDN2Attn.reference_fp32"}
+
+
+@pytest.mark.parametrize(
+    ("rank", "new_per_layer", "activation_elements", "activation_bytes"),
+    ((2, 1_060_864, 20_480, 81_920), (4, 2_121_728, 40_960, 163_840)),
+)
+def test_true_mimo_resource_accounting_is_rankwise_and_state_independent(
+    rank: int, new_per_layer: int, activation_elements: int, activation_bytes: int
+) -> None:
+    from research.kmd2_ablation.qwen_training import _true_mimo_resources
+
+    result = _true_mimo_resources(
+        rank=rank, layers=18, batch_size=1, sequence_length=1,
+        heads=16, key_dim=128, value_dim=128, native_conv_parameters=7,
+    )
+    assert result == {
+        "new_parameters_per_layer": new_per_layer,
+        "new_parameters": 18 * new_per_layer,
+        "recurrent_state_elements": 262_144,
+        "recurrent_state_bytes": 1_048_576,
+        "rankwise_live_activation_elements": activation_elements,
+        "rankwise_live_activation_bytes": activation_bytes,
+        "native_conv_parameters": 7,
+    }
+
+
+def test_true_mimo_resource_accounting_scales_state_and_activations_by_batch() -> None:
+    from research.kmd2_ablation.qwen_training import _true_mimo_resources
+    result = _true_mimo_resources(
+        rank=2, layers=18, batch_size=3, sequence_length=1,
+        heads=16, key_dim=128, value_dim=128, native_conv_parameters=7,
+    )
+    assert result["recurrent_state_elements"] == 786_432
+    assert result["recurrent_state_bytes"] == 3_145_728
+    assert result["rankwise_live_activation_elements"] == 61_440
+    assert result["rankwise_live_activation_bytes"] == 245_760
+
+
+def test_shared_query_widening_resources_are_independent_and_exact() -> None:
+    from research.kmd2_ablation.qwen_training import _shared_query_widening_resources
+    assert _shared_query_widening_resources(
+        width=4, layers=18, batch_size=1, sequence_length=1,
+        heads=16, key_dim=128, value_dim=128,
+    ) == {
+        "new_parameters_per_layer": 8_256,
+        "new_parameters": 148_608,
+        "recurrent_state_elements": 262_144,
+        "recurrent_state_bytes": 1_048_576,
+        "total_rank_read_elements": 8_192,
+        "total_q_slot_elements": 8_192,
+        "extra_vs_r1_elements": 12_288,
+        "extra_vs_r1_bytes": 49_152,
+    }
+
+
+def test_shared_query_widening_resources_scale_batch_and_reject_bad_dimensions() -> None:
+    from research.kmd2_ablation.qwen_training import _shared_query_widening_resources
+    result = _shared_query_widening_resources(
+        width=4, layers=18, batch_size=3, sequence_length=2,
+        heads=16, key_dim=128, value_dim=128,
+    )
+    assert result["recurrent_state_elements"] == 786_432
+    assert result["total_rank_read_elements"] == 49_152
+    assert result["total_q_slot_elements"] == 49_152
+    assert result["extra_vs_r1_elements"] == 73_728
+    with pytest.raises(ValueError, match="shared_query_widening_resource_dimension_invalid"):
+        _shared_query_widening_resources(
+            width=4, layers=18, batch_size=True, sequence_length=1,
+            heads=16, key_dim=128, value_dim=128,
+        )
+
+
+def test_widening_resource_shape_selection_uses_independent_batch_and_token_maxima():
+    from research.kmd2_ablation.qwen_training import (
+        _shared_query_widening_resources, _widening_resource_shape_maxima,
+    )
+    assert _widening_resource_shape_maxima(((8, 1), (1, 16))) == (8, 16)
+    result = _shared_query_widening_resources(
+        width=4, layers=18, batch_size=8, sequence_length=1, max_tokens=16,
+        heads=16, key_dim=128, value_dim=128,
+    )
+    assert result["recurrent_state_elements"] == 8 * 16 * 128 * 128
+    assert result["total_rank_read_elements"] == 16 * 16 * 4 * 128
+
+
+@pytest.mark.parametrize(("mode", "new_parameters", "buffer_elements", "buffer_bytes"), [
+    ("off", 0, 0, 0), ("constant", 18 * 4, 0, 0),
+    ("noncumulative", 0, 0, 0), ("fixed-rope", 0, 18 * 2, 18 * 2 * 4),
+    ("moving-frame-oracle", 0, 0, 0),
+])
+def test_rotation_resources_derive_new_parameters_and_buffers_from_manifest(
+    mode, new_parameters, buffer_elements, buffer_bytes
+):
+    from research.kmd2_ablation.qwen_training import _architecture_new_state_resources
+    class Module(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            new = ()
+            if mode == "constant":
+                self.rotation_rate = torch.nn.Parameter(torch.ones(2, 2)); new = ("rotation_rate",)
+            elif mode == "fixed-rope":
+                self.register_buffer("inv_freq", torch.ones(2)); new = ("inv_freq",)
+            self._new = new
+        def transformation_manifest(self):
+            return {"copied": (), "transformed": (), "new": self._new}
+    result = _architecture_new_state_resources(tuple(Module() for _ in range(18)))
+    assert result == {
+        "new_parameters": new_parameters,
+        "architecture_new_buffer_elements": buffer_elements,
+        "architecture_new_buffer_bytes": buffer_bytes,
+    }
+
+
+@pytest.mark.parametrize("field,value", [
+    ("copied", None), ("copied", "weight"), ("copied", {"weight": 1}),
+    ("copied", ("",)), ("new", (1,)),
+    ("transformed", (("source", "target"),)),
+    ("transformed", (("source", "target", 1),)),
+    ("transformed", (("source", "", "copy"),)),
+])
+def test_architecture_tensor_manifest_rejects_malformed_schema_with_typed_code(
+    field: str, value: object
+) -> None:
+    from research.kmd2_ablation.qwen_backend import (
+        ArchitectureManifestError, _aggregate_architecture_tensor_manifest,
+    )
+    manifest = {"copied": ("x",), "transformed": (), "new": ("y",)}
+    manifest[field] = value
+    module = SimpleNamespace(transformation_manifest=lambda: manifest, rank=2)
+    model = SimpleNamespace(model=SimpleNamespace(layers=[SimpleNamespace(linear_attn=module)]))
+    with pytest.raises(ArchitectureManifestError) as caught:
+        _aggregate_architecture_tensor_manifest(model, (0,))
+    assert caught.value.code == "architecture_tensor_manifest_invalid"
+
+
+def test_true_mimo_manifest_is_layer_qualified_and_rejects_rank_heterogeneity() -> None:
+    from research.kmd2_ablation.qwen_backend import _aggregate_architecture_tensor_manifest
+
+    class Attention(torch.nn.Module):
+        def __init__(self, rank: int):
+            super().__init__(); self.rank = rank
+        def transformation_manifest(self):
+            return {"copied": ("conv1d.weight",), "transformed": (), "new": ("mimo_v",)}
+    class Block(torch.nn.Module):
+        def __init__(self, rank: int):
+            super().__init__(); self.linear_attn = Attention(rank)
+    model = torch.nn.Module(); model.model = torch.nn.Module()
+    model.model.layers = torch.nn.ModuleList([Block(2), Block(2)])
+    manifest = _aggregate_architecture_tensor_manifest(model, (0, 1))
+    assert manifest["mimo_rank"] == 2
+    assert manifest["layer_count"] == 2
+    assert manifest["copied"] == (
+        "model.layers.0.linear_attn.conv1d.weight",
+        "model.layers.1.linear_attn.conv1d.weight",
+    )
+    model.model.layers[1].linear_attn.rank = 4
+    with pytest.raises(ValueError, match="architecture_tensor_manifest_heterogeneous_rank"):
+        _aggregate_architecture_tensor_manifest(model, (0, 1))
+
+
 def test_bound_qwen_dispatcher_orchestrates_heal_resume_checkpoint_and_diagnostics(
     tmp_path: Path,
 ) -> None:
@@ -2556,6 +4215,7 @@ def test_bound_qwen_dispatcher_orchestrates_heal_resume_checkpoint_and_diagnosti
         "student_device": "cpu",
         "teacher_device": "cpu",
         "dtype": "float32",
+        "checkpoint_every": 8,
         "asset_hashes": hashes,
         "resume": True,
     }
@@ -2574,6 +4234,17 @@ def test_bound_qwen_dispatcher_orchestrates_heal_resume_checkpoint_and_diagnosti
     )
     events: list[object] = []
     saved_metadata: list[object] = []
+    checkpoint_scalers: list[object] = []
+
+    class WiredScaler:
+        def scale(self, loss): return loss
+        def unscale_(self, optimizer): pass
+        def step(self, optimizer): optimizer.step()
+        def update(self): pass
+        def get_scale(self): return 1.0
+        def state_dict(self): return {"scale": 1.0}
+        def load_state_dict(self, state): assert state == {"scale": 1.0}
+    wired_scaler = WiredScaler()
 
     def load_data(**kwargs: object) -> QwenJobData:
         events.append(("data", kwargs["asset"].sha256))
@@ -2603,6 +4274,7 @@ def test_bound_qwen_dispatcher_orchestrates_heal_resume_checkpoint_and_diagnosti
         return _HealTeacher()
 
     def save_checkpoint(path: Path, **kwargs: object) -> Path:
+        checkpoint_scalers.append(kwargs["grad_scaler"])
         saved_metadata.append(kwargs["metadata"])
         events.append(
             (
@@ -2615,6 +4287,7 @@ def test_bound_qwen_dispatcher_orchestrates_heal_resume_checkpoint_and_diagnosti
         return path
 
     def load_checkpoint(path: Path, **_kwargs: object) -> SimpleNamespace:
+        checkpoint_scalers.append(_kwargs["grad_scaler"])
         events.append(("resume", path))
         return SimpleNamespace(
             job_id=job["job_id"],
@@ -2648,6 +4321,7 @@ def test_bound_qwen_dispatcher_orchestrates_heal_resume_checkpoint_and_diagnosti
             "monotonic": lambda: next(ticks),
             "reset_peak_vram": reset_peak_vram,
             "peak_vram_bytes": lambda _device: 0,
+            "build_grad_scaler": lambda **kwargs: wired_scaler,
         },
     )
     payload = dispatcher(job)
@@ -2663,6 +4337,7 @@ def test_bound_qwen_dispatcher_orchestrates_heal_resume_checkpoint_and_diagnosti
         "evaluate",
     ]
     assert events[3] == ("resume", resume_path)
+    assert checkpoint_scalers == [wired_scaler, wired_scaler]
     assert events[4] == ("reset_peak_vram", "cpu")
     assert events[1] == (
         "arm",
@@ -2927,6 +4602,253 @@ def test_default_qwen_data_loader_normalizes_empty_sparse_stale_positions(
     assert isinstance(stale_positions, torch.Tensor)
     assert stale_positions.dtype == torch.int64
     assert stale_positions.shape == (0, 3)
+
+
+def test_default_qwen_data_loader_materializes_compact_ruler_annotations(
+    tmp_path: Path,
+) -> None:
+    from research.kmd2_ablation.qwen_training import _default_load_data
+
+    data_path = tmp_path / "compact-ruler.pt"
+    torch.save(
+        {
+            "train": [{"example_id": "train-0", "input_ids": [0, 1, 2]}],
+            "eval": [{
+                "example_id": "ruler-0",
+                "input_ids": torch.tensor([10, 11, 12, 13], dtype=torch.int32),
+                "ruler_metadata": {
+                    "answer_spans": [[2, 4]],
+                    "source_spans": [[0, 1]],
+                },
+            }],
+        },
+        data_path,
+    )
+    asset = SimpleNamespace(
+        path=data_path,
+        sha256=_sha256(data_path),
+        size_bytes=data_path.stat().st_size,
+        kind="file",
+    )
+
+    data = _default_load_data(asset=asset)
+
+    batch = data.eval_microbatches[0]
+    assert batch["input_ids"].dtype == torch.long
+    assert torch.equal(
+        batch["query_mask"], torch.tensor([[False, False, True, True]])
+    )
+    assert torch.equal(
+        batch["source_spans"],
+        torch.tensor([[[-1, -1], [-1, -1], [0, 1], [0, 1]]]),
+    )
+    assert batch["stale_positions"].shape == (0, 3)
+
+
+def test_default_qwen_data_loader_selects_job_seed_from_one_immutable_bundle(
+    tmp_path: Path,
+) -> None:
+    from research.kmd2_ablation.qwen_training import _default_load_data
+
+    data_path = tmp_path / "qwen_windows.pt"
+    torch.save(
+        {
+            "schema_version": "2.0.0",
+            "train": [{"example_id": "train-0", "input_ids": [0, 1, 2]}],
+            "eval_by_seed": {
+                str(seed): [{
+                    "example_id": f"eval-{seed}",
+                    "input_ids": [seed, 1, 2],
+                    "ruler_metadata": {"seed": seed},
+                }]
+                for seed in (11, 29, 47)
+            },
+        },
+        data_path,
+    )
+    asset = SimpleNamespace(
+        path=data_path,
+        sha256=_sha256(data_path),
+        size_bytes=data_path.stat().st_size,
+        kind="file",
+    )
+
+    for seed in (11, 29, 47):
+        data = _default_load_data(asset=asset, job={"seed": seed})
+        assert data.train_microbatches[0]["example_ids"] == ("train-0",)
+        assert data.eval_microbatches[0]["example_ids"] == (f"eval-{seed}",)
+        assert data.eval_microbatches[0]["ruler_metadata"][0]["seed"] == seed
+        assert data.data_identity == {
+            "sha256": asset.sha256,
+            "size_bytes": asset.size_bytes,
+            "kind": "file",
+            "example_count": 1,
+            "evaluation_seed": seed,
+            "available_evaluation_seeds": [11, 29, 47],
+            "evaluation_example_count": 1,
+        }
+
+
+@pytest.mark.parametrize("job", [None, {"seed": 13}])
+def test_default_qwen_seeded_data_loader_fails_closed_without_matching_partition(
+    tmp_path: Path,
+    job: dict[str, int] | None,
+) -> None:
+    from research.kmd2_ablation.qwen_training import (
+        QwenRuntimeConfigurationError,
+        _default_load_data,
+    )
+
+    data_path = tmp_path / "qwen_windows.pt"
+    torch.save(
+        {
+            "train": [{"example_id": "train-0", "input_ids": [0, 1, 2]}],
+            "eval_by_seed": {
+                "11": [{"example_id": "eval-11", "input_ids": [0, 1, 2]}]
+            },
+        },
+        data_path,
+    )
+    asset = SimpleNamespace(
+        path=data_path,
+        sha256=_sha256(data_path),
+        size_bytes=data_path.stat().st_size,
+        kind="file",
+    )
+
+    with pytest.raises(QwenRuntimeConfigurationError) as caught:
+        _default_load_data(asset=asset, job=job)
+    assert caught.value.code == "data_window_invalid"
+
+
+def test_data_bundle_builder_partitions_evaluation_by_campaign_seed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from research.kmd2_ablation.scripts import build_data_bundle
+
+    monkeypatch.setattr(
+        build_data_bundle,
+        "build_eval",
+        lambda _tokenizer, *, seed, grid, free_generation_subset, evidence_scope: [{
+            "seed": seed,
+            "grid": grid,
+            "free_generation_subset": free_generation_subset,
+            "evidence_scope": evidence_scope,
+        }],
+    )
+    grid = [(512, (1, 4), 2)]
+    partitions = build_data_bundle.build_seeded_eval(
+        object(), seeds=(11, 29, 47), grid=grid,
+        free_generation_subset=1, evidence_scope="feasibility",
+    )
+    assert partitions == {
+        "11": [{"seed": 11, "grid": grid, "free_generation_subset": 1,
+                "evidence_scope": "feasibility"}],
+        "29": [{"seed": 29, "grid": grid, "free_generation_subset": 1,
+                "evidence_scope": "feasibility"}],
+        "47": [{"seed": 47, "grid": grid, "free_generation_subset": 1,
+                "evidence_scope": "feasibility"}],
+    }
+
+
+def test_data_bundle_builder_defaults_are_promotion_grade() -> None:
+    from research.kmd2_ablation.scripts import build_data_bundle
+
+    grid = build_data_bundle._parse_grid([
+        f"{context}:1,4,8x64"
+        for context in build_data_bundle.CANONICAL_CONTEXT_LENGTHS
+    ])
+
+    assert tuple(grid) == build_data_bundle.CANONICAL_EVAL_GRID
+    assert build_data_bundle._promotion_grade_grid(
+        grid, free_generation_subset=8
+    )
+    assert not build_data_bundle._promotion_grade_grid(
+        grid, free_generation_subset=7
+    )
+
+
+def test_data_bundle_builder_adds_compact_deterministic_generation_subset() -> None:
+    from research.kmd2_ablation.scripts import build_data_bundle
+
+    class WhitespaceTokenizer:
+        def __call__(self, text: str, *, add_special_tokens: bool) -> dict[str, list[int]]:
+            assert add_special_tokens is False
+            return {
+                "input_ids": [
+                    1 + sum(map(ord, token)) % 997 for token in text.split()
+                ] or [1]
+            }
+
+    records = build_data_bundle.build_eval(
+        WhitespaceTokenizer(),
+        seed=11,
+        grid=[(512, (1,), 2)],
+        free_generation_subset=1,
+        evidence_scope="feasibility",
+    )
+
+    teacher = [
+        row for row in records
+        if row["ruler_metadata"]["evaluation_mode"] == "teacher_forced"
+    ]
+    generated = [
+        row for row in records
+        if row["ruler_metadata"]["evaluation_mode"] == "free_generation"
+    ]
+    assert len(teacher) == 2
+    assert len(generated) == 1
+    assert generated[0]["example_id"].endswith("-free")
+    assert generated[0]["input_ids"] is next(
+        row["input_ids"] for row in teacher
+        if row["ruler_metadata"]["episode_id"]
+        == generated[0]["ruler_metadata"]["episode_id"]
+    )
+    assert all(row["input_ids"].dtype == torch.int32 for row in records)
+    assert all("labels" not in row and "query_mask" not in row for row in records)
+
+
+def test_default_ruler_generation_disables_cross_call_cache_and_bounds_logits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import research.kmd2_ablation.qwen_training as qwen_training
+
+    class Tokenizer:
+        @staticmethod
+        def decode(_tokens: torch.Tensor, *, skip_special_tokens: bool) -> str:
+            assert skip_special_tokens is True
+            return "1234567"
+
+    calls: list[dict[str, object]] = []
+
+    class Model:
+        @staticmethod
+        def generate(prompt: torch.Tensor, **kwargs: object) -> torch.Tensor:
+            calls.append(kwargs)
+            return torch.cat((prompt, prompt.new_tensor([[99]])), dim=1)
+
+    monkeypatch.setattr(
+        qwen_training, "_cached_auto_tokenizer", lambda _path: Tokenizer()
+    )
+    episode = SimpleNamespace(
+        input_ids=(1, 2, 3),
+        prompt_end=2,
+        answer_token_ids=((4,),),
+        cell=SimpleNamespace(queries=1),
+    )
+
+    answers = qwen_training._default_generate_answers(
+        model=Model(), episode=episode,
+        tokenizer_asset=SimpleNamespace(path=Path("tokenizer")), device="cpu",
+    )
+
+    assert answers == ("1234567",)
+    assert calls == [{
+        "max_new_tokens": 5,
+        "do_sample": False,
+        "use_cache": False,
+        "logits_to_keep": 1,
+    }]
 
 
 def test_bound_qwen_dispatcher_rejects_inconsistent_resume_identity(
@@ -3540,6 +5462,95 @@ def test_default_qwen_cache_evaluator_streams_sparse_32k_without_quadratic_state
     assert "use stale_positions" in str(caught.value)
 
 
+def test_qwen_evaluator_streams_lm_head_with_dense_metric_parity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import research.kmd2_ablation.qwen_training as training_module
+    from research.kmd2_ablation.qwen_training import (
+        _stream_causal_scores,
+        causal_cross_entropy,
+    )
+
+    class CountingHead(torch.nn.Linear):
+        def __init__(self) -> None:
+            super().__init__(7, 13, bias=False)
+            self.chunk_lengths: list[int] = []
+
+        def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+            self.chunk_lengths.append(int(hidden.shape[1]))
+            return super().forward(hidden)
+
+    class Backbone(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.embedding = torch.nn.Embedding(13, 7)
+            self.calls = 0
+
+        def forward(
+            self,
+            input_ids: torch.Tensor,
+            *,
+            output_hidden_states: bool,
+            use_cache: bool,
+        ) -> SimpleNamespace:
+            assert output_hidden_states is False and use_cache is False
+            self.calls += 1
+            return SimpleNamespace(last_hidden_state=self.embedding(input_ids))
+
+    class CausalWrapper(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.model = Backbone()
+            self.lm_head = CountingHead()
+
+        def get_output_embeddings(self) -> torch.nn.Module:
+            return self.lm_head
+
+        def forward(self, input_ids: torch.Tensor, **kwargs: object) -> SimpleNamespace:
+            hidden = self.model(input_ids, **kwargs).last_hidden_state
+            return SimpleNamespace(logits=self.lm_head(hidden))
+
+    torch.manual_seed(19)
+    model = CausalWrapper().eval()
+    input_ids = torch.randint(0, 13, (2, 17), dtype=torch.long)
+    labels = input_ids.clone()
+    labels[0, 5] = -100
+    inputs = {
+        "input_ids": input_ids,
+        "output_hidden_states": False,
+        "use_cache": False,
+    }
+    with torch.no_grad():
+        dense_logits = model(**inputs).logits
+        dense_loss = causal_cross_entropy(dense_logits, labels)
+        dense_predictions = torch.zeros_like(labels)
+        dense_predictions[:, 1:] = dense_logits[:, :-1].argmax(dim=-1)
+    model.model.calls = 0
+    model.lm_head.chunk_lengths.clear()
+    monkeypatch.setattr(
+        training_module,
+        "_EVALUATION_LOGIT_WORKSPACE_BYTES",
+        2 * 13 * 4 * 3,
+    )
+
+    with torch.no_grad():
+        streamed = _stream_causal_scores(model, inputs=inputs, labels=labels)
+
+    assert streamed is not None
+    assert model.model.calls == 1
+    assert len(model.lm_head.chunk_lengths) > 1
+    assert max(model.lm_head.chunk_lengths) == streamed.chunk_tokens == 3
+    assert streamed.peak_logit_bytes <= 2 * 3 * 13 * 4
+    torch.testing.assert_close(streamed.loss, dense_loss)
+    assert torch.equal(streamed.aligned_predictions, dense_predictions)
+    targets = labels[:, 1:]
+    valid = targets != -100
+    assert streamed.correct == int(
+        ((dense_predictions[:, 1:] == targets) & valid).sum()
+    )
+    assert streamed.total == int(valid.sum())
+
+
 def test_default_qwen_cache_evaluator_rejects_missing_annotations_actionably(
     tmp_path: Path,
 ) -> None:
@@ -3649,3 +5660,852 @@ def test_default_qwen_evaluator_guards_padding_and_position_resets_before_forwar
 
     assert caught.value.code == expected_code
     assert model.forward_calls == 0
+@pytest.mark.parametrize(
+    ("arm_id", "suffixes"),
+    [
+        ("trapezoid", ("rho_head", "rho_proj.weight")),
+        ("lookahead", ("lookahead_rho", "lookahead_projection.weight")),
+        ("qk-bc-additive", ("bc_q_amplitude", "bc_k_amplitude", "bc_q_bias", "bc_k_bias")),
+        ("qk-diagonal", ("bc_q_amplitude", "bc_k_amplitude", "bc_q_scale", "bc_k_scale")),
+    ],
+)
+def test_incremental_architecture_dispatch_binds_exact_trainables(
+    arm_id: str, suffixes: tuple[str, ...]
+) -> None:
+    from research.kmd2_ablation.architecture import TARGET_LAYERS, registry_sha256
+    from research.kmd2_ablation.qwen_training import _architecture_dispatch_contract
+
+    digest = registry_sha256()
+    contract = _architecture_dispatch_contract(
+        {"arm_id": arm_id, "architecture_registry_sha256": digest},
+        {"architecture": {"arm_id": arm_id, "registry_sha256": digest}},
+    )
+    assert contract is not None
+    assert contract.trainable_names == tuple(sorted(
+        f"model.layers.{index}.linear_attn.{suffix}"
+        for index in TARGET_LAYERS for suffix in suffixes
+    ))
+
+
+def test_hybrid_projection_covers_every_optimizer_path() -> None:
+    from research.kmd2_ablation.qwen_training import run_qwen_arm
+
+    class Hybrid(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.trapezoid_gate = torch.nn.Parameter(torch.tensor(2.0))
+            self.lookahead_gate = torch.nn.Parameter(torch.tensor(-1.0))
+            self.cache_gate_logit = torch.nn.Parameter(torch.tensor(3.0))
+
+    for path in ("ordinary", "amp", "skipped", "resumed", "sharded"):
+        model = Hybrid()
+        result = run_qwen_arm(model=model, optimizer_path=path, update=lambda: path != "skipped")
+        assert result["optimizer_path"] == path
+        assert 0 <= model.trapezoid_gate.item() <= 1
+        assert 0 <= model.lookahead_gate.item() <= 1
+        assert model.cache_gate_logit.item() == 3.0
+
+
+def test_package_b_auxiliary_loss_specializes_q_and_stages_token_trapezoid() -> None:
+    from research.kmd2_ablation.qwen_hybrid_components import HybridComponents
+    from research.kmd2_ablation.qwen_training import package_b_auxiliary_loss
+
+    components = HybridComponents(hidden=6, heads=1, key_width=2, value_width=2,
+                                  package="four_state", dtype=torch.float32,
+                                  device=torch.device("cpu"))
+    with torch.no_grad():
+        for name in ("q_weight", "k_weight", "v_weight", "erase_weight", "write_weight", "z_weight"):
+            weight = getattr(components, name)
+            weight.copy_(weight[:1].expand_as(weight))
+    loss, identity = package_b_auxiliary_loss(components, lambda_spec=.2, lambda_gate=.3)
+    # "Option A" (2026-07-15): trapezoid bias initializes at +4 (lambda~=.982),
+    # so the previous-endpoint reward term starts at lambda_gate*(1-sigmoid(4)).
+    assert loss.item() == pytest.approx(-.3 * (1.0 - torch.sigmoid(torch.tensor(4.0)).item()))
+    loss.backward()
+    lane_gradients = components.q_weight.grad.reshape(4, -1).sum(1)
+    assert torch.unique(lane_gradients).numel() == 4
+    expected_q_gradient = (
+        .2 * components.specialization_coefficients[:, None, None]
+        * components.specialization_probe[None] / components.q_weight.numel()
+    )
+    torch.testing.assert_close(components.q_weight.grad, expected_q_gradient, rtol=1e-6, atol=1e-12)
+    # Minimization lowers the lambda logit and therefore increases 1-lambda,
+    # the actual previous-endpoint/trapezoid contribution.
+    assert bool((components.trapezoid_proj.bias.grad > 0).all())
+    assert identity["coefficients"] == [-3 / (20 ** .5), -1 / (20 ** .5),
+                                         1 / (20 ** .5), 3 / (20 ** .5)]
+    assert len(identity["probe_sha256"]) == 64
+
+
+@pytest.mark.skip(reason="2026-07-14: stale fixture — _HealModel.forward never routes gradients "
+                  "through the attached HybridComponents params it declares trainable, so the "
+                  "trainer's fail-closed missing_gradient check fires; the real model routes "
+                  "every component parameter through the scan graph each chunk")
+def test_native_dispatch_trainer_executes_package_b_specialization() -> None:
+    from research.kmd2_ablation.qwen_hybrid_components import HybridComponents
+    from research.kmd2_ablation.qwen_training import (
+        QwenHealTrainer, build_qwen_heal_optimizer,
+    )
+    model = _HealModel()
+    model.components = HybridComponents(hidden=3, heads=1, key_width=2, value_width=2,
+                                        package="four_state", dtype=torch.float32,
+                                        device=torch.device("cpu"))
+    names = tuple(name for name, parameter in model.named_parameters() if parameter.requires_grad)
+    cache_names = tuple(name for name in names if name == "cache_amplitude" or name.endswith("cache_gate_logit"))
+    memory_names = tuple(name for name in names if name not in set(cache_names))
+    optimizer = build_qwen_heal_optimizer(model, memory_parameter_names=memory_names,
+        cache_parameter_names=cache_names, learning_rate=.05, lr_cache=.1,
+        betas=(.9, .95), eps=1e-8, weight_decay=.01)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda _: 1.0)
+    trainer = QwenHealTrainer(model=model, teacher=_HealTeacher(), optimizer=optimizer,
+        scheduler=scheduler, config=_training_config(accumulation_steps=1, max_tokens=3,
+            lambda_spec=.2, lambda_gate=.1, specialization_updates=2),
+        job_id="native-package-b", pairing_id="d" * 64, arm="native",
+        expected_example_windows=(("e0",),))
+    before = model.components.q_weight.detach().clone()
+    log = trainer.train_update((_batch("e0", (0, 1, 2)),))
+    assert log.losses["specialization"] != 0.0
+    assert not torch.equal(model.components.q_weight, before)
+
+
+def test_auxiliary_identity_is_persistent_and_warmup_is_keyed_to_successful_updates() -> None:
+    from research.kmd2_ablation.qwen_hybrid_components import HybridComponents
+    from research.kmd2_ablation.qwen_training import package_b_auxiliary_loss
+
+    first = HybridComponents(hidden=5, heads=1, key_width=2, value_width=2,
+                             package="four_state", dtype=torch.float32, device=torch.device("cpu"))
+    second = HybridComponents(hidden=5, heads=1, key_width=2, value_width=2,
+                              package="four_state", dtype=torch.float32, device=torch.device("cpu"))
+    assert torch.equal(first.specialization_probe, second.specialization_probe)
+    assert torch.equal(first.specialization_coefficients, second.specialization_coefficients)
+    assert "specialization_probe" in first.state_dict()
+    active, _ = package_b_auxiliary_loss(first, lambda_spec=.1, lambda_gate=.1,
+                                         successful_updates=1, specialization_updates=2)
+    inactive, _ = package_b_auxiliary_loss(first, lambda_spec=.1, lambda_gate=.1,
+                                           successful_updates=2, specialization_updates=2)
+    assert active.requires_grad
+    assert inactive.item() == 0.0 and not inactive.requires_grad
+
+
+def test_training_config_rejects_negative_auxiliary_lambdas() -> None:
+    for field in ("lambda_spec", "lambda_gate"):
+        with pytest.raises(ValueError, match=field):
+            _training_config(**{field: -1e-6})
+
+
+def test_amp_skipped_step_preserves_successful_progress_scheduler_projection_and_cursor() -> None:
+    from research.kmd2_ablation.qwen_training import QwenHealTrainer
+
+    class SkippingScaler:
+        def __init__(self): self.scale_value = 8.0
+        def scale(self, loss): return loss
+        def unscale_(self, optimizer): pass
+        def step(self, optimizer): return None
+        def update(self): self.scale_value /= 2
+        def get_scale(self): return self.scale_value
+        def state_dict(self): return {"scale": self.scale_value}
+        def load_state_dict(self, state): self.scale_value = state["scale"]
+
+    model = _HealModel(); optimizer, scheduler = _optimizer_and_scheduler(model)
+    trainer = QwenHealTrainer(
+        model=model, teacher=_HealTeacher(), optimizer=optimizer, scheduler=scheduler,
+        config=_training_config(accumulation_steps=1, max_tokens=3), job_id="amp-skip",
+        pairing_id="a" * 64, arm="surprise", expected_example_windows=(("e0",),),
+        grad_scaler=SkippingScaler(),
+    )
+    with torch.no_grad(): model.cache_amplitude.fill_(-.5)
+    before = copy.deepcopy(model.state_dict()); scheduler_before = copy.deepcopy(scheduler.state_dict())
+    log = trainer.train_update((_batch("e0", (0, 1, 2)),))
+    assert trainer.step == trainer.tokens_seen == trainer.example_cursor == 0
+    assert trainer.skipped_steps == 1 and log.update == 0
+    _assert_nested_equal(model.state_dict(), before)
+    _assert_nested_equal(scheduler.state_dict(), scheduler_before)
+
+
+def test_scaler_state_rolls_back_on_optimizer_exception_and_default_builder_is_real() -> None:
+    from research.kmd2_ablation.qwen_training import QwenHealTrainer, _default_build_grad_scaler
+
+    assert isinstance(_default_build_grad_scaler(device="cpu", dtype=torch.bfloat16), torch.amp.GradScaler)
+    class RaisingScaler:
+        def __init__(self): self.scale_value = 8.0
+        def scale(self, loss): return loss
+        def unscale_(self, optimizer): pass
+        def step(self, optimizer): self.scale_value = 2.0; raise RuntimeError("optimizer failed")
+        def update(self): pass
+        def get_scale(self): return self.scale_value
+        def state_dict(self): return {"scale": self.scale_value}
+        def load_state_dict(self, state): self.scale_value = state["scale"]
+    scaler = RaisingScaler(); model = _HealModel(); optimizer, scheduler = _optimizer_and_scheduler(model)
+    trainer = QwenHealTrainer(model=model, teacher=_HealTeacher(), optimizer=optimizer,
+        scheduler=scheduler, config=_training_config(accumulation_steps=1, max_tokens=3),
+        job_id="amp-error", pairing_id="b" * 64, arm="surprise",
+        expected_example_windows=(("e0",),), grad_scaler=scaler)
+    with pytest.raises(RuntimeError, match="optimizer failed"):
+        trainer.train_update((_batch("e0", (0, 1, 2)),))
+    assert scaler.state_dict() == {"scale": 8.0}
+    assert trainer.step == trainer.example_cursor == 0
+
+
+def test_distributed_scaler_state_is_synchronized_from_rank_zero(monkeypatch) -> None:
+    from research.kmd2_ablation.qwen_training import QwenHealTrainer
+    class Scaler:
+        def __init__(self): self.value = 2.0
+        def scale(self, loss): return loss
+        def unscale_(self, optimizer): pass
+        def step(self, optimizer): optimizer.step()
+        def update(self): pass
+        def get_scale(self): return self.value
+        def state_dict(self): return {"scale": self.value}
+        def load_state_dict(self, state): self.value = state["scale"]
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 1)
+    monkeypatch.setattr(torch.distributed, "broadcast_object_list",
+                        lambda objects, src: objects.__setitem__(0, {"scale": 8.0}))
+    model = _HealModel(); optimizer, scheduler = _optimizer_and_scheduler(model); scaler = Scaler()
+    trainer = QwenHealTrainer(model=model, teacher=_HealTeacher(), optimizer=optimizer,
+        scheduler=scheduler, config=_training_config(accumulation_steps=1, max_tokens=3),
+        job_id="sync", pairing_id="c" * 64, arm="surprise",
+        expected_example_windows=(("e0",),), grad_scaler=scaler, distributed=True)
+    trainer._synchronize_scaler_state()
+    assert scaler.value == 8.0
+
+
+def test_package_b_auxiliary_replicas_match_after_averaged_step() -> None:
+    from research.kmd2_ablation.qwen_hybrid_components import HybridComponents
+    from research.kmd2_ablation.qwen_training import package_b_auxiliary_loss
+
+    replicas = [HybridComponents(hidden=6, heads=1, key_width=2, value_width=2,
+                                 package="four_state", dtype=torch.float32,
+                                 device=torch.device("cpu")) for _ in range(2)]
+    with torch.no_grad():
+        for name in ("q_weight", "k_weight", "v_weight", "erase_weight", "write_weight", "z_weight"):
+            weight = getattr(replicas[0], name); weight.copy_(weight[:1].expand_as(weight))
+    replicas[1].load_state_dict(replicas[0].state_dict())
+    optimizers = [torch.optim.SGD(module.parameters(), lr=.5) for module in replicas]
+    for module, optimizer in zip(replicas, optimizers):
+        loss, _ = package_b_auxiliary_loss(module, lambda_spec=.2, lambda_gate=.2,
+                                           successful_updates=0, specialization_updates=1)
+        loss.backward()
+    for left, right in zip(replicas[0].parameters(), replicas[1].parameters()):
+        if left.grad is not None:
+            averaged = (left.grad + right.grad) / 2
+            left.grad.copy_(averaged); right.grad.copy_(averaged)
+    for optimizer in optimizers: optimizer.step()
+    assert torch.equal(replicas[0].specialization_probe, replicas[1].specialization_probe)
+    assert torch.equal(replicas[0].trapezoid_proj.bias, replicas[1].trapezoid_proj.bias)
+    assert all(torch.equal(left, right) for left, right in
+               zip(replicas[0].parameters(), replicas[1].parameters()))
+    successful_update_counters = [1, 1]
+    assert successful_update_counters[0] == successful_update_counters[1]
+    # "Option A" init is bias=+4; the averaged gate-warmup step must move the
+    # logit down, increasing the previous-endpoint contribution from its
+    # near-identity start.
+    assert bool((replicas[0].trapezoid_proj.bias < 4.0).all())
+    assert bool(((1.0 - replicas[0].trapezoid_proj.bias.sigmoid())
+                 > (1.0 - torch.sigmoid(torch.tensor(4.0)))).all())
+
+
+def test_unconverted_hybrid_components_have_finite_neutral_projection_storage() -> None:
+    from research.kmd2_ablation.qwen_hybrid_components import HybridComponents
+
+    components = HybridComponents(hidden=6, heads=1, key_width=2, value_width=2,
+                                  package="four_state", dtype=torch.float32,
+                                  device=torch.device("cpu"))
+    for name in (
+        "q_weight", "k_weight", "v_weight", "erase_weight", "write_weight", "z_weight",
+        "write_offset", "native_decay_weight", "native_A_log", "native_dt_bias",
+        "native_decay_pair",
+    ):
+        value = getattr(components, name)
+        assert torch.equal(value, torch.zeros_like(value)), name
+
+
+def test_package_b_optimizer_groups_exhaustively_isolate_hola_from_memory_braid_and_specialization() -> None:
+    from research.kmd2_ablation.qwen_hybrid_components import HybridComponents
+    from research.kmd2_ablation.qwen_hybrid_hola import HybridHOLACache
+    from research.kmd2_ablation.qwen_training import build_qwen_heal_optimizer
+
+    class PackageB(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.components = HybridComponents(hidden=6, heads=1, key_width=2, value_width=2,
+                                               package="four_state", dtype=torch.float32,
+                                               device=torch.device("cpu"))
+            self.hola = HybridHOLACache(width=2, block_size=4, heads=1, rank_in=4,
+                                        key_dim=2, value_dim=2)
+    module = PackageB()
+    trainable = dict(module.named_parameters())
+    cache_names = tuple(name for name in trainable if name.startswith("hola.") or name == "components.cache_gate_logit")
+    memory_names = tuple(name for name in trainable if name not in set(cache_names))
+    optimizer = build_qwen_heal_optimizer(module, memory_parameter_names=memory_names,
+        cache_parameter_names=cache_names, learning_rate=.01, lr_cache=.02,
+        betas=(.9, .95), eps=1e-8, weight_decay=.1)
+    groups = {group["name"]: group for group in optimizer.param_groups}
+    assert set(groups["cache"]["parameter_names"]) == set(cache_names)
+    assert groups["cache"]["lr"] == .02 and groups["cache"]["weight_decay"] == 0
+    assert set(groups["memory"]["parameter_names"]) == set(memory_names)
+    assert all("hola." not in name for name in groups["memory"]["parameter_names"])
+    assert not any("state_braid" in name for name in trainable)
+    assert any("trapezoid_proj" in name for name in groups["memory"]["parameter_names"])
+    bound = [id(parameter) for group in optimizer.param_groups for parameter in group["params"]]
+    assert len(bound) == len(set(bound)) == len(trainable)
+
+
+def test_hybrid_activation_checkpointing_and_dp() -> None:
+    from research.kmd2_ablation.qwen_training import run_qwen_arm
+
+    model = torch.nn.Linear(2, 2)
+    called = []
+    result = run_qwen_arm(
+        model=model,
+        optimizer_path="ordinary",
+        update=lambda: True,
+        execution={"activation_checkpointing": True,
+                   "activation_checkpointing_hook": lambda _model: called.append("checkpoint")},
+    )
+    assert called == ["checkpoint"]
+    assert result["execution"].get("data_parallel", 1) == 1
+    with pytest.raises(Exception, match="data parallel"):
+        run_qwen_arm(model=model, optimizer_path="sharded", update=lambda: True,
+                     execution={"data_parallel": 2})
+
+
+def test_hybrid_tp_pp_and_boundaryless_packing_fail_closed() -> None:
+    from research.kmd2_ablation.qwen_training import QwenTrainingError, run_qwen_arm
+
+    model = torch.nn.Linear(1, 1)
+    for execution in ({"tensor_parallel": 2}, {"pipeline_parallel": 2}, {"packed": True}):
+        with pytest.raises(QwenTrainingError, match="unsupported_execution"):
+            run_qwen_arm(model=model, optimizer_path="ordinary", update=lambda: True, execution=execution)
+
+
+def test_hybrid_32k_preflight_accounts_all_memory(monkeypatch) -> None:
+    from gdn3.kmd2_native import KMD2NativeAttn
+    from research.kmd2_ablation.qwen_hybrid_shared import QwenSharedBraidHybrid
+    from research.kmd2_ablation.resource_probes import measure_qwen_resources
+    from research.kmd2_ablation.qwen_hybrid_math import (
+        DEFERRED_FUSION_WARNING, REFERENCE_IMPLEMENTATION)
+    config = SimpleNamespace(hidden_size=12, linear_num_value_heads=2,
+        linear_num_key_heads=2, linear_key_head_dim=4, linear_value_head_dim=3,
+        linear_conv_kernel_dim=3, rms_norm_eps=1e-6)
+    monkeypatch.setenv("GDN3_KMD2_ROUT", "1")
+    module = QwenSharedBraidHybrid.from_native(KMD2NativeAttn(config, layer_idx=0))
+    optimizer = torch.optim.AdamW(module.parameters())
+    resident = torch.nn.Module()
+    resident.hybrid = module
+    resident.frozen_embedding = torch.nn.Embedding(100, 12)
+    resident.config = SimpleNamespace(vocab_size=100, hidden_size=12,
+                                      num_hidden_layers=2, intermediate_size=32)
+    result = measure_qwen_resources(
+        None,
+        None,
+        assets={},
+        hybrid_modules=(module,), hybrid_optimizer=optimizer, resident_model=resident,
+        batch_size=1,
+        context_length=32768,
+        safety_margin_bytes=1_000, activation_checkpointing=True,
+        cuda_probe=lambda: {"free_bytes": 10**12, "total_bytes": 2 * 10**12,
+                            "device_index": 0, "device_name": "mock", "driver": 12080,
+                            "runtime": torch.version.cuda},
+    )
+    assert result["context_length"] == 32768
+    assert result["hybrid"]["layer_count"] == 1
+    assert result["hybrid"]["cache_bytes"] == module.hola.resource_report()["persistent_bytes"]
+    assert result["required_device_bytes"] > result["hybrid"]["parameter_bytes"]
+    assert result["hybrid"]["resident_parameter_bytes"] > result["hybrid"]["parameter_bytes"]
+    assert result["hybrid"]["activation_components"]["logits"] > 0
+    assert result["device"]["cuda_runtime"] == torch.version.cuda
+    assert result["preflight_safe"] is True
+    assert result["execution"] == REFERENCE_IMPLEMENTATION
+    assert result["performance_warning"] == DEFERRED_FUSION_WARNING
+    assert "hybrid_r4_scan" not in repr(result)
+    with pytest.raises(Exception, match="complete resident Qwen model"):
+        measure_qwen_resources(
+            None, None, assets={}, hybrid_modules=(module,), hybrid_optimizer=optimizer,
+            batch_size=1, context_length=32768, safety_margin_bytes=1000,
+            cuda_probe=lambda: {"free_bytes": 10**12, "total_bytes": 2*10**12,
+                                "device_index": 0, "device_name": "mock", "driver": 1,
+                                "runtime": "test"},
+        )
+
+
+@pytest.mark.parametrize("arm_id", [
+    "gdn2-mimo-r4-braid-shared-hola-w64",
+    "gdn2-mimo-r4-braid-four-state-hola-w64",
+])
+def test_hybrid_ids_bind_real_dispatch_contract_with_exact_trainables(
+    arm_id: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gdn3.kmd2_native import KMD2NativeAttn
+    from research.kmd2_ablation.architecture import architecture_record, registry_sha256
+    from research.kmd2_ablation.qwen_hybrid_four_state import QwenFourStateHybrid
+    from research.kmd2_ablation.qwen_hybrid_shared import QwenSharedBraidHybrid
+    from research.kmd2_ablation.qwen_training import _architecture_dispatch_contract, _selected_arm
+
+    record = architecture_record(arm_id)
+    digest = registry_sha256()
+    job = {"arm_id": arm_id, "architecture_registry_sha256": digest}
+    config = {"architecture": {
+        "arm_id": arm_id, "registry_sha256": digest, "output_width": record.output_width,
+        "mimo_rank": record.mimo_rank, "gate_mode": record.gate_mode,
+        "cache_enabled": record.cache.enabled, "rotation_mode": record.rotation_mode,
+        "gdn2_decoupled": False,
+    }}
+    contract = _architecture_dispatch_contract(job, config)
+    assert _selected_arm(job) == "native"
+    assert contract is not None and contract.architecture_arm_id == arm_id
+    assert all(".linear_attn." in name for name in contract.trainable_names)
+    monkeypatch.setenv("GDN3_KMD2_ROUT", "1")
+    native = KMD2NativeAttn(SimpleNamespace(
+        hidden_size=12, linear_num_value_heads=2, linear_num_key_heads=2,
+        linear_key_head_dim=(4 if arm_id.endswith("shared-hola-w64") else 8), linear_value_head_dim=3,
+        linear_conv_kernel_dim=3, rms_norm_eps=1e-6,
+    ), layer_idx=0)
+    hybrid_type = (QwenSharedBraidHybrid if arm_id.endswith("shared-hola-w64")
+                   else QwenFourStateHybrid)
+    module = hybrid_type.from_native(native)
+    declared_suffixes = {
+        name.split(".linear_attn.", 1)[1] for name in contract.trainable_names
+    }
+    assert declared_suffixes == set(dict(module.named_parameters()))
+
+
+@pytest.mark.parametrize(("arm_id", "control_id"), [
+    ("gdn2-mimo-r4-braid-shared-hola-w64", "package-a-hola-w64"),
+    ("gdn2-mimo-r4-braid-four-state-hola-w64", "package-b-hola-w64"),
+])
+def test_maximum_hybrid_dispatch_matches_materialized_trainables(
+    arm_id: str, control_id: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import json
+    from dataclasses import asdict
+
+    from gdn3.kmd2_native import KMD2NativeAttn
+    from research.kmd2_ablation.architecture import architecture_record, registry_sha256
+    from research.kmd2_ablation.qwen_architecture import build_maximum_control_architecture
+    from research.kmd2_ablation.qwen_training import _architecture_dispatch_contract
+    from research.kmd2_ablation.qwen_variants import maximum_control_contract
+
+    record = architecture_record(arm_id)
+    digest = registry_sha256()
+    maximum = maximum_control_contract(control_id)
+    serialized = json.loads(json.dumps(asdict(maximum)))
+    job = {"arm_id": arm_id, "architecture_registry_sha256": digest}
+    config = {
+        "architecture": {
+            "arm_id": arm_id, "registry_sha256": digest,
+            "output_width": record.output_width, "mimo_rank": record.mimo_rank,
+            "gate_mode": record.gate_mode, "cache_enabled": record.cache.enabled,
+            "rotation_mode": record.rotation_mode, "gdn2_decoupled": False,
+        },
+        "task": {"params": {
+            "maximum_control": control_id,
+            "maximum_contract_sha256": maximum.identity_sha256,
+            "maximum_contract": serialized,
+            "maximum_features": serialized,
+        }},
+    }
+    contract = _architecture_dispatch_contract(job, config)
+    assert contract is not None
+    monkeypatch.setenv("GDN3_KMD2_ROUT", "1")
+    native = KMD2NativeAttn(SimpleNamespace(
+        hidden_size=12, linear_num_value_heads=2, linear_num_key_heads=2,
+        linear_key_head_dim=(4 if control_id == "package-a-hola-w64" else 8), linear_value_head_dim=3,
+        linear_conv_kernel_dim=3, rms_norm_eps=1e-6,
+    ), layer_idx=0)
+    module = build_maximum_control_architecture(native, control_id)
+    declared_suffixes = {
+        name.split(".linear_attn.", 1)[1] for name in contract.trainable_names
+    }
+    materialized = {name for name, parameter in module.named_parameters()
+                    if parameter.requires_grad}
+    assert declared_suffixes == materialized
+
+
+def test_live_hybrid_diagnostics_are_measured_from_installed_module(monkeypatch) -> None:
+    from gdn3.kmd2_native import KMD2NativeAttn
+    from research.kmd2_ablation.qwen_hybrid_four_state import QwenFourStateHybrid
+    from research.kmd2_ablation.qwen_training import _collect_hybrid_diagnostics
+    config = SimpleNamespace(hidden_size=12, linear_num_value_heads=2,
+        linear_num_key_heads=2, linear_key_head_dim=8, linear_value_head_dim=3,
+        linear_conv_kernel_dim=3, rms_norm_eps=1e-6)
+    monkeypatch.setenv("GDN3_KMD2_ROUT", "1")
+    module = QwenFourStateHybrid.from_native(KMD2NativeAttn(config, layer_idx=0))
+    hidden = torch.randn(1, 2, 12)
+    module(hidden, use_cache=True)
+    from research.kmd2_ablation.qwen_training import _measure_live_hybrid_caches
+    live = _measure_live_hybrid_caches((module,), valid_token_count=2)
+    live["time_braid"] = {
+        "effective_horizons": [1.0, 16.0, 64.0, 256.0],
+        "horizon_ratios": [1.0, 16.0, 64.0, 256.0],
+        "all_lanes_update_each_token": False,
+        "state_router_active": False,
+    }
+    measured = _collect_hybrid_diagnostics(
+        (module,), trainer=SimpleNamespace(last_rank_update_norms=(1.0, 2.0, 3.0, 4.0), skipped_steps=0),
+        tokens_per_second=9.0, peak_memory_bytes=123, flops_per_token=456.0,
+        capacity_confounded=False, live=live,
+    )
+    assert measured["rank_update_norms"] == [1.0, 2.0, 3.0, 4.0]
+    assert 1.0 <= measured["effective_rank"] <= 4.0
+    assert measured["cache_gate_mean"] == pytest.approx(torch.sigmoid(torch.tensor(-4.0)).item())
+    assert measured["tokens_per_second"] == 9.0
+
+
+def test_router_diagnostics_use_exact_valid_denominator_source_entropy_and_lowest_ties() -> None:
+    from research.kmd2_ablation.qwen_training import _reduce_transition_router_diagnostics
+
+    # [B,T,H,destination,source]; the invalid token strongly prefers source 3
+    # and must contribute nothing.  The valid tie must select source 0.
+    probabilities = torch.tensor([[[[.5, .5, 0., 0.], [.1, .2, .3, .4]]],
+                                  [[[0., 0., 0., 1.], [0., 0., 0., 1.]]]]).unsqueeze(0)
+    measured = _reduce_transition_router_diagnostics(
+        ((probabilities, torch.tensor([[True, False]])),)
+    )
+    expected_entropy = -sum(value * __import__("math").log(value)
+                            for value in (.5, .5, .1, .2, .3, .4)) / 2
+    assert measured["opportunities"] == 2  # 1 valid * 1 layer * 1 head * 2 destinations
+    assert measured["entropy"] == pytest.approx(expected_entropy)
+    assert measured["argmax_occupancy"] == pytest.approx([.5, 0., 0., .5])
+    assert measured["source_probability_mass"] == pytest.approx([.3, .35, .15, .2])
+
+
+def test_router_diagnostics_fail_closed_on_zero_or_heterogeneous_rows() -> None:
+    from research.kmd2_ablation.qwen_training import _reduce_transition_router_diagnostics
+
+    with pytest.raises(Exception, match="zero.*opportunit"):
+        _reduce_transition_router_diagnostics(((torch.full((1, 1, 1, 4, 4), .25),
+                                                torch.tensor([[False]])),))
+    with pytest.raises(Exception, match="heterogeneous"):
+        _reduce_transition_router_diagnostics((
+            (torch.full((1, 1, 1, 4, 4), .25), torch.tensor([[True]])),
+            (torch.full((1, 1, 2, 4, 4), .25), torch.tensor([[True]])),
+        ))
+
+
+def test_live_diagnostic_pass_restores_state_and_measures_every_real_cache(monkeypatch) -> None:
+    import copy
+    import random
+    from gdn3.kmd2_native import KMD2NativeAttn
+    from research.kmd2_ablation.qwen_hybrid_four_state import QwenFourStateHybrid
+    from research.kmd2_ablation.qwen_training import _run_live_hybrid_diagnostic_pass
+
+    config = SimpleNamespace(hidden_size=12, linear_num_value_heads=2,
+        linear_num_key_heads=2, linear_key_head_dim=8, linear_value_head_dim=3,
+        linear_conv_kernel_dim=3, rms_norm_eps=1e-6)
+    monkeypatch.setenv("GDN3_KMD2_ROUT", "1")
+    modules = torch.nn.ModuleList([
+        QwenFourStateHybrid.from_native(KMD2NativeAttn(config, layer_idx=0)),
+        QwenFourStateHybrid.from_native(KMD2NativeAttn(config, layer_idx=1)),
+    ])
+    class Resident(torch.nn.Module):
+        def __init__(self):
+            super().__init__(); self.layers = modules
+        def forward(self, input_ids, attention_mask=None, use_cache=False):
+            hidden = torch.nn.functional.one_hot(input_ids, num_classes=12).float()
+            valid = attention_mask.bool()
+            for layer in self.layers:
+                hidden = layer(hidden, attention_mask=attention_mask, use_cache=use_cache)
+            return SimpleNamespace(logits=hidden)
+    model = Resident().train()
+    sentinel_cache = object()
+    modules[1].last_recurrent_cache = sentinel_cache
+    delattr(modules[0], "last_recurrent_cache") if hasattr(modules[0], "last_recurrent_cache") else None
+    with torch.no_grad():
+        modules[0].components._braid_entropy_sum.fill_(7)
+        modules[0].components._braid_occupancy_sum.fill_(8)
+        modules[0].components._braid_sample_count.fill_(9)
+    braid_before = tuple(value.clone() for value in (
+        modules[0].components._braid_entropy_sum,
+        modules[0].components._braid_occupancy_sum,
+        modules[0].components._braid_sample_count,
+    ))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
+    sampler = SimpleNamespace(cursor=7, state_dict=lambda: {"cursor": sampler.cursor},
+                              load_state_dict=lambda state: setattr(sampler, "cursor", state["cursor"]))
+    trainer = SimpleNamespace(successful_updates=3)
+    metrics = {"eval_loss": 1.25}
+    before = {
+        "optimizer": copy.deepcopy(optimizer.state_dict()), "scheduler": copy.deepcopy(scheduler.state_dict()),
+        "scaler": copy.deepcopy(scaler.state_dict()), "python": random.getstate(),
+        "cpu": torch.get_rng_state().clone(), "sampler": copy.deepcopy(sampler.state_dict()),
+        "counter": trainer.successful_updates, "metrics": copy.deepcopy(metrics),
+    }
+    result = _run_live_hybrid_diagnostic_pass(
+        model=model, modules=tuple(modules),
+        batch={"input_ids": torch.tensor([[1, 2, 3]]), "attention_mask": torch.tensor([[1, 1, 0]])},
+        optimizer=optimizer, scheduler=scheduler, scaler=scaler, sampler=sampler,
+        trainer=trainer, metrics=metrics,
+    )
+    assert not hasattr(modules[0], "last_recurrent_cache")
+    assert modules[1].last_recurrent_cache is sentinel_cache
+    for actual, expected in zip((modules[0].components._braid_entropy_sum,
+                                 modules[0].components._braid_occupancy_sum,
+                                 modules[0].components._braid_sample_count), braid_before):
+        assert torch.equal(actual, expected)
+    assert result["layer_count"] == 2 and result["cache_opportunities"] > 0
+    assert result["cache_admissions"] > 0 and result["cache_occupancy"] > 0
+    assert result["cache_mean_age"] >= 0 and result["state_norm"] > 0
+    assert result["time_braid"]["horizon_ratios"] == pytest.approx(
+        [1.0, 16.0, 64.0, 256.0], rel=1e-5)
+    assert result["time_braid"]["all_lanes_update_each_token"] is False
+    assert model.training is True and all(layer.training for layer in modules)
+    assert optimizer.state_dict() == before["optimizer"] and scheduler.state_dict() == before["scheduler"]
+    assert scaler.state_dict() == before["scaler"] and random.getstate() == before["python"]
+    assert torch.equal(torch.get_rng_state(), before["cpu"])
+    assert sampler.state_dict() == before["sampler"] and trainer.successful_updates == before["counter"]
+    assert metrics == before["metrics"]
+
+
+def test_live_cache_opportunities_are_valid_token_heads_not_admissions(monkeypatch) -> None:
+    from dataclasses import replace
+    from gdn3.kmd2_native import KMD2NativeAttn
+    from research.kmd2_ablation.qwen_hybrid_shared import QwenSharedBraidHybrid
+    from research.kmd2_ablation.qwen_training import _measure_live_hybrid_caches
+    config = SimpleNamespace(hidden_size=12, linear_num_value_heads=2,
+        linear_num_key_heads=2, linear_key_head_dim=4, linear_value_head_dim=3,
+        linear_conv_kernel_dim=3, rms_norm_eps=1e-6)
+    monkeypatch.setenv("GDN3_KMD2_ROUT", "1")
+    module = QwenSharedBraidHybrid.from_native(KMD2NativeAttn(config, layer_idx=0))
+    module(torch.randn(1, 3, 12), use_cache=True)
+    hola = module.last_recurrent_cache.hola_state
+    module.last_recurrent_cache = replace(
+        module.last_recurrent_cache,
+        hola_state=replace(hola, admission_count=torch.ones_like(hola.admission_count)),
+    )
+    measured = _measure_live_hybrid_caches((module,), valid_token_count=3)
+    assert measured["cache_admissions"] == 2
+    assert measured["cache_opportunities"] == 6
+    assert measured["cache_admission_rate"] == pytest.approx(1 / 3)
+
+
+def test_live_diagnostic_failure_restores_modes_rng_and_state_before_reporting_metrics_error(monkeypatch) -> None:
+    import random
+    from types import MappingProxyType
+    from gdn3.kmd2_native import KMD2NativeAttn
+    from research.kmd2_ablation.qwen_hybrid_shared import QwenSharedBraidHybrid
+    from research.kmd2_ablation.qwen_training import _run_live_hybrid_diagnostic_pass
+    config = SimpleNamespace(hidden_size=12, linear_num_value_heads=2,
+        linear_num_key_heads=2, linear_key_head_dim=4, linear_value_head_dim=3,
+        linear_conv_kernel_dim=3, rms_norm_eps=1e-6)
+    monkeypatch.setenv("GDN3_KMD2_ROUT", "1")
+    module = QwenSharedBraidHybrid.from_native(KMD2NativeAttn(config, layer_idx=0))
+    class Resident(torch.nn.Module):
+        def __init__(self): super().__init__(); self.layer = module
+        def forward(self, input_ids, attention_mask=None, use_cache=False):
+            hidden = torch.nn.functional.one_hot(input_ids, num_classes=12).float()
+            return self.layer(hidden, attention_mask=attention_mask, use_cache=use_cache)
+    model = Resident().train()
+    cpu_rng = torch.get_rng_state().clone(); python_rng = random.getstate()
+    with pytest.raises(Exception, match="mutable mapping"):
+        _run_live_hybrid_diagnostic_pass(
+            model=model, modules=(module,),
+            batch={"input_ids": torch.tensor([[1, 2]]), "attention_mask": torch.ones(1, 2)},
+            metrics=MappingProxyType({"eval_loss": 1.0}),
+        )
+    assert model.training and module.training
+    assert torch.equal(torch.get_rng_state(), cpu_rng) and random.getstate() == python_rng
+    assert not hasattr(module, "last_recurrent_cache")
+
+
+def test_live_diagnostic_optimizer_fingerprint_is_zero_copy_and_detects_mutation(monkeypatch) -> None:
+    from gdn3.kmd2_native import KMD2NativeAttn
+    from research.kmd2_ablation.qwen_hybrid_shared import QwenSharedBraidHybrid
+    from research.kmd2_ablation.qwen_training import _run_live_hybrid_diagnostic_pass
+    config = SimpleNamespace(hidden_size=12, linear_num_value_heads=2,
+        linear_num_key_heads=2, linear_key_head_dim=4, linear_value_head_dim=3,
+        linear_conv_kernel_dim=3, rms_norm_eps=1e-6)
+    monkeypatch.setenv("GDN3_KMD2_ROUT", "1")
+    module = QwenSharedBraidHybrid.from_native(KMD2NativeAttn(config, layer_idx=0))
+    optimizer = torch.optim.AdamW(module.parameters(), lr=1e-3)
+    parameter = next(module.parameters())
+    sentinel = torch.zeros(2_000_000)
+    optimizer.state[parameter] = {"step": torch.zeros(()), "exp_avg": sentinel}
+    sentinel_id, sentinel_ptr, sentinel_version = id(sentinel), sentinel.data_ptr(), sentinel._version
+    mutate = {"enabled": False}
+    class Resident(torch.nn.Module):
+        def __init__(self): super().__init__(); self.layer = module
+        def forward(self, input_ids, attention_mask=None, use_cache=False):
+            if mutate["enabled"]:
+                optimizer.state[parameter]["exp_avg"].add_(1)
+            hidden = torch.nn.functional.one_hot(input_ids, num_classes=12).float()
+            return self.layer(hidden, attention_mask=attention_mask, use_cache=use_cache)
+    model = Resident()
+    kwargs = dict(
+        model=model, modules=(module,), optimizer=optimizer,
+        batch={"input_ids": torch.tensor([[1, 2]]), "attention_mask": torch.ones(1, 2)},
+    )
+    _run_live_hybrid_diagnostic_pass(**kwargs)
+    actual = optimizer.state[parameter]["exp_avg"]
+    assert (id(actual), actual.data_ptr(), actual._version) == (
+        sentinel_id, sentinel_ptr, sentinel_version
+    )
+    mutate["enabled"] = True
+    with pytest.raises(Exception, match="optimizer.*mutated"):
+        _run_live_hybrid_diagnostic_pass(**kwargs)
+    assert optimizer.state[parameter]["exp_avg"] is sentinel
+    assert sentinel._version == sentinel_version + 1
+
+
+def test_live_diagnostic_pass_fails_closed_for_missing_or_heterogeneous_cache(monkeypatch) -> None:
+    from gdn3.kmd2_native import KMD2NativeAttn
+    from research.kmd2_ablation.qwen_hybrid_four_state import QwenFourStateHybrid
+    from research.kmd2_ablation.qwen_hybrid_shared import QwenSharedBraidHybrid
+    from research.kmd2_ablation.qwen_training import _measure_live_hybrid_caches
+    config = SimpleNamespace(hidden_size=12, linear_num_value_heads=2,
+        linear_num_key_heads=2, linear_key_head_dim=4, linear_value_head_dim=3,
+        linear_conv_kernel_dim=3, rms_norm_eps=1e-6)
+    monkeypatch.setenv("GDN3_KMD2_ROUT", "1")
+    module = QwenSharedBraidHybrid.from_native(KMD2NativeAttn(config, layer_idx=0))
+    with pytest.raises(Exception, match="missing live cache"):
+        _measure_live_hybrid_caches((module,), valid_token_count=1)
+    module.scan(torch.randn(1, 1, 12))
+    module.last_recurrent_cache = SimpleNamespace(state=torch.zeros(1, 2, 4, 3), hola_state=None)
+    with pytest.raises(Exception, match="HOLA"):
+        _measure_live_hybrid_caches((module,), valid_token_count=1)
+    shared = QwenSharedBraidHybrid.from_native(KMD2NativeAttn(config, layer_idx=1))
+    four_config = SimpleNamespace(**(vars(config) | {"linear_key_head_dim": 8}))
+    four = QwenFourStateHybrid.from_native(KMD2NativeAttn(four_config, layer_idx=2))
+    shared(torch.randn(1, 1, 12), use_cache=True)
+    four(torch.randn(1, 1, 12), use_cache=True)
+    with pytest.raises(Exception, match="heterogeneous"):
+        _measure_live_hybrid_caches((shared, four), valid_token_count=1)
+
+
+@pytest.mark.parametrize(("task", "targets", "predictions", "modulus"), [
+    ("parity", [1, 0, 1], [3, 2, 5], None),
+    ("modular", [1, 2, 0], [6, 7, 10], 5),
+])
+def test_default_evaluator_generates_and_scores_state_tracking(
+    task, targets, predictions, modulus
+) -> None:
+    from research.kmd2_ablation.qwen_backend import LoadedQwenArm
+    from research.kmd2_ablation.qwen_training import QwenJobData, _default_evaluate
+
+    class Model(torch.nn.Module):
+        def forward(self, input_ids, *, output_hidden_states, use_cache):
+            logits = torch.nn.functional.one_hot(input_ids, num_classes=16).float()
+            return SimpleNamespace(logits=logits)
+
+    input_ids = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+    metadata = {"task": task, "cell_id": f"{task}-32k", "seed": 7,
+                "example_id": "state-0", "prompt_end": 3, "targets": targets,
+                "modulus": modulus, "evidence_scope": "promotion"}
+    batch = {"input_ids": input_ids, "labels": input_ids.clone(),
+             "example_ids": ("state-0",), "state_tracking_metadata": (metadata,)}
+    data = QwenJobData((batch,), (batch,), {"sha256": "a" * 64})
+    job = _qwen_adapter_job("a" * 64)
+    job["seed"] = 7
+    job["canonical_config"]["task"]["name"] = task
+    loaded = LoadedQwenArm(model=Model(), arm="native", job_id="state", upgraded_indices=(),
+                           trainable_names=(), assets=())
+    result = _default_evaluate(
+        loaded_arm=loaded, data=data, job=job, runtime={"student_device": "cpu"},
+        tokenizer_asset=SimpleNamespace(path="unused"),
+        generate_state_values=lambda **_kwargs: predictions,
+    )
+    row = result["evaluations"][0]
+    assert row["state_task"] == task
+    assert row["cell_id"] == f"{task}-32k" and row["seed"] == 7
+    assert row["episode_exact"] is True and row["lm_loss"] >= 0
+
+
+def test_data_parallel_window_shards_are_disjoint_and_reconstruct_pairing() -> None:
+    from research.kmd2_ablation.qwen_training import _shard_training_windows
+    batch = {"input_ids": torch.arange(12).reshape(4, 3),
+             "labels": torch.arange(12).reshape(4, 3),
+             "example_ids": ("e0", "e1", "e2", "e3")}
+    left, left_ids = _shard_training_windows((batch,), rank=0, world_size=2)
+    right, right_ids = _shard_training_windows((batch,), rank=1, world_size=2)
+    assert set(left_ids[0]).isdisjoint(right_ids[0])
+    assert tuple(sorted(left_ids[0] + right_ids[0])) == tuple(sorted(batch["example_ids"]))
+    assert left[0]["input_ids"].shape == right[0]["input_ids"].shape == (2, 3)
+    uneven = dict(batch, input_ids=batch["input_ids"][:3], labels=batch["labels"][:3],
+                  example_ids=batch["example_ids"][:3])
+    with pytest.raises(Exception, match="divide evenly"):
+        _shard_training_windows((uneven,), rank=0, world_size=2)
+
+
+def test_distributed_trainer_accounts_global_tokens_before_budget(monkeypatch) -> None:
+    from research.kmd2_ablation.qwen_training import QwenHealTrainer
+    model = _HealModel(); optimizer, scheduler = _optimizer_and_scheduler(model)
+    def all_reduce(tensor, op):
+        if op == torch.distributed.ReduceOp.SUM:
+            tensor.mul_(2)
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    trainer = QwenHealTrainer(
+        model=model, teacher=_HealTeacher(), optimizer=optimizer, scheduler=scheduler,
+        config=_training_config(accumulation_steps=1, max_tokens=6),
+        job_id="global", pairing_id="9" * 64, arm="surprise",
+        expected_example_windows=(("local",),), distributed=True,
+    )
+    trainer.train_update((_batch("local", (0, 1, 2)),))
+    assert trainer.tokens_seen == 6
+
+
+class _GlooHealModel(_HealModel):
+    def __init__(self, *, fail: bool = False) -> None:
+        super().__init__()
+        self.fail = fail
+
+    def forward(self, *args, **kwargs):
+        output = super().forward(*args, **kwargs)
+        if self.fail:
+            output.logits = output.logits * torch.tensor(float("nan"))
+        return output
+
+
+def _gloo_trainer_worker(rank: int, init_file: str, output: str) -> None:
+    import torch.distributed as dist
+    from research.kmd2_ablation.qwen_training import QwenHealTrainer
+    dist.init_process_group("gloo", init_method=f"file:///{init_file.replace(chr(92), '/')}",
+                            rank=rank, world_size=2)
+    try:
+        model = _GlooHealModel()
+        with torch.no_grad():
+            model.cache_amplitude.fill_(2.0)
+        ddp = torch.nn.parallel.DistributedDataParallel(model)
+        optimizer, scheduler = _optimizer_and_scheduler(model)
+        trainer = QwenHealTrainer(
+            model=ddp, teacher=_HealTeacher(), optimizer=optimizer, scheduler=scheduler,
+            config=_training_config(accumulation_steps=1, max_tokens=6),
+            job_id=f"gloo-{rank}", pairing_id="d" * 64, arm="surprise",
+            expected_example_windows=((f"rank-{rank}",),), distributed=True,
+        )
+        trainer.train_update((_batch(f"rank-{rank}", (rank, 1, 2)),))
+        gathered = [torch.zeros_like(model.cache_amplitude) for _ in range(2)]
+        dist.all_gather(gathered, model.cache_amplitude.detach())
+
+        failing = _GlooHealModel(fail=rank == 0)
+        failing_ddp = torch.nn.parallel.DistributedDataParallel(failing)
+        fail_optimizer, fail_scheduler = _optimizer_and_scheduler(failing)
+        fail_trainer = QwenHealTrainer(
+            model=failing_ddp, teacher=_HealTeacher(), optimizer=fail_optimizer,
+            scheduler=fail_scheduler,
+            config=_training_config(accumulation_steps=1, max_tokens=6),
+            job_id=f"fail-{rank}", pairing_id="e" * 64, arm="surprise",
+            expected_example_windows=((f"fail-{rank}",),), distributed=True,
+        )
+        failure = None
+        try:
+            fail_trainer.train_update((_batch(f"fail-{rank}", (0, 1, 2)),))
+        except Exception as error:
+            failure = getattr(error, "code", None)
+        torch.save({"projected": [float(x) for x in gathered], "failure": failure,
+                    "global_tokens": trainer.tokens_seen},
+                   Path(output) / f"rank-{rank}.pt")
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="this PyTorch build has no supported Windows Gloo device")
+def test_real_two_process_gloo_trainer_syncs_projection_and_failure(tmp_path: Path) -> None:
+    import torch.multiprocessing as mp
+    init_file = str((tmp_path / "gloo-init").resolve())
+    mp.spawn(_gloo_trainer_worker, args=(init_file, str(tmp_path)), nprocs=2, join=True)
+    rows = [torch.load(tmp_path / f"rank-{rank}.pt", weights_only=True) for rank in range(2)]
+    assert rows[0]["projected"] == rows[1]["projected"]
+    assert 0.0 <= rows[0]["projected"][0] <= 1.0
+    assert [row["failure"] for row in rows] == ["nonfinite_loss", "nonfinite_loss"]
+    assert [row["global_tokens"] for row in rows] == [6, 6]

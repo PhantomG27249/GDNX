@@ -22,6 +22,12 @@ from typing import Any, Iterable
 
 ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
 BUNDLE_SCHEMA_VERSION = "1.0.0"
+MAX_ARCHIVE_MEMBERS = 512
+MAX_MANIFEST_COMPRESSED_BYTES = 1024 * 1024
+MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+MAX_MEMBER_BYTES = 32 * 1024 * 1024
+MAX_TOTAL_BYTES = 256 * 1024 * 1024
+MAX_COMPRESSION_RATIO = 200
 VERIFIER_SIDECAR_NAME = "verify_bundle.py"
 _MANIFEST_CONVENTION = (
     "MANIFEST.json is not self-hashed; every other exact member is hashed; "
@@ -84,8 +90,13 @@ _KIND_SOURCE_SEEDS = {
     ),
     "qwen": (
         "research/kmd2_ablation/qwen_backend.py",
+        "research/kmd2_ablation/qwen_cache_campaign.py",
         "research/kmd2_ablation/qwen_checkpoint.py",
         "research/kmd2_ablation/qwen_exact_cache.py",
+        "research/kmd2_ablation/qwen_fused_loss.py",
+        "research/kmd2_ablation/qwen_hybrid_chunkwise.py",
+        "research/kmd2_ablation/qwen_hybrid_liger_chunked.py",
+        "research/kmd2_ablation/qwen_hybrid_triton.py",
         "research/kmd2_ablation/qwen_training.py",
         "research/kmd2_ablation/qwen_variants.py",
         "research/kmd2_ablation/tiny_backend.py",
@@ -106,11 +117,33 @@ _KIND_TEST_SEEDS = {
         "tests/ablation/test_tiny_backend.py",
         "tests/ablation/test_fast_scan_api.py",
         "tests/ablation/test_qwen_backend.py",
+        "tests/ablation/test_qwen_fused_loss.py",
     ),
 }
 _KIND_STATIC_ARTIFACTS = {
     "tiny": ("research/kmd2_ablation/scripts/run_remote_tiny.sh",),
-    "qwen": ("research/kmd2_ablation/scripts/run_remote_qwen.sh",),
+    "qwen": (
+        "research/kmd2_ablation/scripts/run_remote_qwen.sh",
+        "research/kmd2_ablation/scripts/run_remote_qwen_campaign.sh",
+        "research/kmd2_ablation/campaigns/qwen08b-runnable-v1.json",
+        "research/kmd2_ablation/campaigns/configs/stock.json",
+        "research/kmd2_ablation/campaigns/configs/kmd2-r1.json",
+        "research/kmd2_ablation/campaigns/configs/rot-off.json",
+        "research/kmd2_ablation/campaigns/configs/rot-constant.json",
+        "research/kmd2_ablation/campaigns/configs/rot-noncumulative.json",
+        "research/kmd2_ablation/campaigns/configs/rot-fixed-rope.json",
+        "research/kmd2_ablation/campaigns/configs/rot-moving-frame-oracle.json",
+        "research/kmd2_ablation/campaigns/configs/rout-4.json",
+        "research/kmd2_ablation/campaigns/configs/mimo-r2.json",
+        "research/kmd2_ablation/campaigns/configs/mimo-r4.json",
+        "research/kmd2_ablation/campaigns/configs/gdn2-channel-r1.json",
+        "research/kmd2_ablation/campaigns/configs/trapezoid.json",
+        "research/kmd2_ablation/campaigns/configs/lookahead.json",
+        "research/kmd2_ablation/campaigns/configs/qk-bc-additive.json",
+        "research/kmd2_ablation/campaigns/configs/qk-diagonal.json",
+        "research/kmd2_ablation/campaigns/configs/cache-recency-w64.json",
+        "research/kmd2_ablation/campaigns/configs/cache-surprise-w64.json",
+    ),
 }
 _TINY_EVIDENCE_FILES = _QWEN_GDN3_FILES
 _LOCAL_MODULE_PREFIXES = ("research.kmd2_ablation", "tests.ablation", "gdn3")
@@ -123,6 +156,30 @@ _TINY_OPTIONAL_LOCAL_IMPORTS = frozenset(
         (
             "research.kmd2_ablation.runner",
             "research.kmd2_ablation.resource_probes",
+        ),
+        (
+            "research.kmd2_ablation.runner",
+            "research.kmd2_ablation.qwen_variants",
+        ),
+        (
+            "research.kmd2_ablation.gate_probes",
+            "research.kmd2_ablation.qwen_training",
+        ),
+        (
+            "research.kmd2_ablation.gate_probes",
+            "research.kmd2_ablation.qwen_hybrid_four_state",
+        ),
+        (
+            "research.kmd2_ablation.gate_probes",
+            "research.kmd2_ablation.qwen_hybrid_shared",
+        ),
+        (
+            "research.kmd2_ablation.bundle",
+            "research.kmd2_ablation.qwen_hybrid_math",
+        ),
+        (
+            "gdn3.gdn3_upgrade",
+            "gdn3.triton_kernels",
         ),
     }
 )
@@ -158,6 +215,26 @@ _ASSET_NAMES = ("model", "tokenizer", "checkpoint", "data", "teacher_model")
 _MAX_SOURCE_BYTES = 16 * 1024 * 1024
 _MAX_CONFIG_FILES = 256
 _MAX_CONFIG_DEPTH = 4
+_MAXIMUM_KINDS = frozenset({"maximum-hybrid-a", "maximum-hybrid-b"})
+_MAXIMUM_FLAGSHIPS = {
+    "maximum-hybrid-a": "research/kmd2_ablation/campaigns/maximum_hybrid/07-package-a-hola-w64.json",
+    "maximum-hybrid-b": "research/kmd2_ablation/campaigns/maximum_hybrid/09-package-b-hola-w64.json",
+}
+_MAXIMUM_READMES = {
+    "maximum-hybrid-a": "research/kmd2_ablation/package_readmes/MAXIMUM-HYBRID-A.md",
+    "maximum-hybrid-b": "research/kmd2_ablation/package_readmes/MAXIMUM-HYBRID-B.md",
+}
+_MAXIMUM_DEFAULT_CONTROLS = {
+    "maximum-hybrid-a": (
+        "gdn2-r1", "gdn2-mimo-r2", "gdn2-mimo-r4", "package-a-native-decay",
+        "package-a-braid-no-cache", "package-a-recency-w64", "package-a-hola-w64",
+        "shared-query-widening", "stock-qwen",
+    ),
+    "maximum-hybrid-b": (
+        "gdn2-r1", "gdn2-mimo-r2", "gdn2-mimo-r4", "package-b-recency-w64",
+        "package-b-hola-w64", "shared-query-widening", "stock-qwen",
+    ),
+}
 
 
 VERIFY_BUNDLE_SOURCE = r'''#!/usr/bin/env python3
@@ -180,6 +257,12 @@ import zipfile
 
 ZIP_EPOCH = (1980, 1, 1, 0, 0, 0)
 BUNDLE_SCHEMA_VERSION = "1.0.0"
+MAX_ARCHIVE_MEMBERS = 512
+MAX_MANIFEST_COMPRESSED_BYTES = 1024 * 1024
+MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+MAX_MEMBER_BYTES = 32 * 1024 * 1024
+MAX_TOTAL_BYTES = 256 * 1024 * 1024
+MAX_COMPRESSION_RATIO = 200
 _DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
 _WINDOWS_RESERVED_NAMES = frozenset(
     {"con", "prn", "aux", "nul"}
@@ -341,7 +424,7 @@ def _manifest_metadata(manifest, names, codes):
         _append_code(codes, "manifest_schema_invalid")
     if type(manifest.get("suite_version")) is not str or not manifest.get("suite_version"):
         _append_code(codes, "manifest_schema_invalid")
-    if manifest.get("kind") not in {"tiny", "qwen"}:
+    if manifest.get("kind") not in {"tiny", "qwen", "maximum-hybrid-a", "maximum-hybrid-b"}:
         _append_code(codes, "manifest_schema_invalid")
     if manifest.get("manifest_convention") != _MANIFEST_CONVENTION:
         _append_code(codes, "manifest_schema_invalid")
@@ -403,7 +486,7 @@ def _manifest_metadata(manifest, names, codes):
     smoke = manifest.get("smoke")
     expected_smoke = (
         _expected_smoke(manifest.get("kind"), config)
-        if type(config) is str and manifest.get("kind") in {"tiny", "qwen"}
+        if type(config) is str and manifest.get("kind") in {"tiny", "qwen", "maximum-hybrid-a", "maximum-hybrid-b"}
         else None
     )
     if (
@@ -421,17 +504,26 @@ def _manifest_metadata(manifest, names, codes):
     if "verify_bundle.py" not in entries:
         _append_code(codes, "member_set_mismatch")
     requirements = "research/kmd2_ablation/requirements-{}.txt".format(
-        manifest.get("kind")
+        "qwen" if manifest.get("kind") in {"maximum-hybrid-a", "maximum-hybrid-b"} else manifest.get("kind")
     )
     if requirements not in entries:
         _append_code(codes, "member_set_mismatch")
-    launcher = "research/kmd2_ablation/scripts/run_remote_{}.sh".format(
-        manifest.get("kind")
+    launcher = (
+        "research/kmd2_ablation/scripts/run_remote_qwen_maximum_hybrids.sh"
+        if manifest.get("kind") in {"maximum-hybrid-a", "maximum-hybrid-b"}
+        else "research/kmd2_ablation/scripts/run_remote_{}.sh".format(manifest.get("kind"))
     )
     if launcher not in entries:
         _append_code(codes, "member_set_mismatch")
     if manifest.get("kind") == "qwen" and "external-assets.json" not in entries:
         _append_code(codes, "member_set_mismatch")
+    if manifest.get("kind") in {"maximum-hybrid-a", "maximum-hybrid-b"}:
+        if "PACKAGE.json" not in entries:
+            _append_code(codes, "member_set_mismatch")
+        if "research/kmd2_ablation/requirements-qwen.lock" not in entries:
+            _append_code(codes, "member_set_mismatch")
+        if "research/kmd2_ablation/assets/qwen08b-maximum-assets.template.json" not in entries:
+            _append_code(codes, "member_set_mismatch")
     return entries
 
 
@@ -439,6 +531,8 @@ def _verify_zip_metadata(archive, infos, codes):
     if archive.comment:
         _append_code(codes, "noncanonical_zip_metadata")
     names = [info.filename for info in infos]
+    if len(names) != len(set(names)):
+        _append_code(codes, "duplicate_member")
     if names != sorted(names):
         _append_code(codes, "noncanonical_member_order")
     collision_keys = {}
@@ -472,6 +566,26 @@ def _verify_zip_metadata(archive, infos, codes):
             or info.comment
         ):
             _append_code(codes, "noncanonical_zip_metadata")
+
+
+def _verify_archive_limits(infos, codes):
+    if len(infos) > MAX_ARCHIVE_MEMBERS:
+        _append_code(codes, "member_count_limit")
+    total = 0
+    for info in infos:
+        size = info.file_size
+        compressed = info.compress_size
+        total += size
+        if info.filename == _MANIFEST_NAME and (
+            size > MAX_MANIFEST_BYTES or compressed > MAX_MANIFEST_COMPRESSED_BYTES
+        ):
+            _append_code(codes, "manifest_size_limit")
+        if size > MAX_MEMBER_BYTES:
+            _append_code(codes, "member_size_limit")
+        if size and (compressed <= 0 or size > compressed * MAX_COMPRESSION_RATIO):
+            _append_code(codes, "compression_ratio_limit")
+    if total > MAX_TOTAL_BYTES:
+        _append_code(codes, "total_size_limit")
 
 
 def _extract_contents(contents, modes, destination):
@@ -521,6 +635,7 @@ def verify_archive(archive_path, extract_to=None):
             infos = archive.infolist()
             member_count = len(infos)
             _verify_zip_metadata(archive, infos, codes)
+            _verify_archive_limits(infos, codes)
             if codes:
                 return _report(False, codes, outer_sha256, member_count)
 
@@ -554,18 +669,34 @@ def verify_archive(archive_path, extract_to=None):
             manifest_info = by_name[_MANIFEST_NAME]
             if stat.S_IMODE(manifest_info.external_attr >> 16) != 0o644:
                 _append_code(codes, "mode_mismatch")
+            config_member = manifest.get("config")
             for name, info in by_name.items():
-                data = archive.read(info)
-                contents[name] = data
+                digest = hashlib.sha256()
+                size = 0
+                retained = bytearray() if extract_to is not None or name in {_MANIFEST_NAME, config_member} else None
+                with archive.open(info, "r") as source:
+                    while True:
+                        chunk = source.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > MAX_MEMBER_BYTES:
+                            _append_code(codes, "member_size_limit")
+                            break
+                        digest.update(chunk)
+                        if retained is not None:
+                            retained.extend(chunk)
+                if retained is not None:
+                    contents[name] = bytes(retained)
                 modes[name] = stat.S_IMODE(info.external_attr >> 16)
                 if name == _MANIFEST_NAME:
                     continue
                 metadata = entries.get(name)
                 if type(metadata) is not dict:
                     continue
-                if info.file_size != metadata.get("size") or len(data) != metadata.get("size"):
+                if info.file_size != metadata.get("size") or size != metadata.get("size"):
                     _append_code(codes, "size_mismatch")
-                if hashlib.sha256(data).hexdigest() != metadata.get("sha256"):
+                if digest.hexdigest() != metadata.get("sha256"):
                     _append_code(codes, "hash_mismatch")
                 if modes[name] != metadata.get("mode"):
                     _append_code(codes, "mode_mismatch")
@@ -583,11 +714,16 @@ def verify_archive(archive_path, extract_to=None):
                 ):
                     config_document = {}
                     _append_code(codes, "manifest_schema_invalid")
+                maximum_kind = manifest.get("kind") in {"maximum-hybrid-a", "maximum-hybrid-b"}
                 if (
                     config_document.get("schema_version") != BUNDLE_SCHEMA_VERSION
-                    or config_document.get("suite_version")
-                    != manifest.get("suite_version")
-                    or config_document.get("backend") != manifest.get("kind")
+                    or (
+                        not maximum_kind
+                        and (
+                            config_document.get("suite_version") != manifest.get("suite_version")
+                            or config_document.get("backend") != manifest.get("kind")
+                        )
+                    )
                 ):
                     _append_code(codes, "manifest_schema_invalid")
                 source_hashes = {
@@ -1022,6 +1158,73 @@ def _requirement_roots(data: bytes, *, kind: str) -> frozenset[str]:
     return frozenset(roots)
 
 
+def validate_qwen_lock(data: bytes) -> bool:
+    """Validate the complete, exact Qwen lock used by clean extractions."""
+
+    roots = _requirement_roots(data, kind="qwen")
+    required = {"torch", "transformers", "safetensors", "triton", "fla_core"}
+    if roots != required:
+        raise BundleError("requirements_invalid", "Qwen lock has an incomplete dependency set")
+    text = data.decode("utf-8")
+    for raw_line in text.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if line and "==" not in line.partition(";")[0]:
+            raise BundleError("requirements_invalid", f"Qwen lock is not exact: {line}")
+    return True
+
+
+def _collect_maximum_bundle_files(root: Path, kind: str) -> tuple[BundleEntry, ...]:
+    """Collect the complete tracked production campaign without runtime assets."""
+
+    git_modes = _git_modes(root)
+    candidates: set[Path] = {
+        root / "LICENSE",
+        root / "README.md",
+        root / "research/kmd2_ablation/README.md",
+        root / "research/kmd2_ablation/config.schema.json",
+        root / "research/kmd2_ablation/requirements-qwen.txt",
+        root / "research/kmd2_ablation/requirements-qwen.lock",
+        root / "research/kmd2_ablation/assets/qwen08b-maximum-assets.template.json",
+        root / "research/kmd2_ablation/campaigns/qwen08b-maximum-hybrid-v1.json",
+        root / "research/kmd2_ablation/scripts/run_remote_qwen_maximum_hybrids.sh",
+        root / PurePosixPath(_MAXIMUM_READMES[kind]),
+    }
+    for directory, patterns in (
+        (root / "research/kmd2_ablation", ("*.py",)),
+        (root / "gdn3", ("*.py",)),
+        (root / "tests/ablation", ("*.py",)),
+        (root / "research/kmd2_ablation/configs", ("*.json",)),
+        (root / "research/kmd2_ablation/campaigns", ("*.json",)),
+    ):
+        for pattern in patterns:
+            candidates.update(path for path in directory.rglob(pattern) if path.is_file() or path.is_symlink())
+    entries = list(_validated_entries(_entry_from_repo(root, path, git_modes) for path in candidates))
+    if kind == "maximum-hybrid-b":
+        package_root = root / "research/kmd2_ablation/package_root/package-b"
+        entries = [entry for entry in entries if entry.name != "README.md"]
+        entries.extend(
+            (
+                BundleEntry("README.md", (package_root / "README.md").read_bytes()),
+                BundleEntry("requirements.txt", (root / "research/kmd2_ablation/requirements-qwen.txt").read_bytes()),
+                BundleEntry("config.toml", (package_root / "config.toml").read_bytes()),
+                BundleEntry("run.sh", (package_root / "run.sh").read_bytes(), 0o755),
+            )
+        )
+    entries = _validated_entries(entries)
+    lock = next(entry for entry in entries if entry.name.endswith("requirements-qwen.lock"))
+    validate_qwen_lock(lock.data)
+    requirements = next(entry for entry in entries if entry.name.endswith("requirements-qwen.txt"))
+    if _requirement_roots(requirements.data, kind="qwen") != _requirement_roots(lock.data, kind="qwen"):
+        raise BundleError("requirements_invalid", "Qwen requirements and lock dependency sets differ")
+    runtime_names = frozenset(
+        entry.name
+        for entry in entries
+        if entry.name.endswith(".py") and not entry.name.startswith("tests/")
+    )
+    _audit_imports(entries, requirements, "qwen", runtime_names=runtime_names)
+    return entries
+
+
 def _module_name(path: str) -> tuple[str, bool]:
     module = path[:-3].replace("/", ".")
     is_package = module.endswith(".__init__")
@@ -1254,14 +1457,18 @@ def collect_bundle_files(
     *,
     kind: str,
     repo_root: Path | str,
-    config_path: Path | str,
+    config_path: Path | str | None = None,
     assets_manifest: Path | str | None = None,
 ) -> tuple[BundleEntry, ...]:
     """Collect safe repository payload files and audit their Python imports."""
 
-    if kind not in {"tiny", "qwen"}:
-        raise BundleError("bundle_kind_invalid", "kind must be tiny or qwen")
+    if kind not in {"tiny", "qwen", *_MAXIMUM_KINDS}:
+        raise BundleError("bundle_kind_invalid", "unsupported bundle kind")
     root = Path(repo_root).resolve(strict=True)
+    if kind in _MAXIMUM_KINDS:
+        return _collect_maximum_bundle_files(root, kind)
+    if config_path is None:
+        raise BundleError("config_required", "tiny and Qwen bundles require a config")
     config, config_name = _repo_relative(root, Path(config_path))
     configs = _workspace_kind_configs(root, kind)
     config_names = {_repo_relative(root, path)[1] for path in configs}
@@ -1289,8 +1496,28 @@ def collect_bundle_files(
         git_modes=git_modes,
     )
     if kind == "tiny":
+        qwen_runtime = tuple(
+            entry.name for entry in source_entries if "qwen" in entry.name.casefold()
+        )
+        if qwen_runtime:
+            raise BundleError(
+                "forbidden_dependency",
+                f"tiny source includes Qwen runtime module {qwen_runtime[0]}",
+            )
+        source_entries = tuple(
+            entry
+            for entry in source_entries
+            if "qwen" not in entry.name.casefold()
+            and (
+                not entry.name.startswith("gdn3/")
+                or entry.name in _TINY_EVIDENCE_FILES
+            )
+        )
         test_entries = tuple(
-            entry for entry in test_entries if entry.name != "gdn3/__init__.py"
+            entry
+            for entry in test_entries
+            if entry.name != "gdn3/__init__.py"
+            and "qwen" not in entry.name.casefold()
         )
     candidates: set[Path] = set(_required_paths(root, kind, config))
     candidates.update(configs)
@@ -1453,10 +1680,15 @@ def _git_provenance(root: Path) -> dict[str, Any]:
         "diff": diff.replace("\r\n", "\n").replace("\r", "\n"),
         "status": sorted(status.replace("\r\n", "\n").splitlines()),
     }
+    dirty = bool(normalized["status"])
     return {
         "revision": revision.strip(),
-        "dirty": bool(normalized["status"]),
-        "diff_sha256": hashlib.sha256(_canonical_json_bytes(normalized)).hexdigest(),
+        "dirty": dirty,
+        "diff_sha256": (
+            hashlib.sha256(_canonical_json_bytes(normalized)).hexdigest()
+            if dirty
+            else "0" * 64
+        ),
     }
 
 
@@ -1472,13 +1704,20 @@ def plan_bundle(
     *,
     kind: str,
     repo_root: Path | str,
-    config_path: Path | str,
+    config_path: Path | str | None = None,
     assets_manifest: Path | str | None = None,
 ) -> BundlePlan:
     """Create a canonical complete archive plan without writing output."""
 
     root = Path(repo_root).resolve(strict=True)
-    config, config_name = _repo_relative(root, Path(config_path))
+    selected_config = (
+        root / PurePosixPath(_MAXIMUM_FLAGSHIPS[kind])
+        if kind in _MAXIMUM_KINDS
+        else Path(config_path) if config_path is not None else None
+    )
+    if selected_config is None:
+        raise BundleError("config_required", "bundle config is required")
+    config, config_name = _repo_relative(root, selected_config)
     payload = list(
         collect_bundle_files(
             kind=kind,
@@ -1487,6 +1726,27 @@ def plan_bundle(
             assets_manifest=assets_manifest,
         )
     )
+    if kind in _MAXIMUM_KINDS:
+        from .qwen_hybrid_math import DEFERRED_FUSION_WARNING, REFERENCE_IMPLEMENTATION
+        package = kind[-1].upper()
+        flagship = PurePosixPath(_MAXIMUM_FLAGSHIPS[kind]).stem
+        flagship = re.sub(r"^[0-9]+-", "", flagship)
+        payload.append(
+            BundleEntry(
+                "PACKAGE.json",
+                _canonical_json_bytes(
+                    {
+                        "schema_version": BUNDLE_SCHEMA_VERSION,
+                        "kind": kind,
+                        "package": package,
+                        "flagship": flagship,
+                        "default_controls": list(_MAXIMUM_DEFAULT_CONTROLS[kind]),
+                        "implementation": REFERENCE_IMPLEMENTATION,
+                        "performance_warning": DEFERRED_FUSION_WARNING,
+                    }
+                ),
+            )
+        )
     if kind == "qwen":
         assert assets_manifest is not None
         payload.append(BundleEntry("external-assets.json", _sanitized_external_assets(assets_manifest)))
@@ -1496,9 +1756,17 @@ def plan_bundle(
         config_document = json.loads(config.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
         raise BundleError("config_invalid", "bundle config is not valid UTF-8 JSON") from error
-    if not isinstance(config_document, Mapping) or config_document.get("backend") != kind:
+    if kind not in _MAXIMUM_KINDS and (
+        not isinstance(config_document, Mapping) or config_document.get("backend") != kind
+    ):
         raise BundleError("config_invalid", "bundle config backend does not match kind")
-    suite_version = config_document.get("suite_version")
+    if kind in _MAXIMUM_KINDS:
+        campaign_document = json.loads(
+            (root / "research/kmd2_ablation/campaigns/qwen08b-maximum-hybrid-v1.json").read_text(encoding="utf-8")
+        )
+        suite_version = campaign_document.get("schema_version")
+    else:
+        suite_version = config_document.get("suite_version")
     if type(suite_version) is not str or not suite_version:
         raise BundleError("config_invalid", "bundle config suite_version is missing")
     source_hashes = {
@@ -1714,6 +1982,11 @@ def cli_handler(arguments: Any) -> dict[str, Any]:
     """Build one verified bundle and return a path-sanitized JSON report."""
 
     kind = getattr(arguments, "backend", None)
+    maximum_package = getattr(arguments, "maximum_package", None)
+    if maximum_package in {"A", "B"}:
+        if kind != "qwen":
+            raise BundleError("bundle_kind_invalid", "maximum packages require --backend qwen")
+        kind = f"maximum-hybrid-{maximum_package.casefold()}"
     config = getattr(arguments, "config", None)
     destination = Path(getattr(arguments, "out", ""))
     assets_manifest = getattr(arguments, "assets_manifest", None)
@@ -1763,4 +2036,5 @@ __all__ = [
     "plan_bundle",
     "verify_bundle",
     "write_deterministic_zip",
+    "validate_qwen_lock",
 ]

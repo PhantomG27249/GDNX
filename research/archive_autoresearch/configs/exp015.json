@@ -1,3 +1,0 @@
-{"name":"baseline_800_fineeval_exp015","hypothesis":"STRUCTURAL-CAUSE DOCUMENTATION (config-only, no source edit): exp001's exact stable config run to 800 steps with fine eval_every=25 yields a high-resolution plateau curve. If flat ~0.30 through 800 steps, the format plateau is a genuine stable ceiling (frozen full-attention format shortcut fully satisfied, GDN3 never learns retrieval) = decisive final evidence for the structural human handoff. If tokacc climbs past step 500, emergence was being cut off and the issue is step budget, reopening the search.",
- "steps":800,"eval_every":25,"warmup":40,"grad_accum":1,"n_keys":4,"seq_len":512,
- "lr_memory":2.5e-4,"lr_coproduct":1.5e-4,"decay_clamp":0.999,"slow_decay":0.97,"residual_rank":16,"seed":0}

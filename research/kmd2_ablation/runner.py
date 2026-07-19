@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 import functools
 import importlib
 import importlib.metadata
@@ -16,9 +17,208 @@ import sys
 import traceback
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
+
+
+_MAXIMUM_REQUIRED_ASSETS = ("model", "tokenizer", "checkpoint", "data", "teacher_model")
+
+
+def select_maximum_package_controls(
+    control_ids: Sequence[str], package: str
+) -> tuple[str, ...]:
+    """Select package-local controls plus shared controls in stable order."""
+    normalized = package.casefold()
+    if normalized not in {"a", "b", "both"}:
+        raise ValueError("package must be A, B, or both")
+    opposite = "package-b-" if normalized == "a" else "package-a-"
+    return tuple(
+        control_id
+        for control_id in control_ids
+        if normalized == "both" or not control_id.startswith(opposite)
+    )
+
+
+def _maximum_asset_identities(raw: Mapping[str, Any]) -> dict[str, str]:
+    assets = raw.get("assets")
+    if not isinstance(assets, Mapping):
+        raise ValueError("maximum campaign requires full asset identities")
+    identities: dict[str, str] = {}
+    for name in _MAXIMUM_REQUIRED_ASSETS:
+        item = assets.get(name)
+        if not isinstance(item, Mapping):
+            raise ValueError("maximum campaign requires full asset identities")
+        identity = item.get("tree_sha256") or item.get("sha256")
+        path = item.get("path")
+        if (
+            not isinstance(path, str)
+            or not path
+            or not isinstance(identity, str)
+            or len(identity) != 64
+            or any(character not in "0123456789abcdef" for character in identity)
+        ):
+            raise ValueError("maximum campaign requires full asset identities")
+        identities[name] = identity
+    return identities
+
+
+def materialize_maximum_hybrid_campaign(
+    campaign_path: Path | str,
+    assets_manifest: Mapping[str, Any] | Path | str,
+    destination: Path | str,
+    *,
+    smoke: bool = False,
+) -> tuple[Path, ...]:
+    """Materialize all full control documents with immutable asset identities."""
+    campaign_file = Path(campaign_path)
+    campaign = json.loads(campaign_file.read_text(encoding="utf-8"))
+    if isinstance(assets_manifest, (str, Path)):
+        asset_document = json.loads(Path(assets_manifest).read_text(encoding="utf-8"))
+    else:
+        asset_document = dict(assets_manifest)
+    identities = _maximum_asset_identities(asset_document)
+    controls = campaign.get("controls")
+    if not isinstance(controls, list) or len(controls) != 11:
+        raise ValueError("maximum campaign requires exactly eleven controls")
+    specialization = campaign.get("specialization")
+    if (
+        not isinstance(specialization, Mapping)
+        or specialization.get("lambda_spec") != 0.001
+        or specialization.get("lambda_gate") != 0.001
+        or specialization.get("specialization_updates") != 8
+    ):
+        raise ValueError("maximum campaign specialization contract is missing or stale")
+    output = Path(destination)
+    output.mkdir(parents=True, exist_ok=True)
+    base_path = campaign_file.parents[3] / campaign.get(
+        "base_config", "research/kmd2_ablation/configs/qwen_exact_cache.json"
+    )
+    base = json.loads(base_path.read_text(encoding="utf-8"))
+    written: list[Path] = []
+    for control in controls:
+        source = campaign_file.parents[3] / control["config"]
+        overlay = json.loads(source.read_text(encoding="utf-8"))
+        document = copy.deepcopy(base)
+        control_id = overlay["control_id"]
+        from .qwen_variants import maximum_control_contract
+        contract = maximum_control_contract(control_id)
+        mechanism_variant = {
+            "gdn2-r1": ("gdn2_decoupled", "channelwise_erase_write"),
+            "gdn2-mimo-r2": ("true_mimo", "true_mimo_sweep"),
+            "gdn2-mimo-r4": ("true_mimo", "true_mimo_sweep"),
+            "package-a-native-decay": ("maximum_hybrid", "braid_shared_hola_w64"),
+            "package-a-braid-no-cache": ("maximum_hybrid", "braid_shared_hola_w64"),
+            "package-a-recency-w64": ("maximum_hybrid", "braid_shared_hola_w64"),
+            "package-a-hola-w64": ("maximum_hybrid", "braid_shared_hola_w64"),
+            "package-b-recency-w64": ("maximum_hybrid", "braid_four_state_hola_w64"),
+            "package-b-hola-w64": ("maximum_hybrid", "braid_four_state_hola_w64"),
+            "shared-query-widening": ("state_size", "state_size_sweep"),
+            "stock-qwen": ("native", "native"),
+        }[control_id]
+        document["mechanism"], document["variant"] = mechanism_variant
+        document["task"]["params"].update({
+            "maximum_control": control_id,
+            "maximum_features": asdict(contract),
+            "maximum_contract": asdict(contract),
+            "maximum_contract_sha256": contract.identity_sha256,
+            "capacity_label": overlay["classification"],
+            "asset_identities": identities,
+            "lambda_spec": specialization["lambda_spec"],
+            "lambda_gate": specialization["lambda_gate"],
+            "specialization_updates": specialization["specialization_updates"],
+        })
+        architecture_ids = {
+            "gdn2-r1": "gdn2-channel-r1", "gdn2-mimo-r2": "mimo-r2",
+            "gdn2-mimo-r4": "mimo-r4", "package-a-native-decay": "gdn2-mimo-r4-braid-shared-hola-w64",
+            "package-a-braid-no-cache": "gdn2-mimo-r4-braid-shared-hola-w64",
+            "package-a-recency-w64": "gdn2-mimo-r4-braid-shared-hola-w64",
+            "package-a-hola-w64": "gdn2-mimo-r4-braid-shared-hola-w64",
+            "package-b-recency-w64": "gdn2-mimo-r4-braid-four-state-hola-w64",
+            "package-b-hola-w64": "gdn2-mimo-r4-braid-four-state-hola-w64",
+            "shared-query-widening": "rout-4",
+        }
+        if control_id in architecture_ids:
+            from .architecture import architecture_record, registry_sha256
+            record = architecture_record(architecture_ids[control_id])
+            document["architecture"] = {
+                "arm_id": record.arm_id, "registry_sha256": registry_sha256(),
+                "model_tree_sha256": identities["model"],
+                "ordered_examples_sha256": identities["data"],
+                "pretraining_checkpoint_sha256": identities["checkpoint"],
+            }
+            document["task"]["params"].update({
+                "target_layers": list(record.target_layers), "output_width": record.output_width,
+                "mimo_rank": record.mimo_rank, "gate_mode": record.gate_mode,
+            })
+            if record.arm_id.startswith("gdn2-mimo-r4-braid-"):
+                document["task"]["params"].update({
+                    "timescales": list(record.timescales), "state_topology": record.state_topology,
+                    "cache_scope": record.cache_scope, "update_paths": 4, "convolution_on": True,
+                    "rotation_mode": "mamba3_complex_input_dependent_cumulative",
+                    "phase_topology": record.phase_topology, "input_rank": 4, "output_rank": 4,
+                    "read_topology": record.read_topology, "read_paths": record.read_paths,
+                    "state_input_mode": "trapezoid", "lookahead": record.lookahead,
+                    "qk_contract": record.qk_contract,
+                })
+                document["cache"]["read_init"] = record.cache.read_init
+        if control_id == "stock-qwen":
+            document["qwen"]["run_mode"] = "reliance"
+            document["required_stage"] = "qwen_reliance"
+        if smoke:
+            params = document["task"]["params"]
+            params["objective"] = "synthetic_only"
+            params["example_ids"] = params["example_ids"][:1]
+            params["training_window_example_counts"] = [1]
+            params["training_window_token_counts"] = [64]
+            params["episodes_per_cell"] = 1
+            params["free_generation_subset_per_cell"] = 1
+            document["budget"] = {"tokens": 64, "updates": 1}
+            document["lengths"] = {"curriculum": [64], "extrapolation": [64]}
+            if "architecture" not in document:
+                document["cache"]["width"] = 4
+                document["cache"]["block_size"] = 16
+        target = output / Path(control["config"]).name
+        target.write_text(
+            json.dumps(document, sort_keys=True, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        written.append(target)
+    return tuple(written)
+
+
+def run_campaign(
+    campaign: Mapping[str, Any], *,
+    preflight: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+    execute: Callable[[Mapping[str, Any]], Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Run a campaign only after every control has passed preflight."""
+    controls = campaign.get("controls")
+    if not isinstance(controls, list) or len(controls) != 11:
+        raise ValueError("maximum campaign requires exactly eleven controls")
+    preflights = [dict(preflight(control)) for control in controls]
+    failed = [
+        controls[index]["control_id"]
+        for index, report in enumerate(preflights)
+        if report.get("ok") is not True
+    ]
+    if failed:
+        return {"ok": False, "phase": "preflight", "failed_controls": failed, "runs": []}
+    runs = [dict(execute(control)) for control in controls]
+    return {"ok": all(run.get("ok") is True for run in runs), "preflights": preflights, "runs": runs}
+
+
+def promotion_decision(seed_results: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Return a visible, fail-closed decision for the immutable three-seed screen."""
+    required = (11, 29, 47)
+    by_seed = {item.get("seed"): item for item in seed_results}
+    missing = [seed for seed in required if seed not in by_seed]
+    if missing:
+        return {"promoted": False, "reason": "missing_required_seeds", "missing_seeds": missing}
+    failed = [seed for seed in required if by_seed[seed].get("passed") is not True]
+    if failed:
+        return {"promoted": False, "reason": "seed_threshold_failed", "failed_seeds": failed}
+    return {"promoted": True, "reason": "all_required_seeds_passed"}
 
 from .config import SUITE_VERSION, ExperimentConfig
 from .results import (
@@ -708,6 +908,39 @@ def validate_scientific_preflight(
             if not isinstance(evidence, Mapping) or evidence.get("available") is not True:
                 codes.append("gate_evaluator_unavailable")
             else:
+                if spec.mechanism == "maximum_hybrid":
+                    probe = evidence.get("probe")
+                    required_real_probe = {
+                        "kind": "real_converted_kmd2_hybrid_module",
+                        "native_base_class": "KMD2NativeAttn",
+                        "forward_executed": True,
+                        "scan_executed": True,
+                        "neutral_repeat_deterministic": True,
+                        "finite_connected_gradients": True,
+                        "lane_specialization_gradients": True,
+                        "braid_staging_passed": True,
+                    }
+                    # Native output parity is required exactly where the probe
+                    # declares it applies: Package A (shared) must match the
+                    # source layer; Package B's identity contract is conversion
+                    # determinism because braided horizons, CMS clocks, and the
+                    # 0.5-initialized trapezoid intentionally move its output
+                    # ("Option B", 2026-07-14 - see bible.txt).
+                    parity_consistent = (
+                        isinstance(probe, Mapping)
+                        and type(probe.get("native_parity_expected")) is bool
+                        and type(probe.get("native_parity_passed")) is bool
+                        and (probe["native_parity_passed"]
+                             or not probe["native_parity_expected"])
+                    )
+                    if (not isinstance(probe, Mapping)
+                            or any(probe.get(name) != value
+                                   for name, value in required_real_probe.items())
+                            or not parity_consistent
+                            or probe.get("cache_schema") not in {"state", "states"}
+                            or type(probe.get("hola_admissions")) is not int
+                            or probe.get("hola_admissions", 0) < 1):
+                        codes.append("real_module_gate_required")
                 if spec.native_warm_start:
                     if "identity_passed" not in evidence:
                         codes.append("identity_evidence_missing")
@@ -1080,7 +1313,16 @@ def evaluate_exact_resources(
             "resources": {},
         }
     codes: list[str] = []
-    if evidence.get("exact") is not True:
+    conservative_hybrid = (
+        evidence.get("exact") is False
+        and evidence.get("preflight_safe") is True
+        and isinstance(evidence.get("accounting"), Mapping)
+        and evidence["accounting"].get("activation") in {
+            "conservative_shape_upper_bound",
+            "phase_separated_fused_path_upper_bound",
+        }
+    )
+    if evidence.get("exact") is not True and not conservative_hybrid:
         codes.append("resource_accounting_not_exact")
 
     from .variants import EqualStateByteControl, ParameterMatchResult
@@ -1091,6 +1333,8 @@ def evaluate_exact_resources(
         resources: dict[str, Any] = {
             "trainable_parameters": matched.trainable_parameters,
             "recurrent_state_elements": matched.recurrent_state_elements,
+            "recurrent_state_tensor_elements": matched.recurrent_state_elements,
+            "recurrent_state_auxiliary_bytes": 0,
             "recurrent_state_bytes": matched.recurrent_state_bytes,
         }
         ffn_value: Any = {
@@ -1114,6 +1358,12 @@ def evaluate_exact_resources(
                 "recurrent_state_bytes",
             )
         }
+        resources["recurrent_state_tensor_elements"] = evidence.get(
+            "recurrent_state_tensor_elements", resources["recurrent_state_elements"]
+        )
+        resources["recurrent_state_auxiliary_bytes"] = evidence.get(
+            "recurrent_state_auxiliary_bytes", 0
+        )
         ffn_value = evidence.get("ffn_match")
 
     ffn_match, ffn_codes = _normalize_ffn_match(ffn_value)
@@ -1158,6 +1408,8 @@ def evaluate_exact_resources(
         "trainable_parameters",
         "total_parameters",
         "recurrent_state_elements",
+        "recurrent_state_tensor_elements",
+        "recurrent_state_auxiliary_bytes",
         "recurrent_state_bytes",
         "cache_persistent_bytes",
         "cache_block_bytes",
@@ -1167,7 +1419,8 @@ def evaluate_exact_resources(
     elif (
         resources["total_parameters"] < resources["trainable_parameters"]
         or resources["recurrent_state_bytes"]
-        != 4 * resources["recurrent_state_elements"]
+        != (4 * resources["recurrent_state_tensor_elements"]
+            + resources["recurrent_state_auxiliary_bytes"])
         or ffn_match.get("matched_parameters") != resources["trainable_parameters"]
     ):
         codes.append("resource_accounting_invalid")
@@ -1194,12 +1447,96 @@ def _pairing_id(config: ExperimentConfig, seed: int) -> str:
     return hashlib.sha256(canonical_json_bytes(basis)).hexdigest()
 
 
+def _qwen_pairing_inputs(
+    config: ExperimentConfig,
+    asset_hashes: Mapping[str, str] | None,
+) -> tuple[tuple[str, ...], str, str]:
+    """Validate immutable inputs shared by paired Qwen execution modes."""
+    if not _is_exact_three_seed_matrix(config.seeds):
+        raise PreflightCheckError(
+            "qwen_seed_matrix_invalid",
+            "Qwen heal requires exactly three unique nonnegative seeds",
+        )
+    if not isinstance(asset_hashes, Mapping):
+        raise ValueError("Qwen heal expansion requires measured asset_hashes")
+    checkpoint_digest = asset_hashes.get("checkpoint")
+    if (
+        type(checkpoint_digest) is not str
+        or len(checkpoint_digest) != 64
+        or any(
+            character not in "0123456789abcdef"
+            for character in checkpoint_digest
+        )
+    ):
+        raise ValueError(
+            "Qwen heal expansion requires a measured checkpoint SHA-256"
+        )
+    data_digest = asset_hashes.get("data")
+    if (
+        type(data_digest) is not str
+        or len(data_digest) != 64
+        or any(character not in "0123456789abcdef" for character in data_digest)
+    ):
+        raise ValueError("Qwen heal expansion requires a measured data SHA-256")
+    example_ids = config.task.params.get("example_ids")
+    if (
+        not isinstance(example_ids, (list, tuple))
+        or not example_ids
+        or any(type(item) is not str or not item for item in example_ids)
+        or len(set(example_ids)) != len(example_ids)
+    ):
+        raise ValueError(
+            "Qwen heal expansion requires ordered unique task.params.example_ids"
+        )
+    return tuple(example_ids), checkpoint_digest, data_digest
+
+
 def _expand_jobs(
     config: ExperimentConfig,
     arm_id: str,
     *,
     asset_hashes: Mapping[str, str] | None = None,
 ) -> list[dict[str, Any]]:
+    maximum_control = config.task.params.get("maximum_control")
+    architecture = getattr(config, "architecture", None)
+    if (
+        config.backend == "qwen"
+        and isinstance(maximum_control, str)
+        and maximum_control
+        and (architecture is not None or maximum_control == "stock-qwen")
+    ):
+        from .qwen_training import derive_three_arm_pairing
+
+        example_ids, checkpoint_digest, data_digest = _qwen_pairing_inputs(
+            config, asset_hashes
+        )
+        execution_arm_id = architecture.arm_id if architecture is not None else arm_id
+        jobs: list[dict[str, Any]] = []
+        for seed in config.seeds:
+            provisional = build_job(
+                config,
+                seed=seed,
+                stage=config.required_stage,
+                backend=config.backend,
+                arm_id=execution_arm_id,
+            )
+            pairing = derive_three_arm_pairing(
+                provisional,
+                example_ids=example_ids,
+                pre_replacement_checkpoint_sha256=checkpoint_digest,
+                data_sha256=data_digest,
+            )
+            jobs.append(
+                build_job(
+                    config,
+                    seed=seed,
+                    stage=config.required_stage,
+                    backend=config.backend,
+                    arm_id=execution_arm_id,
+                    pairing_id=pairing.pairing_id,
+                )
+            )
+        return build_jobs_document(jobs)["jobs"]
     if (
         config.backend == "qwen"
         and config.required_stage == "qwen_heal"
@@ -1207,43 +1544,14 @@ def _expand_jobs(
     ):
         from .qwen_training import derive_three_arm_pairing
 
-        if not _is_exact_three_seed_matrix(config.seeds):
-            raise PreflightCheckError(
-                "qwen_seed_matrix_invalid",
-                "Qwen heal requires exactly three unique nonnegative seeds",
-            )
+        example_ids, checkpoint_digest, data_digest = _qwen_pairing_inputs(
+            config, asset_hashes
+        )
+        # Keep the generic runner's source closure backend-neutral so Tiny
+        # bundles never pull a Qwen-named module into their payload.  The
+        # Qwen release contract independently fail-closes this same trio.
+        release_cache_arm_ids = ("native", "recency", "surprise")
 
-        if not isinstance(asset_hashes, Mapping):
-            raise ValueError("Qwen heal expansion requires measured asset_hashes")
-        checkpoint_digest = asset_hashes.get("checkpoint")
-        if (
-            type(checkpoint_digest) is not str
-            or len(checkpoint_digest) != 64
-            or any(
-                character not in "0123456789abcdef"
-                for character in checkpoint_digest
-            )
-        ):
-            raise ValueError(
-                "Qwen heal expansion requires a measured checkpoint SHA-256"
-            )
-        data_digest = asset_hashes.get("data")
-        if (
-            type(data_digest) is not str
-            or len(data_digest) != 64
-            or any(character not in "0123456789abcdef" for character in data_digest)
-        ):
-            raise ValueError("Qwen heal expansion requires a measured data SHA-256")
-        example_ids = config.task.params.get("example_ids")
-        if (
-            not isinstance(example_ids, (list, tuple))
-            or not example_ids
-            or any(type(item) is not str or not item for item in example_ids)
-            or len(set(example_ids)) != len(example_ids)
-        ):
-            raise ValueError(
-                "Qwen heal expansion requires ordered unique task.params.example_ids"
-            )
         jobs: list[dict[str, Any]] = []
         for seed in config.seeds:
             provisional = build_job(
@@ -1255,7 +1563,7 @@ def _expand_jobs(
             )
             pairing = derive_three_arm_pairing(
                 provisional,
-                example_ids=tuple(example_ids),
+                example_ids=example_ids,
                 pre_replacement_checkpoint_sha256=checkpoint_digest,
                 data_sha256=data_digest,
             )
@@ -1268,7 +1576,7 @@ def _expand_jobs(
                     arm_id=paired_arm,
                     pairing_id=pairing.pairing_id,
                 )
-                for paired_arm in ("native", "recency", "surprise")
+                for paired_arm in release_cache_arm_ids
             )
         return build_jobs_document(jobs)["jobs"]
     from .variants import get_variant
@@ -1336,6 +1644,7 @@ def _command_for(options: Any, command: str) -> list[str]:
         ("student_device", "--student-device"),
         ("teacher_device", "--teacher-device"),
         ("dtype", "--dtype"),
+        ("checkpoint_every", "--checkpoint-every"),
         ("model_sha256", "--model-sha256"),
         ("tokenizer_sha256", "--tokenizer-sha256"),
         ("checkpoint_sha256", "--checkpoint-sha256"),
@@ -1448,6 +1757,13 @@ def _load_asset_expectations(options: Any) -> dict[str, dict[str, Any]]:
                     "asset_manifest_invalid", "asset identities must be mappings"
                 )
             expected[name] = dict(identity)
+            tree_digest = expected[name].pop("tree_sha256", None)
+            if tree_digest is not None:
+                if "sha256" in expected[name] and expected[name]["sha256"] != tree_digest:
+                    raise PreflightCheckError(
+                        "asset_manifest_invalid", f"asset {name} has conflicting tree identities"
+                    )
+                expected[name]["sha256"] = tree_digest
     for name in ("model", "tokenizer", "checkpoint", "data", "teacher_model"):
         digest = getattr(options, f"{name}_sha256", None)
         if digest is not None:
@@ -1512,6 +1828,9 @@ def preflight(
         )
     try:
         config = ExperimentConfig.from_dict(raw)
+        if options.backend == "qwen":
+            from .qwen_variants import validate_maximum_control_config
+            validate_maximum_control_config(raw)
     except (TypeError, ValueError):
         return _preflight_report(
             ok=False,
@@ -1532,6 +1851,24 @@ def preflight(
         return _preflight_report(
             ok=False,
             codes=["qwen_mode_mismatch"],
+            commands=commands,
+            manifest_path=manifest_path,
+            exit_code=2,
+        )
+    maximum_control = config.task.params.get("maximum_control")
+    requested_control = getattr(options, "maximum_control", None)
+    if requested_control is not None and requested_control != maximum_control:
+        return _preflight_report(
+            ok=False,
+            codes=["maximum_control_mismatch"],
+            commands=commands,
+            manifest_path=manifest_path,
+            exit_code=2,
+        )
+    if maximum_control is not None and requested_control is None:
+        return _preflight_report(
+            ok=False,
+            codes=["maximum_control_required"],
             commands=commands,
             manifest_path=manifest_path,
             exit_code=2,
@@ -1836,6 +2173,7 @@ def build_runtime_dispatchers(
             "teacher_model",
             "student_device",
             "teacher_device",
+            "checkpoint_every",
         ):
             value = getattr(options, field, None)
             if value is not None:
@@ -2288,13 +2626,16 @@ __all__ = [
     "evaluate_exact_resources",
     "execute_jobs",
     "inspect_external_assets",
+    "materialize_maximum_hybrid_campaign",
     "load_backend_dispatcher",
     "preflight",
     "preflight_command",
+    "promotion_decision",
     "probe_backend_dispatch",
     "probe_environment",
     "run",
     "run_command",
+    "run_campaign",
     "validate_raw_scientific_config",
     "validate_scientific_preflight",
     "validate_output_writable",

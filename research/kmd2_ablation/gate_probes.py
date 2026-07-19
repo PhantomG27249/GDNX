@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 
 import torch
@@ -268,6 +270,135 @@ def _warm_probe(config: ExperimentConfig, spec: Any) -> dict[str, Any]:
     }
 
 
+def _maximum_hybrid_probe(config: ExperimentConfig) -> dict[str, Any]:
+    """Run the flagship gate through a converted production module and real cache carry."""
+    from gdn3.kmd2_native import KMD2NativeAttn
+    from .qwen_hybrid_four_state import FourStateHybridCache, QwenFourStateHybrid
+    from .qwen_hybrid_shared import QwenSharedBraidHybrid, SharedHybridCache
+    from .qwen_training import package_b_auxiliary_loss
+
+    control_id = config.task.params.get("maximum_control")
+    four_state = control_id == "package-b-hola-w64"
+    if control_id not in {"package-a-hola-w64", "package-b-hola-w64"}:
+        return {"available": False, "reason": "unsupported_maximum_control_probe"}
+    prior_rout = os.environ.get("GDN3_KMD2_ROUT")
+    os.environ["GDN3_KMD2_ROUT"] = "1"
+    try:
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(1729)
+            model_config = SimpleNamespace(
+                hidden_size=16, linear_num_value_heads=2, linear_num_key_heads=2,
+                linear_key_head_dim=(8 if four_state else 4), linear_value_head_dim=4,
+                linear_conv_kernel_dim=3, rms_norm_eps=1e-6,
+            )
+            native = KMD2NativeAttn(model_config, layer_idx=0)
+            module = (QwenFourStateHybrid.from_native(native) if four_state
+                      else QwenSharedBraidHybrid.from_native(native))
+            identity_hidden = torch.randn(2, 4, 16)
+            native_identity_output = native(identity_hidden)
+            converted_identity_output = module(identity_hidden)
+            native_parity_passed = torch.allclose(
+                converted_identity_output, native_identity_output,
+                atol=1e-6, rtol=1e-6,
+            )
+            hidden = torch.randn(2, 4, 16, requires_grad=True)
+            valid = torch.tensor([[True, True, True, False], [True, True, True, True]])
+            boundary = torch.tensor([[True, False, False, False], [True, False, True, False]])
+            neutral_forward = module(hidden, boundary=boundary, valid=valid, use_cache=True)
+            neutral_repeat = module(hidden, boundary=boundary, valid=valid)
+            deterministic_repeat = torch.equal(neutral_forward, neutral_repeat)
+            cache = module.last_recurrent_cache
+            expected_cache = FourStateHybridCache if four_state else SharedHybridCache
+            if type(cache) is not expected_cache or cache.hola_state is None:
+                raise RuntimeError("real hybrid probe did not produce its genuine cache carry")
+            scan_output, scan_cache = module.scan(
+                hidden.detach(), boundary=boundary, valid=valid, initial_cache=None
+            )
+            if type(scan_cache) is not expected_cache or not bool(torch.isfinite(scan_output).all()):
+                raise RuntimeError("real hybrid scan did not execute")
+            with torch.no_grad():
+                module.components.cache_gate_logit.fill_(torch.logit(torch.tensor(0.25)))
+            active = module(hidden, boundary=boundary, valid=valid, use_cache=True)
+            active_delta = float((active - neutral_forward).detach().abs().max())
+            loss = active.square().mean()
+            loss.backward(retain_graph=four_state)
+            connected = hidden.grad is not None and bool(torch.isfinite(hidden.grad).all())
+            projection_gradients = [
+                getattr(module.components, name).grad
+                for name in ("q_weight", "k_weight", "v_weight", "erase_weight", "write_weight", "z_weight")
+            ]
+            connected = connected and all(_finite_nonzero(value) for value in projection_gradients)
+            lane_specialization = True
+            braid_staging = True
+            if four_state:
+                module.zero_grad(set_to_none=True)
+                auxiliary, _ = package_b_auxiliary_loss(
+                    module, lambda_spec=1.0, lambda_gate=0.1,
+                    successful_updates=0, specialization_updates=1,
+                )
+                auxiliary.backward()
+                q_gradient = module.components.q_weight.grad.reshape(4, -1)
+                lane_specialization = torch.unique(q_gradient, dim=0).shape[0] == 4
+                gate_gradient = module.components.trapezoid_proj.bias.grad
+                # Execute the declared staging: a successful specialization/gate
+                # update first breaks lane symmetry, then ordinary loss can reach
+                # the token-dependent trapezoid on the following step.
+                with torch.no_grad():
+                    for name in ("q_weight", "k_weight", "v_weight", "erase_weight",
+                                 "write_weight", "z_weight"):
+                        parameter = getattr(module.components, name)
+                        parameter.add_(parameter.grad, alpha=-0.1)
+                module.zero_grad(set_to_none=True)
+                routed, _ = module.scan(hidden.detach(), boundary=boundary, valid=valid)
+                routed.square().mean().backward()
+                trapezoid_gradient = module.components.trapezoid_proj.weight.grad
+                braid_staging = _finite_nonzero(gate_gradient) and _finite_nonzero(trapezoid_gradient)
+            hola = module.last_recurrent_cache.hola_state
+            admissions = int(hola.admission_count.sum().cpu())
+            details = {
+                "kind": "real_converted_kmd2_hybrid_module",
+                "control_id": control_id,
+                "native_base_class": type(native).__name__,
+                "converted_module_class": type(module).__name__,
+                "forward_executed": True,
+                "scan_executed": True,
+                "cache_schema": "states" if four_state else "state",
+                "hola_admissions": admissions,
+                "hola_inclusive": admissions > 0 and bool((hola.block_positions >= 0).any()),
+                "finite_connected_gradients": connected,
+                "lane_specialization_gradients": bool(lane_specialization),
+                "braid_staging_passed": bool(braid_staging),
+                "native_parity_passed": native_parity_passed,
+                "native_parity_expected": not four_state,
+                "native_parity_atol": 1e-6,
+                "native_parity_rtol": 1e-6,
+                "neutral_repeat_deterministic": deterministic_repeat,
+                "active_max_abs_delta": active_delta,
+                "native_max_abs_delta": float(
+                    (converted_identity_output - native_identity_output).detach().abs().max()
+                ),
+            }
+            return {
+                "available": True,
+                # Package B intentionally changes decay horizons and enables a
+                # .5-initialized token trapezoid, so source-output parity is not
+                # its identity contract. Conversion determinism is.
+                "identity_passed": deterministic_repeat and (native_parity_passed or four_state),
+                "active_effect_passed": (
+                    active_delta > 0 and connected and lane_specialization
+                    and braid_staging and details["hola_inclusive"]
+                ),
+                "missing_parameters": (), "disconnected_parameters": (),
+                "frozen_zero_gates": (), "native_feature_present": False,
+                "probe": details,
+            }
+    finally:
+        if prior_rout is None:
+            os.environ.pop("GDN3_KMD2_ROUT", None)
+        else:
+            os.environ["GDN3_KMD2_ROUT"] = prior_rout
+
+
 def measure_scientific_gates(config: ExperimentConfig, spec: Any) -> dict[str, Any]:
     """Return freshly measured identity/active evidence for one registered arm."""
 
@@ -300,6 +431,8 @@ def measure_scientific_gates(config: ExperimentConfig, spec: Any) -> dict[str, A
                 "active_state_elements": active_state,
             },
         }
+    if spec.mechanism == "maximum_hybrid":
+        return _maximum_hybrid_probe(config)
     if spec.mechanism == "gdn2_decoupled":
         probe = _probe_config(config, spec)
         missing, disconnected, frozen = _parameter_evidence(

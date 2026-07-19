@@ -14,8 +14,10 @@ from pathlib import Path
 from typing import Any
 
 
+# 2026-07-14: fast scan gated to CUDA inputs (CPU preflight probes take the
+# reference loop); see bible.txt footnote.
 KMD2_NATIVE_SHA256 = (
-    "30b820ddacab4a5632f054ab6ef97a46083c5ac74e15f4c1eb5bdf09a27dce68"
+    "9d17d8f872a57a54e5a990170903e20865a2ebd44ece5432a9d9a7bf5cc38779"
 )
 KMD2_FAST_SCAN_SHA256 = (
     "5f6c83fb5afb869765d5599f2a726e5cfd93d939cd6e6fa4863b0fee2267a0b4"

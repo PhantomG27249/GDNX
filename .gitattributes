@@ -1,5 +1,0 @@
-*.py text eol=lf
-*.sh text eol=lf
-
-runs/kmd2_native_heal/final/gdn3_layers.pt filter=lfs diff=lfs merge=lfs -text
-research/runs_fable/experiment_data/qk_probe_init.pt filter=lfs diff=lfs merge=lfs -text

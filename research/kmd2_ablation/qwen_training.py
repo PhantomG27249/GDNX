@@ -6,16 +6,24 @@ import copy
 import hashlib
 import json
 import math
+import os
 import random
+import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import torch
 import torch.nn.functional as F
+
+from .qwen_fused_loss import fused_heal_ce_kl
+
+
+_OPTIMIZER_STATE_OFFLOAD_THRESHOLD_BYTES = 1 << 30
 
 
 class QwenTrainingError(RuntimeError):
@@ -43,6 +51,18 @@ def _finite_real(name: str, value: object, *, minimum: float = 0.0) -> float:
     return result
 
 
+def _tensors_are_finite(values: Sequence[torch.Tensor]) -> bool:
+    """Check many tensors with one host synchronization per device."""
+    grouped: dict[torch.device, list[torch.Tensor]] = {}
+    for value in values:
+        if not isinstance(value, torch.Tensor):
+            raise TypeError("finite checks require tensors")
+        grouped.setdefault(value.device, []).append(value.detach())
+    return all(bool(torch.stack([
+        torch.isfinite(value).all() for value in tensors
+    ]).all()) for tensors in grouped.values())
+
+
 @dataclass(frozen=True)
 class QwenHealTrainingConfig:
     """Fixed objective and stopping contract shared by all paired arms."""
@@ -56,6 +76,9 @@ class QwenHealTrainingConfig:
     max_updates: int
     max_tokens: int
     gradient_checkpointing: bool
+    lambda_spec: float = 0.0
+    lambda_gate: float = 0.0
+    specialization_updates: int = 0
 
     def __post_init__(self) -> None:
         if type(self.objective) is not str or not self.objective:
@@ -74,6 +97,10 @@ class QwenHealTrainingConfig:
                 raise ValueError(f"{name} must be a positive integer")
         if type(self.gradient_checkpointing) is not bool:
             raise TypeError("gradient_checkpointing must be boolean")
+        for name in ("lambda_spec", "lambda_gate"):
+            object.__setattr__(self, name, _finite_real(name, getattr(self, name)))
+        if type(self.specialization_updates) is not int or self.specialization_updates < 0:
+            raise ValueError("specialization_updates must be a nonnegative integer")
         if self.objective == "synthetic_only" and (
             self.kl_weight != 0.0 or self.layerwise_weight != 0.0
         ):
@@ -159,6 +186,104 @@ def distillation_kl(
     ) * (scale * scale) / student.shape[1]
 
 
+_LAYERWISE_CHUNK_ELEMENTS = 1 << 20
+
+
+def _chunked_layerwise_statistics(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return FP32 residual/teacher means with bounded temporary storage.
+
+    This helper is only dispatched for contiguous CUDA BF16 tensors.  The
+    teacher is copied between GPUs in BF16 before conversion, rather than
+    materializing a full cross-device FP32 copy.  FP32 reductions are combined
+    through FP64 *scalar* accumulation so chunking does not accumulate a
+    sequence-length-dependent rounding error.
+    """
+    student_flat = student.reshape(-1)
+    teacher_flat = teacher.detach().reshape(-1)
+    residual_sums: list[torch.Tensor] = []
+    teacher_sums: list[torch.Tensor] = []
+    for start in range(0, student_flat.numel(), _LAYERWISE_CHUNK_ELEMENTS):
+        stop = min(start + _LAYERWISE_CHUNK_ELEMENTS, student_flat.numel())
+        student_float = student_flat[start:stop].float()
+        teacher_local = teacher_flat[start:stop].to(
+            device=student.device,
+            dtype=torch.bfloat16,
+            non_blocking=True,
+        )
+        teacher_float = teacher_local.float()
+        residual_sums.append((student_float - teacher_float).square().sum())
+        teacher_sums.append(teacher_float.square().sum())
+    residual_mean = (
+        torch.stack(residual_sums).to(torch.float64).sum()
+        / student_flat.numel()
+    ).float()
+    teacher_mean = (
+        torch.stack(teacher_sums).to(torch.float64).sum()
+        / student_flat.numel()
+    ).float()
+    return residual_mean, teacher_mean
+
+
+class _MemoryBoundedLayerwiseAlignment(torch.autograd.Function):
+    """Rematerialize BF16 residuals instead of saving full FP32 differences."""
+
+    @staticmethod
+    def forward(
+        ctx: object,
+        student: torch.Tensor,
+        teacher: torch.Tensor,
+    ) -> torch.Tensor:
+        residual_mean, teacher_mean = _chunked_layerwise_statistics(
+            student, teacher
+        )
+        denominator = teacher_mean.clamp_min(1.0e-8)
+        ctx.set_materialize_grads(False)
+        ctx.save_for_backward(student, teacher, denominator)
+        return residual_mean / denominator
+
+    @staticmethod
+    def backward(
+        ctx: object,
+        grad_output: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, None]:
+        if grad_output is None:
+            return None, None
+        student, teacher, denominator = ctx.saved_tensors
+        student_flat = student.reshape(-1)
+        teacher_flat = teacher.detach().reshape(-1)
+        gradient = torch.empty_like(student_flat)
+        scale = grad_output.float().div(denominator).div(student_flat.numel())
+        for start in range(0, student_flat.numel(), _LAYERWISE_CHUNK_ELEMENTS):
+            stop = min(start + _LAYERWISE_CHUNK_ELEMENTS, student_flat.numel())
+            teacher_local = teacher_flat[start:stop].to(
+                device=student.device,
+                dtype=torch.bfloat16,
+                non_blocking=True,
+            )
+            residual = student_flat[start:stop].float() - teacher_local.float()
+            gradient[start:stop] = residual.mul(2.0).mul(scale)
+        return gradient.reshape_as(student), None
+
+
+def _can_use_memory_bounded_layerwise(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+) -> bool:
+    return (
+        torch.is_grad_enabled()
+        and student.requires_grad
+        and student.is_cuda
+        and teacher.is_cuda
+        and student.dtype == torch.bfloat16
+        and teacher.dtype == torch.bfloat16
+        and student.is_contiguous()
+        and teacher.is_contiguous()
+    )
+
+
 def layerwise_alignment_loss(
     student_hidden: Sequence[torch.Tensor],
     teacher_hidden: Sequence[torch.Tensor],
@@ -187,6 +312,9 @@ def layerwise_alignment_loss(
             raise TypeError(f"hidden layer {index} must contain floating tensors")
         if student.shape != teacher.shape or student.ndim < 2:
             raise ValueError(f"hidden layer {index} shape does not align")
+        if _can_use_memory_bounded_layerwise(student, teacher):
+            losses.append(_MemoryBoundedLayerwiseAlignment.apply(student, teacher))
+            continue
         teacher_float = teacher.detach().to(
             device=student.device, dtype=torch.float32
         )
@@ -229,25 +357,42 @@ def compute_heal_loss(
         "student_logits", _output_field(student_output, "logits")
     )
     zero = student_logits.sum() * 0.0
-    ce = (
-        causal_cross_entropy(student_logits, labels)
-        if config.ce_weight > 0.0
-        else zero
-    )
     if config.kl_weight > 0.0 or config.layerwise_weight > 0.0:
         if teacher_output is None:
             raise TeacherRequiredError(
                 "teacher_required", "KL/layerwise Qwen heal losses require a teacher"
             )
-    if config.kl_weight > 0.0:
+
+    if config.ce_weight > 0.0 and config.kl_weight > 0.0:
         assert teacher_output is not None
-        kl = distillation_kl(
+        labels = _validate_labels(labels, student_logits)
+        teacher_logits = _validate_logits(
+            "teacher_logits", _output_field(teacher_output, "logits")
+        )
+        if teacher_logits.shape != student_logits.shape:
+            raise ValueError("teacher and student logits must have identical shapes")
+        teacher_logits = teacher_logits.detach()
+        ce, kl = fused_heal_ce_kl(
             student_logits,
-            _output_field(teacher_output, "logits"),
+            teacher_logits,
+            labels,
             temperature=config.temperature,
         )
     else:
-        kl = zero
+        ce = (
+            causal_cross_entropy(student_logits, labels)
+            if config.ce_weight > 0.0
+            else zero
+        )
+        if config.kl_weight > 0.0:
+            assert teacher_output is not None
+            kl = distillation_kl(
+                student_logits,
+                _output_field(teacher_output, "logits"),
+                temperature=config.temperature,
+            )
+        else:
+            kl = zero
     if config.layerwise_weight > 0.0:
         assert teacher_output is not None
         layerwise = layerwise_alignment_loss(
@@ -341,11 +486,121 @@ def build_qwen_heal_optimizer(
                 "weight_decay": 0.0,
             }
         )
-    return torch.optim.AdamW(
+    optimizer_options: dict[str, object] = {}
+    bound_parameters = tuple(parameter for _name, parameter in (*memory, *cache))
+    if bound_parameters and all(parameter.device.type == "cuda" for parameter in bound_parameters):
+        optimizer_options["fused"] = True
+    optimizer = torch.optim.AdamW(
         groups,
         betas=(float(betas[0]), float(betas[1])),
         eps=epsilon,
+        **optimizer_options,
     )
+    # Package B has roughly 4.2 GiB of BF16 Adam moments.  They are not used
+    # during forward/backward, where keeping them resident would overlap with
+    # recurrent scratch and the full-vocabulary loss.  Mark only genuinely
+    # large CUDA optimizers for phase-local CPU storage; small/test jobs keep
+    # ordinary AdamW behavior.
+    estimated_moment_bytes = 2 * sum(
+        parameter.numel() * parameter.element_size()
+        for parameter in bound_parameters
+    )
+    optimizer._gdnx_cpu_state_offload = bool(  # type: ignore[attr-defined]
+        optimizer_options.get("fused") is True
+        and estimated_moment_bytes >= _OPTIMIZER_STATE_OFFLOAD_THRESHOLD_BYTES
+    )
+    optimizer._gdnx_estimated_moment_bytes = estimated_moment_bytes  # type: ignore[attr-defined]
+    return optimizer
+
+
+def _move_optimizer_state_(
+    optimizer: torch.optim.Optimizer, *, to_parameter_devices: bool
+) -> None:
+    """Move Adam state between phase-local GPU use and CPU residency."""
+    if not bool(getattr(optimizer, "_gdnx_cpu_state_offload", False)):
+        return
+    for parameter, state in optimizer.state.items():
+        destination = parameter.device if to_parameter_devices else torch.device("cpu")
+        for name, value in tuple(state.items()):
+            if not isinstance(value, torch.Tensor) or value.device == destination:
+                continue
+            state[name] = value.detach().to(
+                device=destination,
+                non_blocking=(to_parameter_devices and value.device.type == "cpu"),
+            )
+
+
+def _optimizer_state_is_offloaded(optimizer: torch.optim.Optimizer) -> bool:
+    """Return whether every materialized tensor slot is currently on CPU."""
+    tensors = tuple(
+        value
+        for state in optimizer.state.values()
+        for value in state.values()
+        if isinstance(value, torch.Tensor)
+    )
+    return bool(getattr(optimizer, "_gdnx_cpu_state_offload", False)) and all(
+        tensor.device.type == "cpu" for tensor in tensors
+    )
+
+
+def package_b_auxiliary_loss(
+    model: torch.nn.Module, *, lambda_spec: float, lambda_gate: float,
+    successful_updates: int = 0, specialization_updates: int | None = None,
+) -> tuple[torch.Tensor, dict[str, object]]:
+    """Centered rank specialization plus Package-B trapezoid-gate warmup."""
+    spec_scale = _finite_real("lambda_spec", lambda_spec)
+    gate_scale = _finite_real("lambda_gate", lambda_gate)
+    if type(successful_updates) is not int or successful_updates < 0:
+        raise ValueError("successful_updates must be a nonnegative integer")
+    if specialization_updates is not None and (
+        type(specialization_updates) is not int or specialization_updates < 0
+    ):
+        raise ValueError("specialization_updates must be a nonnegative integer or None")
+    components = tuple(
+        module for module in model.modules()
+        if getattr(module, "package", None) == "four_state"
+        and hasattr(module, "specialization_probe")
+    )
+    if not components:
+        raise ValueError("Package-B auxiliary loss requires four-state HybridComponents")
+    identities = tuple({
+        "probe_sha256": module.specialization_probe_sha256,
+        "probe_hashes": {
+            "key": module.specialization_probe_sha256,
+            "value": module.specialization_value_probe_sha256,
+        },
+        "coefficients": [value / (20.0 ** .5) for value in (-3.0, -1.0, 1.0, 3.0)],
+    } for module in components)
+    identity: dict[str, object] = dict(identities[0])
+    identity.update({"lambda_spec": spec_scale, "lambda_gate": gate_scale,
+                     "specialization_updates": specialization_updates})
+    if any(item != identities[0] for item in identities[1:]):
+        raise ValueError("Package-B specialization identity differs across layers")
+    active = specialization_updates is None or successful_updates < specialization_updates
+    if not active:
+        reference = components[0].q_weight
+        return torch.zeros((), device=reference.device, dtype=reference.dtype), identity
+    module_losses = []
+    gates = []
+    for module in components:
+        q = module.q_weight
+        coefficients = module.specialization_coefficients.to(device=q.device, dtype=q.dtype)
+        projection_losses = []
+        for name in ("q_weight", "k_weight", "v_weight", "erase_weight", "write_weight", "z_weight"):
+            weight = getattr(module, name)
+            centered = weight - weight.mean(dim=0, keepdim=True)
+            base_probe = (module.specialization_probe if weight.shape[1] == q.shape[1]
+                          else module.specialization_value_probe)
+            probe = base_probe.to(device=weight.device, dtype=weight.dtype)
+            projection_losses.append((coefficients[:, None, None] * centered * probe[None]).mean())
+        module_losses.append(torch.stack(projection_losses).sum())
+        # The removed state-router gate is not part of decay-only braiding.
+        # lambda is the CURRENT-endpoint coefficient, so the actual trapezoid
+        # strength is (1-lambda).  Reward that previous-endpoint contribution.
+        # A zero logit means lambda=.5 (equal endpoints), not Euler identity.
+        gates.append((1.0 - module.trapezoid_proj.bias.sigmoid()).mean())
+    total = spec_scale * torch.stack(module_losses).mean() - gate_scale * torch.stack(gates).mean()
+    return total, identity
 
 
 def project_cache_amplitudes_(model: torch.nn.Module) -> tuple[str, ...]:
@@ -365,6 +620,67 @@ def project_cache_amplitudes_(model: torch.nn.Module) -> tuple[str, ...]:
                 )
             parameter.clamp_(0.0, 1.0)
     return tuple(name for name, _ in amplitudes)
+
+
+_HYBRID_OPTIMIZER_PATHS = frozenset(
+    {"ordinary", "amp", "skipped", "resumed", "sharded"}
+)
+
+
+def project_hybrid_constraints_(model: torch.nn.Module) -> tuple[str, ...]:
+    """Project all bounded Package-A/B coefficients exactly once per module."""
+    projected: list[str] = []
+    with torch.no_grad():
+        for prefix, module in model.named_modules():
+            projector = getattr(module, "project_coefficients_", None)
+            if callable(projector):
+                projector()
+                projected.append(prefix or "<root>")
+        for name, parameter in model.named_parameters():
+            suffix = name.rsplit(".", 1)[-1]
+            if suffix in {"trapezoid_gate", "lookahead_gate", "d_raw"}:
+                if not bool(torch.isfinite(parameter).all()):
+                    raise QwenTrainingError("nonfinite_parameter", f"hybrid gate {name} is nonfinite")
+                parameter.clamp_(0.0, 1.0)
+                projected.append(name)
+    return tuple(dict.fromkeys(projected))
+
+
+def run_qwen_arm(
+    *, model: torch.nn.Module, optimizer_path: str,
+    update: Callable[[], object], execution: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Run the common projected optimizer boundary for every hybrid path."""
+    if not isinstance(model, torch.nn.Module):
+        raise TypeError("model must be a torch module")
+    if optimizer_path not in _HYBRID_OPTIMIZER_PATHS or not callable(update):
+        raise QwenTrainingError("unsupported_execution", "unsupported_execution optimizer path")
+    settings = dict(execution or {})
+    tp = settings.get("tensor_parallel", 1)
+    pp = settings.get("pipeline_parallel", 1)
+    dp = settings.get("data_parallel", 1)
+    checkpointing = settings.get("activation_checkpointing", False)
+    if any(type(value) is not int or value < 1 for value in (tp, pp, dp)):
+        raise QwenTrainingError("unsupported_execution", "unsupported_execution parallel setting")
+    if tp != 1 or pp != 1:
+        raise QwenTrainingError("unsupported_execution", "unsupported_execution TP/PP")
+    if dp != 1:
+        raise QwenTrainingError(
+            "unsupported_execution", "unsupported_execution data parallel is not implemented"
+        )
+    if type(checkpointing) is not bool:
+        raise QwenTrainingError("unsupported_execution", "unsupported_execution checkpointing")
+    if settings.get("packed") is True and not settings.get("document_boundaries"):
+        raise QwenTrainingError("unsupported_execution", "unsupported_execution boundaryless packing")
+    if checkpointing:
+        checkpoint_hook = settings.get("activation_checkpointing_hook")
+        if not callable(checkpoint_hook):
+            raise QwenTrainingError("unsupported_execution", "unsupported_execution checkpointing hook missing")
+        checkpoint_hook(model)
+    completed = bool(update())
+    projected = project_hybrid_constraints_(model)
+    return {"optimizer_path": optimizer_path, "completed": completed,
+            "projected": projected, "execution": settings}
 
 
 @dataclass(frozen=True)
@@ -395,6 +711,23 @@ class HealStepLog:
         }
 
 
+def _emit_live_metrics(path: Path, log: HealStepLog, max_updates: int) -> None:
+    """Best-effort JSONL append for the live-metrics watcher.
+
+    Opt-in via GDNX_LIVE_METRICS=1; every failure is swallowed so the emitter
+    can never alter or abort a training run.
+    """
+    try:
+        record = log.as_dict()
+        record["max_updates"] = max_updates
+        record["wall_time"] = time.time()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+    except Exception:
+        pass
+
+
 class QwenHealTrainer:
     """One deterministic paired-heal update path, independent of the main trainer."""
 
@@ -411,6 +744,8 @@ class QwenHealTrainer:
         arm: str,
         expected_example_windows: tuple[tuple[str, ...], ...],
         teacher_device: str | torch.device | None = None,
+        distributed: bool = False,
+        grad_scaler: object | None = None,
     ) -> None:
         if not isinstance(model, torch.nn.Module):
             raise TypeError("model must be a torch.nn.Module")
@@ -451,12 +786,15 @@ class QwenHealTrainer:
             ):
                 raise ValueError("each expected example window must be nonempty IDs")
         if config.gradient_checkpointing:
-            enable = getattr(model, "gradient_checkpointing_enable", None)
+            underlying = getattr(model, "module", model)
+            enable = getattr(underlying, "gradient_checkpointing_enable", None)
             if not callable(enable):
                 raise TypeError(
                     "gradient checkpointing was requested but the model cannot enable it"
                 )
-            enable()
+            if not getattr(underlying, "_kmd2_checkpointing_enabled", False):
+                enable()
+                underlying._kmd2_checkpointing_enabled = True
         if teacher is not None:
             teacher.eval()
             for parameter in teacher.parameters():
@@ -470,6 +808,7 @@ class QwenHealTrainer:
         self.model = model
         self.teacher = teacher
         self.optimizer = optimizer
+        _move_optimizer_state_(self.optimizer, to_parameter_devices=False)
         self.scheduler = scheduler
         self.config = config
         self.job_id = job_id
@@ -481,6 +820,14 @@ class QwenHealTrainer:
         self.tokens_seen = 0
         self.example_cursor = 0
         self.skipped_steps = 0
+        self.distributed = distributed
+        if grad_scaler is not None and any(
+            not callable(getattr(grad_scaler, name, None))
+            for name in ("scale", "unscale_", "step", "update", "get_scale", "state_dict", "load_state_dict")
+        ):
+            raise TypeError("grad_scaler must implement the GradScaler state/step interface")
+        self.grad_scaler = grad_scaler
+        self.last_rank_update_norms: tuple[float, ...] = ()
 
     def _prevalidate_batches(
         self, microbatches: Sequence[Mapping[str, object]]
@@ -548,6 +895,27 @@ class QwenHealTrainer:
         self.skipped_steps += 1
         raise QwenTrainingError(code, message)
 
+    def _distributed_any(self, value: bool) -> bool:
+        if not self.distributed:
+            return value
+        flag = torch.tensor(int(value), device=next(self.model.parameters()).device)
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+        return bool(flag.item())
+
+    def _distributed_sum_int(self, value: int) -> int:
+        if not self.distributed:
+            return value
+        total = torch.tensor(value, dtype=torch.int64, device=next(self.model.parameters()).device)
+        torch.distributed.all_reduce(total, op=torch.distributed.ReduceOp.SUM)
+        return int(total.item())
+
+    def _synchronize_scaler_state(self) -> None:
+        if not self.distributed or self.grad_scaler is None:
+            return
+        objects = [copy.deepcopy(self.grad_scaler.state_dict()) if torch.distributed.get_rank() == 0 else None]
+        torch.distributed.broadcast_object_list(objects, src=0)
+        self.grad_scaler.load_state_dict(objects[0])
+
     def train_update(
         self, microbatches: Sequence[Mapping[str, object]]
     ) -> HealStepLog:
@@ -556,6 +924,7 @@ class QwenHealTrainer:
                 "update_budget_exhausted", "configured update budget is exhausted"
             )
         token_count, example_ids = self._prevalidate_batches(microbatches)
+        token_count = self._distributed_sum_int(token_count)
         if self.tokens_seen + token_count > self.config.max_tokens:
             raise QwenTrainingError(
                 "token_budget_exhausted", "update would exceed the fixed token budget"
@@ -563,6 +932,10 @@ class QwenHealTrainer:
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
         totals = {"total": 0.0, "ce": 0.0, "kl": 0.0, "layerwise": 0.0}
+        if self.config.specialization_updates > 0:
+            totals["specialization"] = 0.0
+        loss_names = tuple(totals)
+        logged_loss_vectors: list[torch.Tensor] = []
         divisor = float(self.config.accumulation_steps)
         for batch in microbatches:
             labels = batch["labels"]
@@ -570,8 +943,8 @@ class QwenHealTrainer:
             model_inputs = self._model_inputs(batch)
             from .qwen_exact_cache import guarded_model_forward
 
-            student_output = guarded_model_forward(self.model, **model_inputs)
             if self.teacher is None:
+                student_output = guarded_model_forward(self.model, **model_inputs)
                 teacher_output = None
             else:
                 teacher_inputs = {
@@ -583,56 +956,169 @@ class QwenHealTrainer:
                     )
                     for name, value in model_inputs.items()
                 }
-                with torch.no_grad():
-                    teacher_output = self.teacher(**teacher_inputs)
+                student_device = next(self.model.parameters()).device
+                overlap_devices = (
+                    self.teacher_device is not None
+                    and student_device.type == "cuda"
+                    and self.teacher_device.type == "cuda"
+                    and student_device != self.teacher_device
+                )
+                if overlap_devices:
+                    # CUDA calls are asynchronous across devices.  Queue the
+                    # frozen teacher first so it executes on the second GPU
+                    # while the Python-heavy recurrent student forward is
+                    # being dispatched on the first.
+                    with torch.no_grad():
+                        teacher_output = self.teacher(**teacher_inputs)
+                    student_output = guarded_model_forward(self.model, **model_inputs)
+                else:
+                    student_output = guarded_model_forward(self.model, **model_inputs)
+                    with torch.no_grad():
+                        teacher_output = self.teacher(**teacher_inputs)
             breakdown = compute_heal_loss(
                 student_output, teacher_output, labels, self.config
             )
+            auxiliary = breakdown.total.new_zeros(())
+            if self.config.specialization_updates > 0:
+                try:
+                    auxiliary, _ = package_b_auxiliary_loss(
+                        self.model, lambda_spec=self.config.lambda_spec,
+                        lambda_gate=self.config.lambda_gate, successful_updates=self.step,
+                        specialization_updates=self.config.specialization_updates,
+                    )
+                except ValueError as error:
+                    if "requires four-state" not in str(error):
+                        raise
             values = {
-                "total": breakdown.total,
+                "total": breakdown.total + auxiliary,
                 "ce": breakdown.ce,
                 "kl": breakdown.kl,
                 "layerwise": breakdown.layerwise,
             }
-            if any(not bool(torch.isfinite(value.detach()).all()) for value in values.values()):
+            if self.config.specialization_updates > 0:
+                values["specialization"] = auxiliary
+            loss_vector = torch.stack([values[name].detach() for name in loss_names])
+            local_nonfinite = not _tensors_are_finite((loss_vector,))
+            if self._distributed_any(local_nonfinite):
                 self._fail_nonfinite(
                     "nonfinite_loss", "Qwen heal loss contains a nonfinite value"
                 )
-            (breakdown.total / divisor).backward()
-            for name, value in values.items():
-                totals[name] += float(value.detach().cpu()) / divisor
+            scaled_loss = values["total"] / divisor
+            if self.grad_scaler is not None:
+                scaled_loss = self.grad_scaler.scale(scaled_loss)
+            scaled_loss.backward()
+            logged_loss_vectors.append(loss_vector)
+            # Backward has consumed the output graphs.  Drop the multi-GiB
+            # vocabulary tensors before Adam moments are brought onto the GPU
+            # for their short optimizer phase.
+            del scaled_loss, values, breakdown, student_output, teacher_output
+
+        # Preserve the prior Python-double accumulation order while collapsing
+        # one device-to-host transfer per logged loss and microbatch into one
+        # compact transfer per update.
+        logged_losses = torch.stack(logged_loss_vectors).cpu().tolist()
+        for row in logged_losses:
+            for name, value in zip(loss_names, row, strict=True):
+                totals[name] += float(value) / divisor
 
         optimizer_parameters = [
             parameter
             for group in self.optimizer.param_groups
             for parameter in group["params"]
         ]
-        if any(parameter.grad is None for parameter in optimizer_parameters):
+        if self.grad_scaler is not None:
+            self.grad_scaler.unscale_(self.optimizer)
+        if self._distributed_any(any(parameter.grad is None for parameter in optimizer_parameters)):
             self._fail_nonfinite(
                 "missing_gradient", "a declared trainable parameter has no gradient"
             )
-        if any(
-            not bool(torch.isfinite(parameter.grad.detach()).all())
-            for parameter in optimizer_parameters
-            if parameter.grad is not None
-        ):
+        gradients = tuple(parameter.grad for parameter in optimizer_parameters
+                          if parameter.grad is not None)
+        if self._distributed_any(not _tensors_are_finite(gradients)):
             self._fail_nonfinite(
                 "nonfinite_gradient", "Qwen heal gradients contain a nonfinite value"
             )
 
-        parameter_snapshot = [parameter.detach().clone() for parameter in optimizer_parameters]
-        optimizer_snapshot = copy.deepcopy(self.optimizer.state_dict())
+        # Keep transactional rollback off-device: duplicating all Package-B
+        # parameters and AdamW slots in VRAM makes the real 18-layer update
+        # needlessly unrunnable.  CPU snapshots retain exact rollback behavior.
+        parameter_snapshot = [
+            parameter.detach().to(device="cpu", copy=True).contiguous()
+            for parameter in optimizer_parameters
+        ]
+        parameter_names = {
+            id(parameter): name for name, parameter in self.model.named_parameters()
+        }
+        rank_snapshot_indices = [
+            index for index, parameter in enumerate(optimizer_parameters)
+            if ".components." in f".{parameter_names.get(id(parameter), '')}"
+            and parameter.ndim > 0 and parameter.shape[0] == 4
+        ]
+        from .qwen_checkpoint import _portable_cpu_copy
+
+        optimizer_snapshot = _portable_cpu_copy(self.optimizer.state_dict())
         scheduler_snapshot = copy.deepcopy(self.scheduler.state_dict())
+        scaler_snapshot = None if self.grad_scaler is None else copy.deepcopy(self.grad_scaler.state_dict())
         try:
-            self.optimizer.step()
+            skipped_by_scaler = False
+            _move_optimizer_state_(self.optimizer, to_parameter_devices=True)
+            try:
+                if self.grad_scaler is None:
+                    self.optimizer.step()
+                else:
+                    scale_before = float(self.grad_scaler.get_scale())
+                    self.grad_scaler.step(self.optimizer)
+                    self.grad_scaler.update()
+                    local_scaler_skip = float(self.grad_scaler.get_scale()) < scale_before
+                    skipped_by_scaler = self._distributed_any(local_scaler_skip)
+                    if self.distributed and skipped_by_scaler:
+                        self.grad_scaler.load_state_dict(scaler_snapshot)
+                    self._synchronize_scaler_state()
+            finally:
+                _move_optimizer_state_(self.optimizer, to_parameter_devices=False)
+            if skipped_by_scaler:
+                with torch.no_grad():
+                    for parameter, snapshot in zip(optimizer_parameters, parameter_snapshot):
+                        parameter.copy_(snapshot.to(device=parameter.device))
+                self.optimizer.load_state_dict(optimizer_snapshot)
+                _move_optimizer_state_(self.optimizer, to_parameter_devices=False)
+                self.scheduler.load_state_dict(scheduler_snapshot)
+                self.optimizer.zero_grad(set_to_none=True)
+                self.skipped_steps += 1
+                rates = {
+                    str(group.get("name", f"group_{index}")): float(group["lr"])
+                    for index, group in enumerate(self.optimizer.param_groups)
+                }
+                return HealStepLog(
+                    job_id=self.job_id, pairing_id=self.pairing_id, arm=self.arm,
+                    update=self.step, tokens_seen=self.tokens_seen, example_ids=example_ids,
+                    microbatches=self.config.accumulation_steps, losses=totals,
+                    learning_rates=rates, skipped_steps=self.skipped_steps,
+                )
             project_cache_amplitudes_(self.model)
             from .qwen_variants import project_variant_gates_
 
             project_variant_gates_(self.model)
-            if any(
-                not bool(torch.isfinite(parameter.detach()).all())
-                for parameter in optimizer_parameters
-            ):
+            project_hybrid_constraints_(self.model)
+            if self.distributed:
+                for parameter in optimizer_parameters:
+                    lower = parameter.detach().clone()
+                    upper = parameter.detach().clone()
+                    torch.distributed.all_reduce(lower, op=torch.distributed.ReduceOp.MIN)
+                    torch.distributed.all_reduce(upper, op=torch.distributed.ReduceOp.MAX)
+                    if not torch.equal(lower, upper):
+                        raise QwenTrainingError(
+                            "distributed_projection_mismatch",
+                            "post-projection parameters differ across data-parallel ranks",
+                        )
+            if rank_snapshot_indices:
+                rank_squares = torch.zeros(4, dtype=torch.float64)
+                for index in rank_snapshot_indices:
+                    after = optimizer_parameters[index].detach().to(device="cpu")
+                    before = parameter_snapshot[index]
+                    rank_squares += (after - before).double().reshape(4, -1).square().sum(1)
+                self.last_rank_update_norms = tuple(float(value) for value in rank_squares.sqrt())
+            if not _tensors_are_finite(tuple(optimizer_parameters)):
                 raise QwenTrainingError(
                     "nonfinite_parameter", "optimizer produced a nonfinite parameter"
                 )
@@ -640,9 +1126,13 @@ class QwenHealTrainer:
         except BaseException:
             with torch.no_grad():
                 for parameter, snapshot in zip(optimizer_parameters, parameter_snapshot):
-                    parameter.copy_(snapshot)
+                    parameter.copy_(snapshot.to(device=parameter.device))
             self.optimizer.load_state_dict(optimizer_snapshot)
+            _move_optimizer_state_(self.optimizer, to_parameter_devices=False)
             self.scheduler.load_state_dict(scheduler_snapshot)
+            if self.grad_scaler is not None:
+                self.grad_scaler.load_state_dict(scaler_snapshot)
+                self._synchronize_scaler_state()
             self.optimizer.zero_grad(set_to_none=True)
             self.skipped_steps += 1
             raise
@@ -704,7 +1194,168 @@ _QWEN_ARM_IDS = {
     "exact_cache.selector.recency": "recency",
     "surprise": "surprise",
     "exact_cache.selector.exact_outer": "surprise",
+    "gdn2-channel-r1": "native",
+    "rout-4": "native",
+    "mimo-r2": "native",
+    "mimo-r4": "native",
+    "rot-off": "native",
+    "rot-constant": "native",
+    "rot-noncumulative": "native",
+    "rot-fixed-rope": "native",
+    "rot-moving-frame-oracle": "native",
+    "trapezoid": "native",
+    "lookahead": "native",
+    "qk-bc-additive": "native",
+    "qk-diagonal": "native",
+    "gdn2-mimo-r4-braid-shared-hola-w64": "native",
+    "gdn2-mimo-r4-braid-four-state-hola-w64": "native",
 }
+
+
+@dataclass(frozen=True)
+class _ArchitectureDispatchContract:
+    arm: str
+    architecture_arm_id: str
+    registry_sha256: str
+    mimo_rank: int
+    trainable_names: tuple[str, ...]
+    diagnostic_training: bool = False
+
+
+def _architecture_dispatch_contract(
+    job: Mapping[str, object], config: Mapping[str, object]
+) -> _ArchitectureDispatchContract | None:
+    """Validate architecture identity before any data/model construction."""
+    from .architecture import TARGET_LAYERS, architecture_record, registry_sha256
+    from .qwen_architecture import QwenArchitectureConfig
+
+    arm_id = job.get("arm_id")
+    architecture = config.get("architecture")
+    architecture_arm_id = (
+        architecture.get("arm_id") if isinstance(architecture, Mapping) else None
+    )
+    architecture_ids = {
+        "rout-4", "mimo-r2", "mimo-r4", "rot-off", "rot-constant", "rot-noncumulative",
+        "rot-fixed-rope", "rot-moving-frame-oracle",
+        "trapezoid", "lookahead", "qk-bc-additive", "qk-diagonal",
+        "gdn2-mimo-r4-braid-shared-hola-w64",
+        "gdn2-mimo-r4-braid-four-state-hola-w64",
+    }
+    if arm_id not in architecture_ids and architecture_arm_id not in architecture_ids:
+        return None
+    if (
+        arm_id not in architecture_ids
+        or architecture_arm_id not in architecture_ids
+        or architecture_arm_id != arm_id
+    ):
+        raise QwenRuntimeConfigurationError(
+            "architecture_arm_mismatch", "job arm_id does not match canonical architecture arm_id"
+        )
+    assert isinstance(architecture, Mapping)
+    digest = architecture.get("registry_sha256")
+    submitted_digest = job.get("architecture_registry_sha256")
+    if digest != submitted_digest or digest != registry_sha256():
+        raise QwenRuntimeConfigurationError(
+            "architecture_registry_hash_mismatch", "architecture registry identity is stale or inconsistent"
+        )
+    record = architecture_record(arm_id)
+    submitted_width = architecture.get("output_width", record.output_width)
+    if type(submitted_width) is not int:
+        raise QwenRuntimeConfigurationError(
+            "architecture_width_invalid", "architecture output_width must be an int"
+        )
+    if submitted_width != record.output_width:
+        raise QwenRuntimeConfigurationError(
+            "architecture_width_mismatch", "job width does not match the canonical architecture arm"
+        )
+    rank = architecture.get("mimo_rank", record.mimo_rank)
+    if rank != record.mimo_rank:
+        raise QwenRuntimeConfigurationError(
+            "architecture_rank_mismatch", "job rank does not match the canonical true MIMO arm"
+        )
+    rotation_arm = str(arm_id).startswith("rot-")
+    hybrid_arm = str(arm_id).startswith("gdn2-mimo-r4-braid-")
+    forbidden = (
+        submitted_width != (4 if arm_id == "rout-4" or hybrid_arm else 1)
+        or architecture.get("gate_mode", record.gate_mode) != ("channelwise" if hybrid_arm else "scalar")
+        or bool(architecture.get("cache_enabled", record.cache.enabled)) is not hybrid_arm
+        or architecture.get("gdn2_decoupled", False) is not False
+        or (rotation_arm and architecture.get("rotation_mode", record.rotation_mode) != record.rotation_mode)
+    )
+    if forbidden:
+        raise QwenRuntimeConfigurationError(
+            "architecture_combination_invalid",
+            "architecture arm contains a forbidden mechanism combination",
+        )
+    # Re-run the production record validator while still in the preconstruction phase.
+    diagnostic_training = architecture.get("diagnostic_training", False)
+    if rotation_arm and job.get("architecture_diagnostic_training") is not diagnostic_training:
+        raise QwenRuntimeConfigurationError(
+            "architecture_diagnostic_training_mismatch",
+            "submitted diagnostic-training identity does not match canonical architecture config",
+        )
+    QwenArchitectureConfig(arm_id, digest, record, diagnostic_training=diagnostic_training)
+    if type(diagnostic_training) is not bool or (diagnostic_training and arm_id != "rot-moving-frame-oracle"):
+        raise QwenRuntimeConfigurationError(
+            "architecture_combination_invalid", "diagnostic training is valid only for moving-frame oracle"
+        )
+    incremental_suffixes = {
+        "trapezoid": ("rho_head", "rho_proj.weight"),
+        "lookahead": ("lookahead_rho", "lookahead_projection.weight"),
+        "qk-bc-additive": ("bc_q_amplitude", "bc_k_amplitude", "bc_q_bias", "bc_k_bias"),
+        "qk-diagonal": ("bc_q_amplitude", "bc_k_amplitude", "bc_q_scale", "bc_k_scale"),
+    }
+    shared_hybrid = str(arm_id).endswith("shared-hola-w64")
+    hybrid_suffixes = (
+        "components.q_weight", "components.k_weight", "components.v_weight",
+        "components.erase_weight", "components.write_weight", "components.z_weight",
+        "components.write_offset", "components.native_decay_weight", "components.native_A_log",
+        "components.native_dt_bias",
+        "components.phase_proj.weight",
+        "components.phase_proj.bias", "components.output_mixer", "components.d_q",
+        "components.d_k", "components.b_q", "components.b_k", "components.alpha_q",
+        "components.beta_q", "components.alpha_k", "components.beta_k", "components.cache_gate_logit",
+        "components.conv1d.weight", "components.norm.weight", "components.out_proj.weight",
+        "rot_proj.weight", "rot_proj.bias", "hola.gamma_q", "hola.gamma_k", "hola.sink_logit",
+    ) + ((
+        "components.native_decay_chan", "components.braid_residual",
+        "components.trapezoid_gate", "components.lookahead_gate",
+        "components.c_logits", "components.d_raw", "components.braid_router.weight",
+        "components.braid_router.bias", "hola_output_mixer",
+    ) if shared_hybrid else (
+        "components.native_decay_pair", "components.trapezoid_proj.weight",
+        "components.trapezoid_proj.bias",
+    ))
+    if hybrid_arm:
+        from .qwen_variants import validate_maximum_control_config
+        maximum = validate_maximum_control_config(dict(config))
+        if maximum is not None:
+            disabled_groups = (
+                (("braid",), not maximum.braid),
+                (("trapezoid",), not maximum.trapezoid),
+                (("lookahead",), not maximum.lookahead),
+                (("d_q", "d_k", "b_q", "b_k", "alpha_q", "alpha_k", "beta_q", "beta_k"), not maximum.affine_qk),
+                (("cache_gate_logit", "hola", "hola_output"), maximum.cache_policy == "none"),
+            )
+            hybrid_suffixes = tuple(
+                suffix for suffix in hybrid_suffixes
+                if not any(disabled and any(token in suffix for token in tokens)
+                           for tokens, disabled in disabled_groups)
+            )
+    suffixes = (hybrid_suffixes if hybrid_arm else
+                incremental_suffixes[arm_id] if arm_id in incremental_suffixes else
+                {"rot-constant": ("rotation_rate",),
+                 "rot-noncumulative": ("rot_proj.weight", "rot_proj.bias"),
+                 "rot-moving-frame-oracle": (("rot_proj.weight", "rot_proj.bias") if diagnostic_training else ())}.get(str(arm_id), ())
+                if rotation_arm else
+                ("q_slot_scale", "out_mix") if arm_id == "rout-4" else
+                ("mimo_q_transform", "mimo_k_transform", "mimo_v", "mimo_z", "mimo_out"))
+    names = tuple(sorted(
+        f"model.layers.{index}.linear_attn.{suffix}"
+        for index in TARGET_LAYERS
+        for suffix in suffixes
+    ))
+    return _ArchitectureDispatchContract("native", arm_id, digest, rank, names, diagnostic_training)
 
 
 def _required_mapping(value: object, name: str) -> Mapping[str, object]:
@@ -725,10 +1376,19 @@ def _job_config(job: Mapping[str, object]) -> Mapping[str, object]:
         raise QwenRuntimeConfigurationError(
             "job_configuration_invalid", "Qwen dispatcher received a non-Qwen job"
         )
-    qwen = _required_mapping(config.get("qwen"), "canonical_config.qwen")
-    if qwen.get("run_mode") != "heal":
+    from .qwen_variants import validate_maximum_control_config
+    try:
+        maximum = validate_maximum_control_config(dict(config))
+    except ValueError as error:
         raise QwenRuntimeConfigurationError(
-            "qwen_heal_required", "paired Qwen adapter supports run_mode='heal' only"
+            "maximum_control_invalid", str(error)
+        ) from error
+    qwen = _required_mapping(config.get("qwen"), "canonical_config.qwen")
+    expected_mode = "reliance" if maximum is not None and not maximum.replacement else "heal"
+    if qwen.get("run_mode") != expected_mode:
+        raise QwenRuntimeConfigurationError(
+            "qwen_mode_invalid" if maximum is not None else "qwen_heal_required",
+            f"Qwen adapter requires run_mode={expected_mode!r}"
         )
     return config
 
@@ -1061,6 +1721,15 @@ def _asset_spec(asset: object):
 def _training_parameter_names(
     config: Mapping[str, object], arm: str
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    architecture = config.get("architecture")
+    if isinstance(architecture, Mapping) and architecture.get("arm_id") == "gdn2-channel-r1":
+        from .architecture import TARGET_LAYERS
+        memory = tuple(sorted(
+            f"model.layers.{index}.linear_attn.{suffix}"
+            for index in TARGET_LAYERS
+            for suffix in ("erase_proj.weight", "write_proj.weight", "write_offset")
+        ))
+        return memory, ()
     task = _required_mapping(config.get("task"), "canonical_config.task")
     params = _required_mapping(task.get("params"), "canonical_config.task.params")
     memory = _string_tuple(
@@ -1088,10 +1757,43 @@ def _training_config(config: Mapping[str, object]) -> QwenHealTrainingConfig:
         max_updates=_positive_int(budget, "updates"),
         max_tokens=_positive_int(budget, "tokens"),
         gradient_checkpointing=params.get("gradient_checkpointing", True),
+        lambda_spec=params.get("lambda_spec", 0.0),
+        lambda_gate=params.get("lambda_gate", 0.0),
+        specialization_updates=params.get("specialization_updates", 0),
     )
 
 
-def _default_load_data(*, asset: object, **_kwargs: object) -> QwenJobData:
+def _validate_parallel_and_packing(config: Mapping[str, object]) -> int:
+    task = _required_mapping(config.get("task"), "canonical_config.task")
+    params = _required_mapping(task.get("params"), "canonical_config.task.params")
+    for field in ("tensor_parallel", "pipeline_parallel", "data_parallel"):
+        value = params.get(field, 1)
+        if type(value) is not int or value < 1:
+            raise QwenRuntimeConfigurationError("unsupported_execution", f"{field} must be positive")
+        if field in {"tensor_parallel", "pipeline_parallel"} and value != 1:
+            raise QwenRuntimeConfigurationError(
+                "unsupported_execution", f"{field}>1 has no operational Qwen dispatcher implementation"
+            )
+    data_parallel = int(params.get("data_parallel", 1))
+    if data_parallel > 1:
+        if (not torch.distributed.is_available() or not torch.distributed.is_initialized()
+                or torch.distributed.get_world_size() != data_parallel):
+            raise QwenRuntimeConfigurationError(
+                "unsupported_execution", "data_parallel requires an initialized matching torch.distributed world"
+            )
+    if params.get("packed", False) is True and params.get("document_boundaries") is not True:
+        raise QwenRuntimeConfigurationError(
+            "unsupported_execution", "packed Qwen training requires explicit document boundaries"
+        )
+    return data_parallel
+
+
+def _default_load_data(
+    *,
+    asset: object,
+    job: Mapping[str, object] | None = None,
+    **_kwargs: object,
+) -> QwenJobData:
     """Load a small explicit JSON/JSONL/PT window bundle for production smoke runs."""
     path = asset.path
     if path.is_dir():
@@ -1120,9 +1822,56 @@ def _default_load_data(*, asset: object, **_kwargs: object) -> QwenJobData:
         raise QwenRuntimeConfigurationError(
             "data_window_invalid", "Qwen data must be .pt, .json, or .jsonl"
         )
+    evaluation_seed: int | None = None
+    available_evaluation_seeds: tuple[int, ...] = ()
     if isinstance(raw, Mapping):
         train_raw = raw.get("train")
-        eval_raw = raw.get("eval", train_raw)
+        eval_by_seed = raw.get("eval_by_seed")
+        if eval_by_seed is not None:
+            if "eval" in raw:
+                raise QwenRuntimeConfigurationError(
+                    "data_window_invalid",
+                    "Qwen data bundle cannot contain both eval and eval_by_seed",
+                )
+            if not isinstance(eval_by_seed, Mapping) or not eval_by_seed:
+                raise QwenRuntimeConfigurationError(
+                    "data_window_invalid",
+                    "Qwen data bundle eval_by_seed must be a nonempty mapping",
+                )
+            seed_keys = tuple(eval_by_seed)
+            if any(
+                type(seed_key) is not str
+                or not seed_key.isdigit()
+                or str(int(seed_key)) != seed_key
+                for seed_key in seed_keys
+            ):
+                raise QwenRuntimeConfigurationError(
+                    "data_window_invalid",
+                    "Qwen data bundle eval_by_seed keys must be canonical nonnegative integers",
+                )
+            if not isinstance(job, Mapping):
+                raise QwenRuntimeConfigurationError(
+                    "data_window_invalid",
+                    "seed-indexed Qwen evaluation data requires a job mapping",
+                )
+            evaluation_seed = job.get("seed")
+            if type(evaluation_seed) is not int or evaluation_seed < 0:
+                raise QwenRuntimeConfigurationError(
+                    "data_window_invalid",
+                    "seed-indexed Qwen evaluation data requires a nonnegative job seed",
+                )
+            seed_key = str(evaluation_seed)
+            if seed_key not in eval_by_seed:
+                raise QwenRuntimeConfigurationError(
+                    "data_window_invalid",
+                    f"Qwen data bundle has no evaluation partition for seed {evaluation_seed}",
+                )
+            available_evaluation_seeds = tuple(
+                sorted(int(item) for item in seed_keys)
+            )
+            eval_raw = eval_by_seed[seed_key]
+        else:
+            eval_raw = raw.get("eval", train_raw)
     else:
         train_raw = eval_raw = raw
     if not isinstance(train_raw, Sequence) or not isinstance(eval_raw, Sequence):
@@ -1189,28 +1938,133 @@ def _default_load_data(*, asset: object, **_kwargs: object) -> QwenJobData:
             converted["ruler_metadata"] = tuple(
                 copy.deepcopy(dict(item)) for item in metadata
             )
+            # Canonical bundles store only compact token IDs plus the exact
+            # answer/source spans.  Materialize the dense per-token view on
+            # load so it occupies memory for only the selected seed, not disk
+            # for every campaign seed.
+            ruler_metadata = converted["ruler_metadata"]
+            assert isinstance(ruler_metadata, tuple)
+            if len(ruler_metadata) != input_ids.shape[0]:
+                raise QwenRuntimeConfigurationError(
+                    "ruler_annotations_invalid",
+                    f"data record {index} metadata batch size is inconsistent",
+                )
+            compact_span_flags = tuple(
+                "answer_spans" in item or "source_spans" in item
+                for item in ruler_metadata
+            )
+            if any(compact_span_flags) and not all(compact_span_flags):
+                raise QwenRuntimeConfigurationError(
+                    "ruler_annotations_invalid",
+                    f"data record {index} mixes compact and legacy RULER metadata",
+                )
+            compact_spans = bool(compact_span_flags and all(compact_span_flags))
+            if compact_spans and (
+                "query_mask" not in converted or "source_spans" not in converted
+            ):
+                derived_query_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+                derived_source_spans = torch.full(
+                    (*input_ids.shape, 2), -1, dtype=torch.int64
+                )
+                for batch_index, item in enumerate(ruler_metadata):
+                    answer_spans = item.get("answer_spans")
+                    source_span_rows = item.get("source_spans")
+                    if (
+                        not isinstance(answer_spans, Sequence)
+                        or isinstance(answer_spans, (str, bytes, bytearray))
+                        or not isinstance(source_span_rows, Sequence)
+                        or isinstance(source_span_rows, (str, bytes, bytearray))
+                        or len(answer_spans) != len(source_span_rows)
+                    ):
+                        raise QwenRuntimeConfigurationError(
+                            "ruler_annotations_invalid",
+                            f"data record {index} has malformed compact spans",
+                        )
+                    for answer_span, source_span in zip(
+                        answer_spans, source_span_rows
+                    ):
+                        if (
+                            not isinstance(answer_span, Sequence)
+                            or isinstance(answer_span, (str, bytes, bytearray))
+                            or len(answer_span) != 2
+                            or not isinstance(source_span, Sequence)
+                            or isinstance(source_span, (str, bytes, bytearray))
+                            or len(source_span) != 2
+                            or any(type(value) is not int for value in (*answer_span, *source_span))
+                        ):
+                            raise QwenRuntimeConfigurationError(
+                                "ruler_annotations_invalid",
+                                f"data record {index} has malformed compact span rows",
+                            )
+                        answer_start, answer_stop = answer_span
+                        source_start, source_stop = source_span
+                        if not (
+                            0 <= answer_start < answer_stop <= input_ids.shape[1]
+                            and 0 <= source_start < source_stop <= answer_start
+                        ):
+                            raise QwenRuntimeConfigurationError(
+                                "ruler_annotations_invalid",
+                                f"data record {index} has out-of-range compact spans",
+                            )
+                        derived_query_mask[
+                            batch_index, answer_start:answer_stop
+                        ] = True
+                        derived_source_spans[
+                            batch_index, answer_start:answer_stop
+                        ] = torch.tensor(
+                            (source_start, source_stop), dtype=torch.int64
+                        )
+                converted.setdefault("query_mask", derived_query_mask)
+                converted.setdefault("source_spans", derived_source_spans)
+            if compact_spans or {
+                "query_mask", "source_spans"
+            } <= set(converted):
+                converted.setdefault(
+                    "stale_positions", torch.zeros(0, 3, dtype=torch.int64)
+                )
+        if "state_tracking_metadata" in record:
+            metadata = record["state_tracking_metadata"]
+            if isinstance(metadata, Mapping):
+                metadata = (metadata,)
+            if (isinstance(metadata, (str, bytes, bytearray))
+                    or not isinstance(metadata, Sequence)
+                    or any(not isinstance(item, Mapping) for item in metadata)):
+                raise QwenRuntimeConfigurationError(
+                    "state_tracking_annotations_invalid",
+                    f"data record {index} state_tracking_metadata must contain mappings",
+                )
+            converted["state_tracking_metadata"] = tuple(
+                copy.deepcopy(dict(item)) for item in metadata
+            )
         return converted
 
     train = tuple(convert(record, index) for index, record in enumerate(train_raw))
     evaluation = tuple(convert(record, index) for index, record in enumerate(eval_raw))
+    data_identity: dict[str, object] = {
+        "sha256": asset.sha256,
+        "size_bytes": asset.size_bytes,
+        "kind": asset.kind,
+        "example_count": len(train),
+    }
+    if evaluation_seed is not None:
+        data_identity.update({
+            "evaluation_seed": evaluation_seed,
+            "available_evaluation_seeds": list(available_evaluation_seeds),
+            "evaluation_example_count": len(evaluation),
+        })
     return QwenJobData(
         train_microbatches=train,
         eval_microbatches=evaluation,
-        data_identity={
-            "sha256": asset.sha256,
-            "size_bytes": asset.size_bytes,
-            "kind": asset.kind,
-            "example_count": len(train),
-        },
+        data_identity=data_identity,
     )
 
 
 def _default_load_teacher(*, asset: object, runtime: Mapping[str, object], **_kwargs: object):
-    from transformers import AutoModelForCausalLM  # type: ignore[import-not-found]
+    from .qwen_backend import _default_base_model_loader
 
     dtype = torch.float32 if runtime["dtype"] == "float32" else torch.bfloat16
-    teacher = AutoModelForCausalLM.from_pretrained(
-        str(asset.path), torch_dtype=dtype, low_cpu_mem_usage=True
+    teacher = _default_base_model_loader(
+        Path(asset.path), torch_dtype=dtype, low_cpu_mem_usage=True
     )
     teacher.to(runtime["teacher_device"])
     teacher.eval()
@@ -1259,12 +2113,190 @@ def _move_batch(
     }
 
 
+def _shard_training_windows(
+    batches: tuple[Mapping[str, object], ...], *, rank: int, world_size: int,
+) -> tuple[tuple[Mapping[str, object], ...], tuple[tuple[str, ...], ...]]:
+    """Shard paired windows by rows; rank unions reproduce each full window."""
+    if not 0 <= rank < world_size or world_size < 1:
+        raise QwenRuntimeConfigurationError("data_parallel_shard_invalid", "rank/world size is invalid")
+    sharded: list[Mapping[str, object]] = []
+    windows: list[tuple[str, ...]] = []
+    for batch in batches:
+        ids = _batch_example_ids(batch)
+        if len(ids) % world_size:
+            raise QwenRuntimeConfigurationError(
+                "data_parallel_shard_uneven",
+                "each global training window must divide evenly across data-parallel ranks",
+            )
+        indices = tuple(range(rank, len(ids), world_size))
+        if not indices:
+            raise QwenRuntimeConfigurationError(
+                "data_parallel_shard_empty", "each window must contain a row for every rank"
+            )
+        device = batch["input_ids"].device
+        index_tensor = torch.tensor(indices, device=device)
+        row: dict[str, object] = {}
+        for name, value in batch.items():
+            if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == len(ids):
+                row[name] = value.index_select(0, index_tensor)
+            elif isinstance(value, tuple) and len(value) == len(ids):
+                row[name] = tuple(value[index] for index in indices)
+            else:
+                row[name] = value
+        local_ids = tuple(ids[index] for index in indices)
+        row["example_ids"] = local_ids
+        sharded.append(row); windows.append(local_ids)
+    return tuple(sharded), tuple(windows)
+
+
 _EVALUATION_ANNOTATION_FIELDS = {
     "query_mask",
     "source_spans",
     "stale_mask",
     "stale_positions",
     "ruler_metadata",
+    "state_tracking_metadata",
+}
+
+# A full Qwen-3.5 vocabulary projection at 32k is about 15 GiB in BF16.  The
+# backbone must still see the complete context (the exact-cache contract does
+# not permit cross-call state), but its final [B,T,H] hidden tensor is small
+# enough to retain while the LM head is evaluated in bounded token chunks.
+_EVALUATION_LOGIT_WORKSPACE_BYTES = 256 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class _StreamingCausalScores:
+    loss: torch.Tensor
+    aligned_predictions: torch.Tensor
+    correct: int
+    total: int
+    chunk_tokens: int
+    peak_logit_bytes: int
+
+
+def _stream_causal_scores(
+    model: torch.nn.Module,
+    *,
+    inputs: Mapping[str, object],
+    labels: torch.Tensor,
+) -> _StreamingCausalScores | None:
+    """Run one exact full-context backbone pass and stream the vocabulary head.
+
+    Hugging Face causal-LM wrappers are a backbone followed by ``lm_head``.
+    Calling those same two modules separately is numerically identical to the
+    wrapper, while avoiding a resident [B,T,V] tensor.  Unknown/custom model
+    wrappers return ``None`` and retain the established dense evaluator path.
+    """
+
+    backbone = getattr(model, "model", None)
+    lm_head = getattr(model, "lm_head", None)
+    get_output_embeddings = getattr(model, "get_output_embeddings", None)
+    if (
+        not isinstance(backbone, torch.nn.Module)
+        or not isinstance(lm_head, torch.nn.Module)
+        or not callable(get_output_embeddings)
+    ):
+        return None
+    try:
+        if get_output_embeddings() is not lm_head:
+            return None
+    except (AttributeError, NotImplementedError, TypeError):
+        return None
+    weight = getattr(lm_head, "weight", None)
+    if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
+        return None
+
+    from .qwen_exact_cache import guarded_model_forward
+
+    backbone_output = guarded_model_forward(backbone, **dict(inputs))
+    if isinstance(backbone_output, Mapping):
+        hidden = backbone_output.get("last_hidden_state")
+    else:
+        hidden = getattr(backbone_output, "last_hidden_state", None)
+    if hidden is None and isinstance(backbone_output, (tuple, list)) and backbone_output:
+        hidden = backbone_output[0]
+    if (
+        not isinstance(hidden, torch.Tensor)
+        or not hidden.is_floating_point()
+        or hidden.ndim != 3
+        or labels.dtype != torch.long
+        or labels.shape != hidden.shape[:2]
+        or hidden.shape[1] < 2
+    ):
+        raise QwenRuntimeConfigurationError(
+            "evaluation_output_invalid",
+            "streamed Qwen backbone must return floating last_hidden_state [B,T,H]",
+        )
+    valid = labels[:, 1:] != -100
+    if not bool(valid.any()):
+        raise QwenRuntimeConfigurationError(
+            "evaluation_output_invalid",
+            "evaluation labels require at least one valid causal target",
+        )
+
+    batch_size, steps, _ = hidden.shape
+    vocab_size = int(weight.shape[0])
+    if vocab_size < 2:
+        raise QwenRuntimeConfigurationError(
+            "evaluation_output_invalid", "Qwen LM head vocabulary must be at least two"
+        )
+    bytes_per_logit = max(hidden.element_size(), weight.element_size())
+    chunk_tokens = max(
+        1,
+        _EVALUATION_LOGIT_WORKSPACE_BYTES
+        // max(1, batch_size * vocab_size * bytes_per_logit),
+    )
+    chunk_tokens = min(chunk_tokens, steps - 1)
+    aligned_predictions = torch.zeros_like(labels)
+    loss_sum = torch.zeros((), dtype=torch.float32, device=hidden.device)
+    correct_count = torch.zeros((), dtype=torch.int64, device=hidden.device)
+    total_count = torch.zeros((), dtype=torch.int64, device=hidden.device)
+    peak_logit_bytes = 0
+
+    for start in range(0, steps - 1, chunk_tokens):
+        stop = min(steps - 1, start + chunk_tokens)
+        logits = lm_head(hidden[:, start:stop, :])
+        if (
+            not isinstance(logits, torch.Tensor)
+            or not logits.is_floating_point()
+            or logits.shape != (batch_size, stop - start, vocab_size)
+        ):
+            raise QwenRuntimeConfigurationError(
+                "evaluation_output_invalid",
+                "Qwen LM head must return floating [B,chunk,V] logits",
+            )
+        peak_logit_bytes = max(peak_logit_bytes, logits.numel() * logits.element_size())
+        targets = labels[:, start + 1 : stop + 1]
+        local_valid = targets != -100
+        # Per-token CE followed by FP32 accumulation is the same objective as
+        # the dense reduction, without retaining either logits or losses.
+        local_losses = F.cross_entropy(
+            logits.reshape(-1, vocab_size),
+            targets.reshape(-1),
+            ignore_index=-100,
+            reduction="none",
+        ).reshape_as(targets)
+        loss_sum = loss_sum + local_losses[local_valid].float().sum()
+        predictions = logits.argmax(dim=-1)
+        aligned_predictions[:, start + 1 : stop + 1] = predictions
+        correct_count = correct_count + ((predictions == targets) & local_valid).sum()
+        total_count = total_count + local_valid.sum()
+
+    counts = torch.stack((correct_count, total_count)).cpu().tolist()
+    total = int(counts[1])
+    return _StreamingCausalScores(
+        loss=loss_sum / total,
+        aligned_predictions=aligned_predictions,
+        correct=int(counts[0]),
+        total=total,
+        chunk_tokens=chunk_tokens,
+        peak_logit_bytes=peak_logit_bytes,
+    )
+
+_STATE_TRACKING_METADATA_FIELDS = {
+    "task", "cell_id", "seed", "example_id", "prompt_end", "targets",
+    "modulus", "evidence_scope",
 }
 
 _RULER_METADATA_FIELDS = {
@@ -1452,6 +2484,7 @@ def _validate_evaluation_annotations(
     tuple[tuple[dict[str, object], object], ...],
 ]:
     config = _job_config(job)
+    _validate_parallel_and_packing(config)
     task = _required_mapping(config.get("task"), "canonical_config.task")
     is_ruler = task.get("name") == "ruler"
     required = {"query_mask", "source_spans"}
@@ -1612,10 +2645,10 @@ def _validate_evaluation_annotations(
                 "ruler_annotations_invalid",
                 "ruler_metadata fields must exactly match the production schema",
             )
-        if metadata["evaluation_mode"] != "teacher_forced":
+        if metadata["evaluation_mode"] not in {"teacher_forced", "free_generation"}:
             raise QwenRuntimeConfigurationError(
                 "ruler_annotations_invalid",
-                "default Qwen evaluation supports teacher_forced RULER rows only",
+                "RULER evaluation_mode must be teacher_forced or free_generation",
             )
         if metadata["evidence_scope"] not in {"feasibility", "promotion"}:
             raise QwenRuntimeConfigurationError(
@@ -1687,6 +2720,43 @@ def _validate_evaluation_annotations(
     return query_mask, source_spans, frozen_stale, tuple(validated)
 
 
+def _validate_state_tracking_annotations(
+    batch: Mapping[str, object], *, job: Mapping[str, object]
+) -> tuple[dict[str, object], ...]:
+    raw = batch.get("state_tracking_metadata")
+    batch_size = int(batch["input_ids"].shape[0])
+    if (not isinstance(raw, tuple) or len(raw) != batch_size
+            or any(not isinstance(item, Mapping) for item in raw)):
+        raise QwenRuntimeConfigurationError(
+            "state_tracking_annotations_missing", "one state-tracking metadata row is required per example"
+        )
+    example_ids = _batch_example_ids(batch)
+    rows: list[dict[str, object]] = []
+    for index, item in enumerate(raw):
+        row = copy.deepcopy(dict(item))
+        if set(row) != _STATE_TRACKING_METADATA_FIELDS:
+            raise QwenRuntimeConfigurationError(
+                "state_tracking_annotations_invalid", "state-tracking metadata fields must be exact"
+            )
+        if row["task"] not in {"parity", "modular"} or row["seed"] != job.get("seed"):
+            raise QwenRuntimeConfigurationError("state_tracking_annotations_invalid", "task or seed mismatch")
+        if row["example_id"] != example_ids[index] or type(row["cell_id"]) is not str:
+            raise QwenRuntimeConfigurationError("state_tracking_annotations_invalid", "example or cell mismatch")
+        if type(row["prompt_end"]) is not int or not 0 < row["prompt_end"] <= batch["input_ids"].shape[1]:
+            raise QwenRuntimeConfigurationError("state_tracking_annotations_invalid", "prompt_end is invalid")
+        targets = row["targets"]
+        if not isinstance(targets, (list, tuple)) or not targets or any(type(value) is not int for value in targets):
+            raise QwenRuntimeConfigurationError("state_tracking_annotations_invalid", "targets must be nonempty ints")
+        if row["task"] == "modular" and (type(row["modulus"]) is not int or row["modulus"] < 2):
+            raise QwenRuntimeConfigurationError("state_tracking_annotations_invalid", "modulus is invalid")
+        if row["task"] == "parity" and row["modulus"] is not None:
+            raise QwenRuntimeConfigurationError("state_tracking_annotations_invalid", "parity modulus must be null")
+        if row["evidence_scope"] not in {"feasibility", "promotion"}:
+            raise QwenRuntimeConfigurationError("state_tracking_annotations_invalid", "evidence scope is invalid")
+        rows.append(row)
+    return tuple(rows)
+
+
 def _default_evaluate(
     *,
     loaded_arm: object,
@@ -1694,13 +2764,19 @@ def _default_evaluate(
     job: Mapping[str, object],
     runtime: Mapping[str, object],
     amplitude_initial: Sequence[float] = (),
+    generate_answers: Callable[..., Sequence[str]] | None = None,
+    generate_state_values: Callable[..., Sequence[int]] | None = None,
+    tokenizer_asset: object | None = None,
     **_kwargs: object,
 ) -> dict[str, object]:
     from gdn3.kmd2_native import KMD2NativeAttn
     from .qwen_exact_cache import KMD2ExactCacheAttn, guarded_model_forward
-    from .tasks.ruler import score_teacher_forced
+    from .tasks.ruler import score_free_generation, score_state_tracking, score_teacher_forced
 
     model = loaded_arm.model
+    task_name = _required_mapping(
+        _job_config(job).get("task"), "canonical_config.task"
+    ).get("name")
     cache_layers = tuple(
         (name, module)
         for name, module in model.named_modules()
@@ -1737,16 +2813,27 @@ def _default_evaluate(
     cache_norms = _OnlineMean()
     state_norms = _OnlineMean()
     retention_count = eviction_count = persistent_bytes = block_bytes = 0
+    streamed_projection_batches = 0
+    dense_projection_batches = 0
+    streamed_chunk_tokens = 0
+    streamed_peak_logit_bytes = 0
     was_training = model.training
     model.eval()
     try:
         with torch.no_grad():
             for raw_batch in data.eval_microbatches:
-                query_mask, source_spans, stale_by_query, ruler_rows = _validate_evaluation_annotations(
-                    raw_batch,
-                    job=job,
-                    require_cache=require_cache,
-                )
+                state_rows: tuple[dict[str, object], ...] = ()
+                if task_name in {"parity", "modular"}:
+                    state_rows = _validate_state_tracking_annotations(raw_batch, job=job)
+                    input_shape = raw_batch["input_ids"].shape
+                    query_mask = torch.zeros(input_shape, dtype=torch.bool)
+                    source_spans = torch.full((*input_shape, 2), -1, dtype=torch.int64)
+                    stale_by_query = {}
+                    ruler_rows = ()
+                else:
+                    query_mask, source_spans, stale_by_query, ruler_rows = _validate_evaluation_annotations(
+                        raw_batch, job=job, require_cache=require_cache,
+                    )
                 if require_cache and not cache_layers:
                     raise QwenRuntimeConfigurationError(
                         "cache_diagnostics_unavailable",
@@ -1913,26 +3000,50 @@ def _default_evaluate(
                         if name not in {"labels", "example_ids"} | _EVALUATION_ANNOTATION_FIELDS
                     }
                     inputs.update({"output_hidden_states": False, "use_cache": False})
-                    output = guarded_model_forward(model, **inputs)
+                    labels = batch["labels"]
+                    assert isinstance(labels, torch.Tensor)
+                    streamed_scores = _stream_causal_scores(
+                        model, inputs=inputs, labels=labels
+                    )
+                    if streamed_scores is None:
+                        output = guarded_model_forward(model, **inputs)
+                    else:
+                        output = None
                 finally:
                     for _, layer in cache_layers:
                         layer.set_cache_diagnostic_observer(None)
-                logits = _validate_logits(
-                    "evaluation logits", _output_field(output, "logits")
-                )
-                labels = batch["labels"]
-                assert isinstance(labels, torch.Tensor)
-                loss = causal_cross_entropy(logits, labels)
+                if streamed_scores is None:
+                    logits = _validate_logits(
+                        "evaluation logits", _output_field(output, "logits")
+                    )
+                    loss = causal_cross_entropy(logits, labels)
+                    shifted_predictions = logits[:, :-1].argmax(dim=-1)
+                    targets = labels[:, 1:]
+                    valid = targets != -100
+                    batch_correct = int(
+                        ((shifted_predictions == targets) & valid).sum().cpu()
+                    )
+                    batch_total = int(valid.sum().cpu())
+                    aligned_predictions = torch.zeros_like(labels)
+                    aligned_predictions[:, 1:] = shifted_predictions
+                    dense_projection_batches += 1
+                else:
+                    loss = streamed_scores.loss
+                    batch_correct = streamed_scores.correct
+                    batch_total = streamed_scores.total
+                    aligned_predictions = streamed_scores.aligned_predictions
+                    streamed_projection_batches += 1
+                    streamed_chunk_tokens = max(
+                        streamed_chunk_tokens, streamed_scores.chunk_tokens
+                    )
+                    streamed_peak_logit_bytes = max(
+                        streamed_peak_logit_bytes, streamed_scores.peak_logit_bytes
+                    )
                 if not bool(torch.isfinite(loss)):
                     raise QwenTrainingError("nonfinite_loss", "evaluation loss is nonfinite")
                 losses.append(float(loss.cpu()))
-                shifted_predictions = logits[:, :-1].argmax(dim=-1)
-                targets = labels[:, 1:]
-                valid = targets != -100
-                correct += int(((shifted_predictions == targets) & valid).sum().cpu())
-                total += int(valid.sum().cpu())
-                aligned_predictions = torch.zeros_like(labels)
-                aligned_predictions[:, 1:] = shifted_predictions
+                correct += batch_correct
+                total += batch_total
                 layer_persistent_bytes: list[object] = []
                 layer_block_bytes: list[object] = []
                 for layer_name, layer in cache_layers:
@@ -1985,10 +3096,22 @@ def _default_evaluate(
                 )
 
                 for batch_index, (metadata, episode) in enumerate(ruler_rows):
-                    score = score_teacher_forced(
-                        episode,
-                        [int(value) for value in aligned_predictions[batch_index].cpu()],
-                    )
+                    if metadata["evaluation_mode"] == "free_generation":
+                        if not callable(generate_answers) or tokenizer_asset is None:
+                            raise QwenRuntimeConfigurationError(
+                                "free_generation_unavailable",
+                                "free-generation RULER requires tokenizer and generation implementation",
+                            )
+                        generated = generate_answers(
+                            model=model, episode=episode, tokenizer_asset=tokenizer_asset,
+                            device=runtime["student_device"],
+                        )
+                        score = score_free_generation(episode, generated)
+                    else:
+                        score = score_teacher_forced(
+                            episode,
+                            [int(value) for value in aligned_predictions[batch_index].cpu()],
+                        )
                     if require_cache:
                         accumulator = row_accumulators[batch_index]
                         cache_diagnostics: dict[str, object] = {
@@ -2028,6 +3151,32 @@ def _default_evaluate(
                             "arm_id": job["arm_id"],
                         }
                     )
+                for batch_index, metadata in enumerate(state_rows):
+                    if not callable(generate_state_values) or tokenizer_asset is None:
+                        raise QwenRuntimeConfigurationError(
+                            "state_tracking_generation_unavailable",
+                            "state tracking requires tokenizer and generation implementation",
+                        )
+                    targets_row = tuple(int(value) for value in metadata["targets"])
+                    predictions = generate_state_values(
+                        model=model, input_ids=batch["input_ids"][batch_index],
+                        prompt_end=metadata["prompt_end"], count=len(targets_row),
+                        tokenizer_asset=tokenizer_asset, device=runtime["student_device"],
+                    )
+                    score = score_state_tracking(
+                        metadata["task"], predictions, targets_row,
+                        modulus=metadata["modulus"], lm_loss=float(loss.cpu()),
+                    )
+                    evaluations.append({
+                        "task": "state_tracking", "state_task": score.task,
+                        "cell_id": metadata["cell_id"], "example_id": metadata["example_id"],
+                        "seed": metadata["seed"], "evaluation_mode": "free_generation",
+                        "evidence_scope": metadata["evidence_scope"],
+                        "numerator": sum(score.correct), "denominator": len(score.correct),
+                        "episode_exact": all(score.correct), "lm_loss": score.lm_loss,
+                        "modulus": score.modulus, "predictions": list(predictions),
+                        "targets": list(targets_row), "arm_id": job["arm_id"],
+                    })
     finally:
         model.train(was_training)
 
@@ -2041,6 +3190,14 @@ def _default_evaluate(
             "token_accuracy": correct / max(1, total),
         },
         "recurrent_state": {"elements": state_elements, "bytes": 4 * state_elements},
+        "evaluation_execution": {
+            "full_context_backbone": True,
+            "streamed_vocabulary_projection_batches": streamed_projection_batches,
+            "dense_vocabulary_projection_batches": dense_projection_batches,
+            "streamed_chunk_tokens": streamed_chunk_tokens,
+            "peak_streamed_logit_bytes": streamed_peak_logit_bytes,
+            "logit_workspace_limit_bytes": _EVALUATION_LOGIT_WORKSPACE_BYTES,
+        },
     }
     if evaluations:
         result["evaluations"] = evaluations
@@ -2124,6 +3281,68 @@ class QwenExecutionDependencies:
     monotonic: Callable[[], float]
     reset_peak_vram: Callable[[str], None]
     peak_vram_bytes: Callable[[str], int]
+    generate_answers: Callable[..., Sequence[str]]
+    generate_state_values: Callable[..., Sequence[int]]
+    build_grad_scaler: Callable[..., object] | None = None
+
+
+def _default_build_grad_scaler(*, device: str | torch.device, dtype: torch.dtype) -> object:
+    resolved = torch.device(device)
+    enabled = resolved.type == "cuda" and dtype == torch.float16
+    return torch.amp.GradScaler(resolved.type, enabled=enabled)
+
+
+@lru_cache(maxsize=4)
+def _cached_auto_tokenizer(path: str) -> object:
+    from transformers import AutoTokenizer  # type: ignore[import-not-found]
+
+    return AutoTokenizer.from_pretrained(path)
+
+
+def _default_generate_answers(*, model: torch.nn.Module, episode: object,
+                              tokenizer_asset: object, device: str) -> tuple[str, ...]:
+    """Generate and segment the numeric answers used by the pinned RULER format."""
+    tokenizer = _cached_auto_tokenizer(str(tokenizer_asset.path))
+    prompt = torch.tensor([episode.input_ids[:episode.prompt_end]], dtype=torch.long, device=device)
+    max_tokens = sum(len(tokens) for tokens in episode.answer_token_ids) + 4 * episode.cell.queries
+    with torch.no_grad():
+        generated = model.generate(
+            prompt,
+            max_new_tokens=max_tokens,
+            do_sample=False,
+            # The hybrid architecture deliberately has no cross-call state
+            # cache.  Qwen's one-token logit projection keeps generation from
+            # constructing a [context,vocab] tensor at every decode step.
+            use_cache=False,
+            logits_to_keep=1,
+        )
+    text = tokenizer.decode(generated[0, prompt.shape[1]:], skip_special_tokens=True)
+    answers = tuple(re.findall(r"(?<!\d)\d{7}(?!\d)", text))
+    if len(answers) < episode.cell.queries:
+        answers = answers + tuple("" for _ in range(episode.cell.queries - len(answers)))
+    return answers[:episode.cell.queries]
+
+
+def _default_generate_state_values(*, model: torch.nn.Module, input_ids: torch.Tensor,
+                                   prompt_end: int, count: int, tokenizer_asset: object,
+                                   device: str) -> tuple[int, ...]:
+    tokenizer = _cached_auto_tokenizer(str(tokenizer_asset.path))
+    prompt = input_ids[:prompt_end].to(device=device, dtype=torch.long).unsqueeze(0)
+    with torch.no_grad():
+        generated = model.generate(
+            prompt,
+            max_new_tokens=max(8, count * 4),
+            do_sample=False,
+            use_cache=False,
+            logits_to_keep=1,
+        )
+    text = tokenizer.decode(generated[0, prompt.shape[1]:], skip_special_tokens=True)
+    values = tuple(int(value) for value in re.findall(r"-?\d+", text)[:count])
+    if len(values) != count:
+        raise QwenRuntimeConfigurationError(
+            "state_tracking_generation_invalid", "generated output did not contain every state value"
+        )
+    return values
 
 
 def _default_dependencies() -> QwenExecutionDependencies:
@@ -2142,6 +3361,9 @@ def _default_dependencies() -> QwenExecutionDependencies:
         monotonic=time.monotonic,
         reset_peak_vram=_default_reset_peak_vram,
         peak_vram_bytes=_default_peak_vram_bytes,
+        generate_answers=_default_generate_answers,
+        generate_state_values=_default_generate_state_values,
+        build_grad_scaler=_default_build_grad_scaler,
     )
 
 
@@ -2170,11 +3392,25 @@ def _resolve_dependencies(
 def _source_hashes() -> dict[str, str]:
     root = Path(__file__).resolve().parents[2]
     relative_paths = (
+        "research/kmd2_ablation/architecture.py",
         "research/kmd2_ablation/config.py",
         "research/kmd2_ablation/exact_cache.py",
         "research/kmd2_ablation/qwen_backend.py",
+        "research/kmd2_ablation/qwen_architecture.py",
         "research/kmd2_ablation/qwen_checkpoint.py",
         "research/kmd2_ablation/qwen_exact_cache.py",
+        "research/kmd2_ablation/qwen_fused_loss.py",
+        "research/kmd2_ablation/qwen_gdn2_triton.py",
+        "research/kmd2_ablation/qwen_hybrid_chunkwise.py",
+        "research/kmd2_ablation/qwen_hybrid_components.py",
+        "research/kmd2_ablation/qwen_hybrid_four_state.py",
+        "research/kmd2_ablation/qwen_hybrid_hola.py",
+        "research/kmd2_ablation/qwen_hybrid_liger_chunked.py",
+        "research/kmd2_ablation/qwen_hybrid_liger_dplr.py",
+        "research/kmd2_ablation/qwen_hybrid_liger_wy.py",
+        "research/kmd2_ablation/qwen_hybrid_math.py",
+        "research/kmd2_ablation/qwen_hybrid_shared.py",
+        "research/kmd2_ablation/qwen_hybrid_triton.py",
         "research/kmd2_ablation/qwen_training.py",
         "research/kmd2_ablation/qwen_variants.py",
         "research/kmd2_ablation/results.py",
@@ -2246,6 +3482,616 @@ def _scoped_paired_rng(seed: int, runtime: Mapping[str, object]):
         random.setstate(python_state)
 
 
+def _true_mimo_resources(
+    *, rank: int, layers: int, batch_size: int, sequence_length: int,
+    heads: int, key_dim: int, value_dim: int, native_conv_parameters: int,
+) -> dict[str, int]:
+    """Exact independent resource contract for genuine rank-R MIMO."""
+    if rank not in (2, 4):
+        raise ValueError("true_mimo_resource_rank_invalid")
+    values = (layers, batch_size, sequence_length, heads, key_dim, value_dim)
+    if any(type(value) is not int or value < 1 for value in values):
+        raise ValueError("true_mimo_resource_dimension_invalid")
+    if type(native_conv_parameters) is not int or native_conv_parameters < 0:
+        raise ValueError("true_mimo_native_conv_parameters_invalid")
+    new_per_layer = 2 * heads * rank * key_dim * key_dim + 3 * heads * rank * value_dim
+    state_elements = batch_size * heads * key_dim * value_dim
+    activation_elements = (
+        batch_size * sequence_length * heads * rank * (2 * key_dim + 3 * value_dim)
+    )
+    return {
+        "new_parameters_per_layer": new_per_layer,
+        "new_parameters": layers * new_per_layer,
+        "recurrent_state_elements": state_elements,
+        "recurrent_state_bytes": state_elements * 4,
+        "rankwise_live_activation_elements": activation_elements,
+        "rankwise_live_activation_bytes": activation_elements * 4,
+        "native_conv_parameters": native_conv_parameters,
+    }
+
+
+def _shared_query_widening_resources(
+    *, width: int, layers: int, batch_size: int, sequence_length: int,
+    heads: int, key_dim: int, value_dim: int, max_tokens: int | None = None,
+) -> dict[str, int]:
+    """Independent resource contract for shared-query output widening."""
+    if type(width) is not int or width != 4:
+        raise ValueError("shared_query_widening_resource_width_invalid")
+    values = (layers, batch_size, sequence_length, heads, key_dim, value_dim)
+    if any(type(value) is not int or value < 1 for value in values):
+        raise ValueError("shared_query_widening_resource_dimension_invalid")
+    if max_tokens is None:
+        max_tokens = batch_size * sequence_length
+    if type(max_tokens) is not int or max_tokens < 1:
+        raise ValueError("shared_query_widening_resource_dimension_invalid")
+    new_per_layer = heads * width * key_dim + heads * width
+    state_elements = batch_size * heads * key_dim * value_dim
+    rank_reads = max_tokens * heads * width * value_dim
+    q_slots = max_tokens * heads * width * key_dim
+    extra = max_tokens * heads * (width - 1) * (key_dim + value_dim)
+    return {
+        "new_parameters_per_layer": new_per_layer,
+        "new_parameters": layers * new_per_layer,
+        "recurrent_state_elements": state_elements,
+        "recurrent_state_bytes": state_elements * 4,
+        "total_rank_read_elements": rank_reads,
+        "total_q_slot_elements": q_slots,
+        "extra_vs_r1_elements": extra,
+        "extra_vs_r1_bytes": extra * 4,
+    }
+
+
+def _widening_resource_shape_maxima(
+    shapes: tuple[tuple[int, int], ...],
+) -> tuple[int, int]:
+    """Return independent maximum batch size and maximum token count."""
+    if (not shapes or any(type(shape) is not tuple or len(shape) != 2
+                          or any(type(value) is not int or value < 1 for value in shape)
+                          for shape in shapes)):
+        raise ValueError("shared_query_widening_resource_shape_invalid")
+    return max(shape[0] for shape in shapes), max(shape[0] * shape[1] for shape in shapes)
+
+
+def _architecture_new_state_resources(
+    modules: tuple[torch.nn.Module, ...],
+) -> dict[str, int]:
+    """Count manifest-declared new parameters and persistent buffers exactly."""
+    parameter_elements = buffer_elements = buffer_bytes = 0
+    for module in modules:
+        manifest = module.transformation_manifest()
+        # Incremental arms declare "new" inline; the maximum hybrids declare
+        # theirs in the separate architecture_tensor_manifest() (their
+        # transformation manifest describes the component replication).
+        if not isinstance(manifest, Mapping) or "new" not in manifest:
+            tensor_manifest = getattr(module, "architecture_tensor_manifest", None)
+            manifest = tensor_manifest() if callable(tensor_manifest) else manifest
+        if not isinstance(manifest, Mapping) or type(manifest.get("new")) not in (tuple, list):
+            raise QwenRuntimeConfigurationError(
+                "architecture_tensor_manifest_invalid", "architecture new-state manifest is malformed"
+            )
+        parameters, buffers = dict(module.named_parameters()), dict(module.named_buffers())
+        for name in manifest["new"]:
+            in_parameter, in_buffer = name in parameters, name in buffers
+            if in_parameter == in_buffer:
+                raise QwenRuntimeConfigurationError(
+                    "architecture_tensor_manifest_invalid",
+                    "manifest new state must identify exactly one parameter or buffer",
+                )
+            if in_parameter:
+                parameter_elements += parameters[name].numel()
+            else:
+                tensor = buffers[name]
+                buffer_elements += tensor.numel()
+                buffer_bytes += tensor.numel() * tensor.element_size()
+    return {
+        "new_parameters": parameter_elements,
+        "architecture_new_buffer_elements": buffer_elements,
+        "architecture_new_buffer_bytes": buffer_bytes,
+    }
+
+
+def _hybrid_module_resources(
+    modules: tuple[torch.nn.Module, ...], *, optimizer: torch.optim.Optimizer,
+    batch_size: int, sequence_length: int, checkpointing: bool,
+    resident_model: torch.nn.Module | None = None,
+    data_parallel: int = 1,
+) -> dict[str, object]:
+    """Account Package A/B resources from installed modules and live optimizer slots."""
+    if not modules or min(batch_size, sequence_length) < 1:
+        raise QwenRuntimeConfigurationError("hybrid_resource_invalid", "hybrid modules and dimensions are required")
+    parameter_bytes = sum(
+        parameter.numel() * parameter.element_size()
+        for module in modules for parameter in module.parameters()
+    )
+    gradient_bytes = sum(
+        parameter.numel() * parameter.element_size()
+        for module in modules for parameter in module.parameters() if parameter.requires_grad
+    )
+    optimizer_bytes = sum(
+        value.numel() * value.element_size()
+        for state in optimizer.state.values() for value in state.values()
+        if isinstance(value, torch.Tensor)
+    )
+    if resident_model is None:
+        raise QwenRuntimeConfigurationError(
+            "hybrid_resident_model_required",
+            "post-load hybrid accounting requires the complete resident Qwen model",
+        )
+    resident = resident_model
+    resident_parameter_bytes = sum(p.numel() * p.element_size() for p in resident.parameters())
+    resident_buffer_bytes = sum(b.numel() * b.element_size() for b in resident.buffers())
+    trainable_elements = sum(p.numel() for p in resident.parameters() if p.requires_grad)
+    optimizer_bytes = max(optimizer_bytes, 8 * trainable_elements)
+    master_weight_bytes = 4 * trainable_elements
+    persistent_bytes = cache_bytes = workspace_bytes = 0
+    layer_reports: list[dict[str, object]] = []
+    for module in modules:
+        report_fn = getattr(module, "resource_report", None)
+        if callable(report_fn):
+            report = report_fn(batch_size=batch_size)
+        else:
+            element = module.components.q_weight.element_size()
+            shared_histories = (
+                module.recurrent_state_bytes(batch_size=batch_size)
+                + batch_size * module.H * (module.dk // 2) * 4
+                + batch_size * module.H * 4 * module.dv * 4
+                + batch_size * module.H * module.dk * module.dv * 4
+                + batch_size * (module.conv_k - 1) * module.components.hidden * element
+                + batch_size
+            )
+            report = {"persistent_bytes": shared_histories}
+        hola_report = module.hola.resource_report(batch_size=batch_size)
+        layer_persistent = int(report.get("persistent_bytes", 0))
+        persistent_bytes += layer_persistent
+        cache_bytes += int(hola_report["persistent_bytes"])
+        workspace_bytes += int(hola_report["workspace_bytes"])
+        layer_reports.append({"state_and_history_bytes": layer_persistent,
+                              "cache_bytes": int(hola_report["persistent_bytes"]),
+                              "workspace_bytes": int(hola_report["workspace_bytes"])})
+    model_config = getattr(resident_model, "config", None)
+    hidden = int(getattr(model_config, "hidden_size", modules[0].components.hidden))
+    layers = int(getattr(model_config, "num_hidden_layers", len(modules)))
+    intermediate = int(getattr(model_config, "intermediate_size", 4 * hidden))
+    vocab = int(getattr(model_config, "vocab_size", 0))
+    if vocab < 1:
+        raise QwenRuntimeConfigurationError(
+            "hybrid_model_config_incomplete", "resident model config must declare vocab_size"
+        )
+    B,T,L,D,I = batch_size,sequence_length,layers,hidden,intermediate
+    saved_layer_activations = B*T*L*D*4 * (1 if checkpointing else 8)
+    layer_workspace = B*T*(7*D+2*I)*4
+    attention_workspace = B*T*L*D*4
+    logits_bytes = B*T*vocab*4
+    hybrid_activation_bytes = sum(
+        B*T*module.H*4*(4*module.dk+4*module.dv)*4 for module in modules
+    )
+    # Training-path global mixing retains every normalized [B,T,H,4,4,V]
+    # recurrent read (module dtype) and FP32 HOLA read until the mixer is
+    # applied once across T; the concatenation transiently doubles both.
+    # Inference selects segment mixing and never allocates these.
+    global_mix_bytes = sum(
+        2 * (B * T * module.H * 16 * module.dv)
+        * (module.components.q_weight.element_size() + 4)
+        for module in modules
+    )
+    generation_buffers = B*T*D*4+B*vocab*4
+    activation_bytes = sum((saved_layer_activations,layer_workspace,attention_workspace,
+                            logits_bytes,hybrid_activation_bytes,global_mix_bytes,
+                            generation_buffers))
+    return {
+        "layer_count": len(modules), "batch_size": batch_size,
+        "sequence_length": sequence_length, "parameter_bytes": parameter_bytes,
+        "gradient_bytes": gradient_bytes, "optimizer_bytes": optimizer_bytes,
+        "resident_parameter_bytes": resident_parameter_bytes,
+        "resident_buffer_bytes": resident_buffer_bytes,
+        "master_weight_bytes": master_weight_bytes,
+        "state_and_history_bytes": persistent_bytes, "cache_bytes": cache_bytes,
+        "workspace_bytes": workspace_bytes, "activation_bytes": activation_bytes,
+        "activation_checkpointing": checkpointing, "data_parallel": data_parallel,
+        "activation_accounting": "conservative_component_upper_bound",
+        "activation_components": {"saved_layer_activations": saved_layer_activations,
+            "layer_workspace": layer_workspace, "attention_workspace": attention_workspace,
+            "logits": logits_bytes, "hybrid": hybrid_activation_bytes,
+            "global_mix_reads": global_mix_bytes,
+            "generation_buffers": generation_buffers},
+        "layers": layer_reports,
+    }
+
+
+def _reduce_transition_router_diagnostics(
+    rows: Sequence[tuple[torch.Tensor, torch.Tensor]],
+) -> dict[str, object]:
+    """Reduce exact source-router statistics over valid layer/head/destination rows."""
+    if not rows:
+        raise QwenRuntimeConfigurationError(
+            "hybrid_router_diagnostics_unavailable", "missing live transition-router rows"
+        )
+    reference: tuple[int, int, int] | None = None
+    entropy_sum = 0.0
+    opportunities = 0
+    argmax_counts: torch.Tensor | None = None
+    source_mass: torch.Tensor | None = None
+    for probabilities, valid in rows:
+        if (not isinstance(probabilities, torch.Tensor) or probabilities.ndim != 5
+                or probabilities.shape[-1] != 4 or not isinstance(valid, torch.Tensor)
+                or valid.dtype != torch.bool or tuple(valid.shape) != tuple(probabilities.shape[:2])):
+            raise QwenRuntimeConfigurationError(
+                "hybrid_router_diagnostics_invalid", "heterogeneous transition-router schema"
+            )
+        schema = (int(probabilities.shape[2]), int(probabilities.shape[3]), int(probabilities.shape[4]))
+        if reference is None:
+            reference = schema
+            argmax_counts = torch.zeros(schema[-1], dtype=torch.float64)
+            source_mass = torch.zeros(schema[-1], dtype=torch.float64)
+        elif schema != reference:
+            raise QwenRuntimeConfigurationError(
+                "hybrid_router_diagnostics_invalid", "heterogeneous transition-router schema"
+            )
+        selected = probabilities.detach().float()[valid]
+        if selected.numel() == 0:
+            continue
+        flat = selected.reshape(-1, selected.shape[-1]).cpu()
+        if not bool(torch.isfinite(flat).all()) or bool((flat < 0).any()):
+            raise QwenRuntimeConfigurationError(
+                "hybrid_router_diagnostics_invalid", "transition-router probabilities are invalid"
+            )
+        if not torch.allclose(flat.sum(-1), torch.ones(flat.shape[0]), atol=1e-5, rtol=1e-5):
+            raise QwenRuntimeConfigurationError(
+                "hybrid_router_diagnostics_invalid", "transition-router probabilities are not normalized"
+            )
+        # torch.argmax returns the first index, giving the specified lowest-source tie break.
+        assert argmax_counts is not None and source_mass is not None
+        argmax_counts += torch.bincount(flat.argmax(-1), minlength=4).double()
+        source_mass += flat.double().sum(0)
+        entropy_sum += float((-(flat * flat.clamp_min(1e-12).log()).sum(-1)).sum())
+        opportunities += flat.shape[0]
+    if opportunities < 1:
+        raise QwenRuntimeConfigurationError(
+            "hybrid_router_diagnostics_unavailable", "zero transition-router opportunities"
+        )
+    assert argmax_counts is not None and source_mass is not None
+    return {
+        "opportunities": opportunities,
+        "entropy": entropy_sum / opportunities,
+        "argmax_occupancy": (argmax_counts / opportunities).tolist(),
+        "source_probability_mass": (source_mass / opportunities).tolist(),
+    }
+
+
+def _measure_live_hybrid_caches(
+    modules: Sequence[torch.nn.Module], *, valid_token_count: int,
+) -> dict[str, object]:
+    """Measure only genuine cache carries produced by the immediately preceding live pass."""
+    if not modules:
+        raise QwenRuntimeConfigurationError(
+            "hybrid_cache_diagnostics_unavailable", "no upgraded layers were supplied"
+        )
+    if type(valid_token_count) is not int or valid_token_count < 0:
+        raise QwenRuntimeConfigurationError(
+            "hybrid_cache_diagnostics_invalid", "valid token count must be nonnegative"
+        )
+    schema: str | None = None
+    admissions = opportunities = occupied = capacity = age_count = 0
+    age_sum = 0.0
+    state_norms: list[torch.Tensor] = []
+    state_rms_max: list[torch.Tensor] = []
+    state_abs_max: list[torch.Tensor] = []
+    for layer_index, module in enumerate(modules):
+        cache = getattr(module, "last_recurrent_cache", None)
+        if cache is None:
+            raise QwenRuntimeConfigurationError(
+                "hybrid_cache_diagnostics_unavailable", f"upgraded layer {layer_index} has missing live cache"
+            )
+        layer_schema = "state" if hasattr(cache, "state") else "states" if hasattr(cache, "states") else None
+        if layer_schema is None:
+            raise QwenRuntimeConfigurationError(
+                "hybrid_cache_diagnostics_invalid", "live cache has neither state nor states"
+            )
+        if schema is None:
+            schema = layer_schema
+        elif schema != layer_schema:
+            raise QwenRuntimeConfigurationError(
+                "hybrid_cache_diagnostics_invalid", "heterogeneous live cache schemas"
+            )
+        state = getattr(cache, layer_schema)
+        if not isinstance(state, torch.Tensor) or not bool(torch.isfinite(state).all()):
+            raise QwenRuntimeConfigurationError(
+                "hybrid_cache_diagnostics_invalid", "live recurrent state is missing or nonfinite"
+            )
+        detached = state.detach().float()
+        state_norms.append(detached.norm())
+        # A cross-layer mean Frobenius norm can hide one exploding head or
+        # lane; record the per-layer extremes alongside it.  For the
+        # four-state schema [B,H,R,K,V] reduce per (head, lane) matrix.
+        matrix_rms = detached.square().mean((-2, -1)).sqrt()
+        state_rms_max.append(matrix_rms.max())
+        state_abs_max.append(detached.abs().max())
+        hola = getattr(cache, "hola_state", None)
+        if hola is None:
+            raise QwenRuntimeConfigurationError(
+                "hybrid_cache_diagnostics_unavailable", f"upgraded layer {layer_index} has missing HOLA state"
+            )
+        required = ("valid", "epochs", "current_epoch", "block_valid", "block_epochs",
+                    "admission_count", "age_sum", "age_count")
+        if any(not isinstance(getattr(hola, name, None), torch.Tensor) for name in required):
+            raise QwenRuntimeConfigurationError(
+                "hybrid_cache_diagnostics_invalid", "heterogeneous HOLA diagnostic schema"
+            )
+        persistent = hola.valid & (hola.epochs == hola.current_epoch[..., None])
+        block = hola.block_valid & (hola.block_epochs == hola.current_epoch[..., None])
+        occupied += int(persistent.sum().cpu()) + int(block.sum().cpu())
+        capacity += persistent.numel() + block.numel()
+        layer_admissions = int(hola.admission_count.sum().cpu())
+        admissions += layer_admissions
+        opportunities += valid_token_count * int(module.H)
+        age_sum += float(hola.age_sum.sum().cpu())
+        age_count += int(hola.age_count.sum().cpu())
+    if opportunities < 1:
+        raise QwenRuntimeConfigurationError(
+            "hybrid_cache_diagnostics_unavailable", "zero live cache opportunities"
+        )
+    return {
+        "cache_schema": schema, "layer_count": len(modules),
+        "cache_admissions": admissions, "cache_opportunities": opportunities,
+        "cache_admission_rate": admissions / opportunities,
+        "cache_occupancy": occupied / capacity if capacity else 0.0,
+        "cache_mean_age": age_sum / age_count if age_count else 0.0,
+        "state_norm": float(torch.stack(state_norms).mean().cpu()),
+        "state_matrix_rms_max": float(torch.stack(state_rms_max).max().cpu()),
+        "state_abs_max": float(torch.stack(state_abs_max).max().cpu()),
+    }
+
+
+def _optimizer_mutation_fingerprint(
+    optimizer: torch.optim.Optimizer,
+) -> tuple[object, ...]:
+    """Describe optimizer topology and tensor identity/version without copying data."""
+    def freeze(value: object) -> object:
+        if isinstance(value, torch.Tensor):
+            return (
+                "tensor", id(value), value.data_ptr(), value._version,
+                tuple(value.shape), str(value.dtype), str(value.device),
+            )
+        if isinstance(value, Mapping):
+            return ("mapping", tuple(
+                (str(key), freeze(item)) for key, item in value.items()
+            ))
+        if isinstance(value, (list, tuple)):
+            return (type(value).__name__, tuple(freeze(item) for item in value))
+        if value is None or type(value) in (bool, int, float, str):
+            return (type(value).__name__, value)
+        return ("object", type(value).__module__, type(value).__qualname__, id(value))
+
+    groups = tuple(
+        tuple(
+            (key, tuple(id(parameter) for parameter in value))
+            if key == "params"
+            else (key, freeze(value))
+            for key, value in group.items()
+        )
+        for group in optimizer.param_groups
+    )
+    state = tuple(
+        (id(parameter), freeze(values))
+        for parameter, values in optimizer.state.items()
+    )
+    return (groups, state)
+
+
+def _run_live_hybrid_diagnostic_pass(
+    *, model: torch.nn.Module, modules: Sequence[torch.nn.Module], batch: Mapping[str, object],
+    optimizer: torch.optim.Optimizer | None = None, scheduler: object | None = None,
+    scaler: object | None = None, sampler: object | None = None, trainer: object | None = None,
+    metrics: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Execute a use-cache eval pass transactionally and return exact live diagnostics."""
+    if not isinstance(batch, Mapping) or not isinstance(batch.get("input_ids"), torch.Tensor):
+        raise QwenRuntimeConfigurationError(
+            "hybrid_diagnostic_batch_invalid", "diagnostic batch requires input_ids"
+        )
+    input_ids = batch["input_ids"]
+    attention_mask = batch.get("attention_mask")
+    valid = (attention_mask.bool() if isinstance(attention_mask, torch.Tensor)
+             else torch.ones(input_ids.shape, dtype=torch.bool, device=input_ids.device))
+    if valid.ndim != 2 or tuple(valid.shape) != tuple(input_ids.shape):
+        raise QwenRuntimeConfigurationError(
+            "hybrid_diagnostic_batch_invalid", "diagnostic attention_mask must be [B,T]"
+        )
+    mode_snapshot = {module: module.training for module in model.modules()}
+    cache_snapshot = tuple(
+        (module, hasattr(module, "last_recurrent_cache"),
+         getattr(module, "last_recurrent_cache", None))
+        for module in modules
+    )
+    braid_snapshot = tuple(
+        (module.components,
+         module.components._braid_entropy_sum.detach().clone(),
+         module.components._braid_occupancy_sum.detach().clone(),
+         module.components._braid_sample_count.detach().clone())
+        for module in modules
+    )
+    optimizer_fingerprint = (
+        _optimizer_mutation_fingerprint(optimizer) if optimizer is not None else None
+    )
+    optimizer_mutated = False
+    scheduler_state = copy.deepcopy(scheduler.state_dict()) if scheduler is not None else None
+    scaler_state = copy.deepcopy(scaler.state_dict()) if scaler is not None else None
+    sampler_state = copy.deepcopy(sampler.state_dict()) if sampler is not None else None
+    trainer_fields = tuple(name for name in (
+        "successful_updates", "successful_update_count", "step", "tokens_seen",
+        "example_cursor", "skipped_steps", "last_rank_update_norms",
+    ) if trainer is not None and hasattr(trainer, name))
+    trainer_state = {name: copy.deepcopy(getattr(trainer, name)) for name in trainer_fields}
+    metrics_mutable = metrics is None or isinstance(metrics, dict)
+    metrics_state = copy.deepcopy(dict(metrics)) if metrics is not None else None
+    metrics_restore_error: Exception | None = None
+    python_rng = random.getstate()
+    cpu_rng = torch.get_rng_state().clone()
+    cuda_rng = tuple(state.clone() for state in torch.cuda.get_rng_state_all()) if torch.cuda.is_available() else ()
+    router_rows: list[tuple[torch.Tensor, torch.Tensor]] = []
+    decay_rows: list[torch.Tensor] = []
+    handles = []
+
+    def capture(module: torch.nn.Module, args: tuple[object, ...],
+                kwargs: Mapping[str, object] | None = None) -> None:
+        hidden = args[0] if args else (kwargs or {}).get("hidden_states")
+        if not isinstance(hidden, torch.Tensor):
+            raise QwenRuntimeConfigurationError(
+                "hybrid_router_diagnostics_unavailable", "hybrid layer omitted hidden-state input"
+            )
+        components = getattr(module, "components", None)
+        if getattr(components, "package", None) == "four_state":
+            gamma = components.decay_gamma(hidden).detach().float()
+            decay_rows.append(gamma[valid.detach()])
+        else:
+            probabilities = components.braid_probabilities(hidden)
+            router_rows.append((probabilities.detach(), valid.detach()))
+
+    try:
+        for module in modules:
+            # with_kwargs: decoder layers may pass hidden_states by keyword.
+            handles.append(module.register_forward_pre_hook(capture, with_kwargs=True))
+        model.eval()
+        with torch.no_grad():
+            kwargs: dict[str, object] = {"input_ids": input_ids, "use_cache": True}
+            if isinstance(attention_mask, torch.Tensor):
+                kwargs["attention_mask"] = attention_mask
+            model(**kwargs)
+        cache_metrics = _measure_live_hybrid_caches(
+            modules, valid_token_count=int(valid.sum().item())
+        )
+        result = dict(cache_metrics)
+        if decay_rows:
+            rates = torch.cat(decay_rows).clamp_min(2.0 ** -24).log().neg().mean((0, 1, 3))
+            horizons = rates.clamp_min(1e-12).reciprocal()
+            result["time_braid"] = {
+                "effective_horizons": horizons.cpu().tolist(),
+                "horizon_ratios": (horizons / horizons[0]).cpu().tolist(),
+                "all_lanes_update_each_token": False,
+                "state_router_active": False,
+            }
+        else:
+            result["router"] = _reduce_transition_router_diagnostics(router_rows)
+    finally:
+        for handle in handles:
+            handle.remove()
+        if scheduler is not None:
+            scheduler.load_state_dict(scheduler_state)
+        if scaler is not None:
+            scaler.load_state_dict(scaler_state)
+        if sampler is not None:
+            sampler.load_state_dict(sampler_state)
+        for name, value in trainer_state.items():
+            setattr(trainer, name, value)
+        random.setstate(python_rng)
+        torch.set_rng_state(cpu_rng)
+        if cuda_rng:
+            torch.cuda.set_rng_state_all(list(cuda_rng))
+        for module, training in mode_snapshot.items():
+            module.train(training)
+        for module, present, value in cache_snapshot:
+            if present:
+                module.last_recurrent_cache = value
+            elif hasattr(module, "last_recurrent_cache"):
+                delattr(module, "last_recurrent_cache")
+        with torch.no_grad():
+            for components, entropy, occupancy, count in braid_snapshot:
+                components._braid_entropy_sum.copy_(entropy)
+                components._braid_occupancy_sum.copy_(occupancy)
+                components._braid_sample_count.copy_(count)
+        if metrics is not None and isinstance(metrics, dict):
+            try:
+                metrics.clear(); metrics.update(metrics_state)
+            except Exception as error:
+                metrics_restore_error = error
+        if optimizer is not None:
+            optimizer_mutated = (
+                _optimizer_mutation_fingerprint(optimizer) != optimizer_fingerprint
+            )
+    if not metrics_mutable:
+        raise QwenRuntimeConfigurationError(
+            "hybrid_diagnostics_invalid", "reported metrics must be a mutable mapping"
+        )
+    if metrics_restore_error is not None:
+        raise QwenRuntimeConfigurationError(
+            "hybrid_diagnostics_invalid", "reported metrics could not be restored"
+        ) from metrics_restore_error
+    if optimizer_mutated:
+        raise QwenRuntimeConfigurationError(
+            "hybrid_diagnostics_invalid", "optimizer state mutated during live diagnostics"
+        )
+    return result
+
+
+def _collect_hybrid_diagnostics(
+    modules: tuple[torch.nn.Module, ...], *, trainer: QwenHealTrainer,
+    tokens_per_second: float, peak_memory_bytes: int, flops_per_token: float,
+    capacity_confounded: bool, live: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Measure hybrid diagnostics from live parameters, gradients, and retained caches."""
+    if len(trainer.last_rank_update_norms) != 4:
+        raise QwenRuntimeConfigurationError(
+            "hybrid_rank_diagnostics_unavailable", "all four ranks must receive measured gradients"
+        )
+    q_rows = torch.cat(
+        [module.components.q_weight.detach().float().reshape(4, -1) for module in modules], dim=1
+    )
+    normalized = torch.nn.functional.normalize(q_rows, dim=1)
+    pairwise = normalized @ normalized.T
+    off_diagonal = pairwise[~torch.eye(4, dtype=torch.bool, device=pairwise.device)]
+    # svdvals on the raw [4, layers*H*dk*hidden] matrix overflows cuSOLVER's
+    # 32-bit workspace sizing at campaign width (~4x38M); the four singular
+    # values are exactly the root eigenvalues of the 4x4 Gram matrix.
+    gram = (q_rows @ q_rows.T).double()
+    singular = torch.linalg.eigvalsh(gram).clamp_min(0.0).sqrt().float()
+    effective_rank = singular.sum().square() / singular.square().sum().clamp_min(1e-12)
+    phase_weights = torch.cat([
+        module.components.phase_proj.weight.detach().float().reshape(-1) for module in modules
+    ])
+    phase_biases = torch.cat([
+        module.components.phase_proj.bias.detach().float().reshape(-1) for module in modules
+    ])
+    if not isinstance(live, Mapping) or not isinstance(live.get("time_braid"), Mapping):
+        raise QwenRuntimeConfigurationError(
+            "hybrid_live_diagnostics_unavailable", "live decay-timescale diagnostics are required"
+        )
+    time_braid = live["time_braid"]
+    sink = torch.cat([module.hola.sink_logit.detach().float().reshape(-1, 4) for module in modules])
+    read = sink.softmax(-1)
+    read_entropy = -(read * read.clamp_min(1e-12).log()).sum(-1).mean()
+    gates = torch.cat([
+        torch.cat(((1.0 - module.components.trapezoid_proj.bias.detach().sigmoid()).reshape(-1),
+                   module.components.cache_gate_amplitude.detach().reshape(-1))).float()
+        for module in modules
+    ])
+    measured = {
+        "rank_update_norms": list(trainer.last_rank_update_norms),
+        "rank_similarity": float(off_diagonal.abs().mean().cpu()),
+        "effective_rank": float(effective_rank.cpu()),
+        "phase_magnitude": float(phase_biases.abs().mean().cpu()),
+        "phase_frequency": float(phase_weights.abs().mean().cpu()),
+        "effective_decay_horizons": list(time_braid["effective_horizons"]),
+        "decay_horizon_ratios": list(time_braid["horizon_ratios"]),
+        "all_lanes_update_each_token": bool(time_braid["all_lanes_update_each_token"]),
+        "state_router_active": bool(time_braid["state_router_active"]),
+        "cache_admissions": int(live["cache_admissions"]),
+        "cache_opportunities": int(live["cache_opportunities"]),
+        "cache_schema": str(live["cache_schema"]),
+        "layer_count": int(live["layer_count"]),
+        "cache_admission_rate": float(live["cache_admission_rate"]),
+        "cache_occupancy": float(live["cache_occupancy"]),
+        "cache_mean_age": float(live["cache_mean_age"]),
+        "cache_read_entropy": float(read_entropy.cpu()),
+        "cache_gate_mean": float(torch.cat([m.components.cache_gate_amplitude.detach().float().reshape(-1) for m in modules]).mean().cpu()),
+        "state_norm": float(live["state_norm"]),
+        "gate_mean": float(gates.mean().cpu()), "nonfinite_count": trainer.skipped_steps,
+        "flops_per_token": float(flops_per_token), "tokens_per_second": float(tokens_per_second),
+        "peak_memory_bytes": int(peak_memory_bytes), "capacity_confounded": capacity_confounded,
+    }
+    from .results import validate_hybrid_diagnostics
+    return validate_hybrid_diagnostics(measured)
+
+
 def execute_job(
     job: Mapping[str, object],
     *,
@@ -2291,6 +4137,10 @@ def _execute_job_seeded(
     if not isinstance(runtime, Mapping):
         raise TypeError("runtime must be a mapping")
     config = _job_config(job)
+    from .qwen_variants import validate_maximum_control_config
+    maximum_contract = validate_maximum_control_config(dict(config))
+    data_parallel = _validate_parallel_and_packing(config)
+    architecture_contract = _architecture_dispatch_contract(job, config)
     training = _training_config(config)
     validate_teacher_requirement(
         training,
@@ -2329,7 +4179,33 @@ def _execute_job_seeded(
         )
 
     arm = _selected_arm(job)
-    memory_names, cache_names = _training_parameter_names(config, arm)
+    if architecture_contract is not None:
+        # HOLA's read-normalization, sink, and mixing logit use the dedicated
+        # cache learning rate and zero weight decay even for architecture jobs.
+        cache_names = tuple(
+            name for name in architecture_contract.trainable_names
+            if ".hola." in name or name.endswith(".components.cache_gate_logit")
+        )
+        cache_set = set(cache_names)
+        memory_names = tuple(
+            name for name in architecture_contract.trainable_names if name not in cache_set
+        )
+    else:
+        memory_names, cache_names = _training_parameter_names(config, arm)
+    architecture = config.get("architecture")
+    architecture_arm_id = None
+    architecture_registry_sha256 = None
+    if isinstance(architecture, Mapping):
+        architecture_arm_id = architecture.get("arm_id")
+        architecture_registry_sha256 = architecture.get("registry_sha256")
+        if job.get("arm_id") != architecture_arm_id:
+            raise QwenRuntimeConfigurationError(
+                "architecture_arm_mismatch",
+                "job arm_id does not match canonical_config.architecture.arm_id",
+            )
+    if architecture_contract is not None:
+        architecture_arm_id = architecture_contract.architecture_arm_id
+        architecture_registry_sha256 = architecture_contract.registry_sha256
     cache_mapping = _required_mapping(config.get("cache"), "canonical_config.cache")
     cache_config = CacheConfig(**dict(cache_mapping)) if arm != "native" else None
     if arm == "recency":
@@ -2346,6 +4222,11 @@ def _execute_job_seeded(
         trainable_names=memory_names + cache_names,
         pre_replacement_checkpoint_sha256=assets["checkpoint"].sha256,
         model_loader_kwargs={"torch_dtype": dtype, "low_cpu_mem_usage": True},
+        architecture_arm_id=architecture_arm_id,
+        architecture_registry_sha256=architecture_registry_sha256,
+        diagnostic_training=(architecture_contract.diagnostic_training
+                             if architecture_contract is not None else False),
+        maximum_control_id=(maximum_contract.control_id if maximum_contract is not None else None),
     )
     loaded = dependencies_value.load_arm(
         spec, model_config=None, cache_config=cache_config
@@ -2353,7 +4234,80 @@ def _execute_job_seeded(
     if not isinstance(loaded, LoadedQwenArm) or loaded.arm != arm:
         raise TypeError("Qwen arm loader returned an incompatible result")
     loaded.model.to(runtime_values["student_device"])
+    if (training.gradient_checkpointing and architecture_contract is not None
+            and architecture_contract.architecture_arm_id.startswith("gdn2-mimo-r4-braid-")):
+        enable_checkpointing = getattr(loaded.model, "gradient_checkpointing_enable", None)
+        if not callable(enable_checkpointing):
+            raise QwenRuntimeConfigurationError(
+                "activation_checkpointing_unavailable",
+                "configured activation checkpointing is not implemented by the loaded model",
+            )
+        enable_checkpointing()
+        loaded.model._kmd2_checkpointing_enabled = True
     amplitude_initial = _cache_amplitudes(loaded.model)
+
+    if maximum_contract is not None and not maximum_contract.replacement:
+        if arm != "native" or loaded.upgraded_indices:
+            raise QwenRuntimeConfigurationError(
+                "stock_replacement_forbidden", "stock Qwen evaluation must retain the untouched source model"
+            )
+        for parameter in loaded.model.parameters():
+            parameter.requires_grad_(False)
+        dependencies_value.reset_peak_vram(runtime_values["student_device"])
+        evaluation = dependencies_value.evaluate(
+            loaded_arm=loaded, data=data, job=job, runtime=runtime_values,
+            amplitude_initial=amplitude_initial,
+            generate_answers=dependencies_value.generate_answers,
+            generate_state_values=dependencies_value.generate_state_values,
+            tokenizer_asset=assets.get("tokenizer"),
+        )
+        if not isinstance(evaluation, Mapping) or not isinstance(evaluation.get("metrics"), Mapping):
+            raise QwenRuntimeConfigurationError(
+                "evaluation_invalid", "stock Qwen evaluator metrics must be present"
+            )
+        finished = dependencies_value.monotonic()
+        wall_time = finished - started
+        if not math.isfinite(wall_time) or wall_time < 0.0:
+            raise QwenRuntimeConfigurationError("clock_invalid", "stock evaluation duration is invalid")
+        duration = max(wall_time, 1.0e-12)
+        evaluated_tokens = sum(_batch_token_count(batch) for batch in data.eval_microbatches)
+        recurrent_state = evaluation.get("recurrent_state", {"elements": 0, "bytes": 0})
+        if not isinstance(recurrent_state, Mapping) or set(recurrent_state) != {"elements", "bytes"}:
+            raise QwenRuntimeConfigurationError("evaluation_invalid", "stock recurrent state is incomplete")
+        total_parameters = sum(parameter.numel() for parameter in loaded.model.parameters())
+        payload = {
+            "stock_evaluation": True,
+            "optimizer_created": False,
+            "architecture_replaced": False,
+            "metrics": dict(evaluation["metrics"]),
+            "loss_curves": {"train": [], "validation": []},
+            "counts": {"nonfinite_loss": 0, "nonfinite_gradient": 0, "skipped_steps": 0},
+            "parameters": {"trainable": 0, "total": total_parameters},
+            "recurrent_state": dict(recurrent_state),
+            "performance": {
+                "wall_time_seconds": wall_time,
+                "examples_per_second": len(data.eval_microbatches) / duration,
+                "tokens_per_second": evaluated_tokens / duration,
+                "peak_vram_bytes": dependencies_value.peak_vram_bytes(runtime_values["student_device"]),
+            },
+            "identities": {
+                "model": _identity_record(assets["model"]),
+                "checkpoint": _identity_record(assets["checkpoint"]),
+                "data": _identity_record(assets["data"]),
+                "implementation": "stock_qwen_source_evaluator",
+                "stock": maximum_contract.identity_sha256,
+            },
+        }
+        if "evaluation_execution" in evaluation:
+            payload["evaluation_execution"] = copy.deepcopy(
+                evaluation["evaluation_execution"]
+            )
+        # The per-episode RULER rows are the paired-comparison payload; the
+        # heal path forwards them and the stock reference must as well or the
+        # teacher side of every teacher-vs-arm pairing is aggregate-only.
+        if "evaluations" in evaluation:
+            payload["evaluations"] = copy.deepcopy(evaluation["evaluations"])
+        return payload
 
     teacher = None
     if training.objective != "synthetic_only":
@@ -2383,12 +4337,28 @@ def _execute_job_seeded(
     scheduler = dependencies_value.build_scheduler(
         optimizer=optimizer, config=config, job=job
     )
+    scaler_builder = dependencies_value.build_grad_scaler or _default_build_grad_scaler
+    grad_scaler = scaler_builder(
+        device=runtime_values["student_device"],
+        dtype=next(loaded.model.parameters()).dtype,
+    )
     moved_train = tuple(
         _move_batch(batch, runtime_values["student_device"])
         for batch in data.train_microbatches
     )
+    if data_parallel > 1:
+        moved_train, expected_windows = _shard_training_windows(
+            moved_train, rank=torch.distributed.get_rank(), world_size=data_parallel
+        )
+    trainer_model: torch.nn.Module = loaded.model
+    if data_parallel > 1:
+        device = torch.device(runtime_values["student_device"])
+        device_ids = [device.index] if device.type == "cuda" else None
+        trainer_model = torch.nn.parallel.DistributedDataParallel(
+            loaded.model, device_ids=device_ids, broadcast_buffers=True,
+        )
     trainer = QwenHealTrainer(
-        model=loaded.model,
+        model=trainer_model,
         teacher=teacher,
         optimizer=optimizer,
         scheduler=scheduler,
@@ -2400,6 +4370,8 @@ def _execute_job_seeded(
         teacher_device=(
             runtime_values.get("teacher_device") if teacher is not None else None
         ),
+        distributed=data_parallel > 1,
+        grad_scaler=grad_scaler,
     )
     target_module_names = tuple(
         sorted(f"model.layers.{index}.linear_attn" for index in loaded.upgraded_indices)
@@ -2411,6 +4383,31 @@ def _execute_job_seeded(
     promotion = config.get("promotion")
     if not isinstance(promotion, Mapping) or not promotion:
         promotion = cache_mapping
+    promotion = dict(promotion)
+    if architecture_contract is not None:
+        promotion["architecture_diagnostic_training"] = architecture_contract.diagnostic_training
+    from .architecture import registry_sha256
+    checkpoint_architecture_arm_id = (
+        loaded.architecture_arm_id
+        or ("kmd2-r1" if arm == "native" else f"exact-cache-{arm}-r1")
+    )
+    checkpoint_architecture_registry_sha256 = (
+        loaded.architecture_registry_sha256 or registry_sha256()
+    )
+    auxiliary_identity: Mapping[str, object] = {}
+    if training.specialization_updates > 0:
+        try:
+            _, auxiliary_identity = package_b_auxiliary_loss(
+                loaded.model, lambda_spec=training.lambda_spec, lambda_gate=training.lambda_gate,
+                successful_updates=training.specialization_updates,
+                specialization_updates=training.specialization_updates,
+            )
+        except ValueError as error:
+            # Non-Package-B arms (e.g. gdn2-r1) legitimately train with no
+            # auxiliary loss; mirror the training-loop guard at the metadata
+            # replay site rather than failing the whole diagnostics pass.
+            if "requires four-state" not in str(error):
+                raise
     metadata_kwargs = {
         "job_id": job["job_id"],
         "pairing_id": pairing.pairing_id,
@@ -2419,6 +4416,9 @@ def _execute_job_seeded(
         "data_identity": data.data_identity,
         "example_ids": example_ids,
         "promotion_config": promotion,
+        "architecture_arm_id": checkpoint_architecture_arm_id,
+        "architecture_registry_sha256": checkpoint_architecture_registry_sha256,
+        "auxiliary_identity": auxiliary_identity,
     }
     checkpoint_path = (
         runtime_values["output"] / "checkpoints" / job["job_id"] / "latest.pt"
@@ -2432,6 +4432,7 @@ def _execute_job_seeded(
             scheduler=scheduler,
             expectation=expectation,
             target_module_names=target_module_names,
+            grad_scaler=grad_scaler,
         )
         expected_resume_identity = {
             "job_id": job["job_id"],
@@ -2459,10 +4460,19 @@ def _execute_job_seeded(
             raise QwenRuntimeConfigurationError(
                 "resume_progress_invalid", "resume step exceeds configured update budget"
             )
-        cursor = resumed.step * training.accumulation_steps
+        cursor = getattr(resumed, "example_cursor", resumed.step * training.accumulation_steps)
+        if cursor != resumed.step * training.accumulation_steps:
+            raise QwenRuntimeConfigurationError(
+                "resume_progress_invalid", "resume sampler cursor does not match successful updates"
+            )
         prefix_tokens = sum(
             _batch_token_count(batch) for batch in moved_train[:cursor]
         )
+        if data_parallel > 1:
+            prefix_total = torch.tensor(prefix_tokens, dtype=torch.int64,
+                                        device=runtime_values["student_device"])
+            torch.distributed.all_reduce(prefix_total, op=torch.distributed.ReduceOp.SUM)
+            prefix_tokens = int(prefix_total.item())
         if resumed.tokens_seen != prefix_tokens:
             raise QwenRuntimeConfigurationError(
                 "resume_progress_invalid", "resume token progress does not match data windows"
@@ -2476,16 +4486,25 @@ def _execute_job_seeded(
     dependencies_value.reset_peak_vram(runtime_values["student_device"])
 
     logs: list[HealStepLog] = []
+    checkpoint_writer = data_parallel == 1 or torch.distributed.get_rank() == 0
     checkpoint_every = runtime_values["checkpoint_every"]
+    live_metrics_path = (
+        runtime_values["output"] / "live" / f"{job['job_id']}.jsonl"
+        if checkpoint_writer and os.environ.get("GDNX_LIVE_METRICS") == "1"
+        else None
+    )
     while trainer.step < training.max_updates:
         start = trainer.example_cursor
         stop = start + training.accumulation_steps
         log = trainer.train_update(moved_train[start:stop])
         logs.append(log)
-        if trainer.step % checkpoint_every == 0 or trainer.step == training.max_updates:
+        if live_metrics_path is not None:
+            _emit_live_metrics(live_metrics_path, log, training.max_updates)
+        if checkpoint_writer and (trainer.step % checkpoint_every == 0 or trainer.step == training.max_updates):
             metadata = QwenCheckpointMetadata(
                 step=trainer.step,
                 tokens_seen=trainer.tokens_seen,
+                example_cursor=trainer.example_cursor,
                 **metadata_kwargs,
             )
             dependencies_value.save_checkpoint(
@@ -2495,6 +4514,7 @@ def _execute_job_seeded(
                 scheduler=scheduler,
                 metadata=metadata,
                 target_module_names=target_module_names,
+                grad_scaler=grad_scaler,
             )
 
     evaluation = dependencies_value.evaluate(
@@ -2503,6 +4523,9 @@ def _execute_job_seeded(
         job=job,
         runtime=runtime_values,
         amplitude_initial=amplitude_initial,
+        generate_answers=dependencies_value.generate_answers,
+        generate_state_values=dependencies_value.generate_state_values,
+        tokenizer_asset=assets.get("tokenizer"),
     )
     if not isinstance(evaluation, Mapping):
         raise TypeError("Qwen evaluator must return a mapping")
@@ -2562,10 +4585,206 @@ def _execute_job_seeded(
                 if teacher is not None
                 else {}
             ),
+            "architecture_arm_id": checkpoint_architecture_arm_id,
+            "architecture_registry_sha256": checkpoint_architecture_registry_sha256,
+            "architecture_classification": loaded.architecture_classification,
+            "architecture_identity_passed": loaded.architecture_identity_passed,
+            "architecture_implementation": loaded.architecture_implementation,
+            "architecture_tensor_manifest": (
+                None
+                if loaded.architecture_tensor_manifest is None
+                else dict(loaded.architecture_tensor_manifest)
+            ),
         },
     }
+    if loaded.architecture_arm_id is not None:
+        payload.update({
+            "architecture_arm_id": loaded.architecture_arm_id,
+            "architecture_registry_sha256": loaded.architecture_registry_sha256,
+            "architecture_classification": loaded.architecture_classification,
+            "architecture_identity_passed": loaded.architecture_identity_passed,
+            "architecture_implementation": loaded.architecture_implementation,
+            "architecture_tensor_manifest": dict(loaded.architecture_tensor_manifest or {}),
+        })
+        if loaded.architecture_arm_id.startswith("gdn2-mimo-r4-braid-"):
+            from .qwen_hybrid_math import DEFERRED_FUSION_WARNING, REFERENCE_IMPLEMENTATION
+            payload["performance"].update({
+                "execution": REFERENCE_IMPLEMENTATION,
+                "warning": DEFERRED_FUSION_WARNING,
+            })
+        architecture_modules = tuple(
+            loaded.model.model.layers[index].linear_attn
+            for index in loaded.upgraded_indices
+        )
+        # Incremental arms keep the stock conv at module.conv1d; the maximum
+        # hybrids copy it into their HybridComponents submodule.
+        convolution_parameters = sum(
+            (module.conv1d if hasattr(module, "conv1d")
+             else module.components.conv1d).weight.numel()
+            for module in architecture_modules
+        )
+        transformed_parameters = sum(
+            module.erase_proj.weight.numel()
+            + module.write_proj.weight.numel()
+            + module.write_offset.numel()
+            for module in architecture_modules
+            if hasattr(module, "erase_proj")
+        )
+        payload["resources"] = {
+            "total_parameters": total_parameters,
+            "trainable_parameters": trainable,
+            "recurrent_state_elements": recurrent_state["elements"],
+            "recurrent_state_bytes": recurrent_state["bytes"],
+            "convolution_parameters": convolution_parameters,
+            "transformed_parameters": transformed_parameters,
+            "reference_implementation": loaded.architecture_implementation,
+        }
+        payload["resources"].update(_architecture_new_state_resources(architecture_modules))
+        if loaded.architecture_arm_id.startswith("gdn2-mimo-r4-braid-"):
+            input_shapes = tuple(
+                batch["input_ids"].shape
+                for batch in (*data.train_microbatches, *data.eval_microbatches)
+            )
+            batch_size = max(int(shape[0]) for shape in input_shapes)
+            sequence_length = max(int(shape[1]) for shape in input_shapes)
+            payload["resources"]["hybrid"] = _hybrid_module_resources(
+                architecture_modules, optimizer=optimizer, batch_size=batch_size,
+                sequence_length=sequence_length,
+                checkpointing=training.gradient_checkpointing,
+                resident_model=loaded.model,
+                data_parallel=data_parallel,
+            )
+        rank = getattr(architecture_modules[0], "rank", 1)
+        output_width = getattr(architecture_modules[0], "output_width", 1)
+        if loaded.architecture_arm_id == "rout-4":
+            if any(type(getattr(module, "output_width", None)) is not int
+                   for module in architecture_modules):
+                raise QwenRuntimeConfigurationError(
+                    "architecture_tensor_manifest_malformed_width",
+                    "widening production layers must declare integer output_width",
+                )
+            if any(getattr(module, "output_width") != output_width
+                   for module in architecture_modules):
+                raise QwenRuntimeConfigurationError(
+                    "architecture_tensor_manifest_heterogeneous_width",
+                    "widening production layers do not have one homogeneous width",
+                )
+            from .architecture import architecture_record
+            record = architecture_record(loaded.architecture_arm_id)
+            input_shapes = tuple(batch["input_ids"].shape for batch in
+                                 (*data.train_microbatches, *data.eval_microbatches))
+            batch_size, max_tokens = _widening_resource_shape_maxima(tuple(
+                (int(shape[0]), int(shape[1])) for shape in input_shapes
+            ))
+            payload["resources"].update(_shared_query_widening_resources(
+                width=output_width, layers=len(architecture_modules),
+                batch_size=batch_size, sequence_length=1, max_tokens=max_tokens,
+                heads=record.num_heads, key_dim=record.state_key_dim,
+                value_dim=record.state_value_dim,
+            ))
+        if rank > 1:
+            if any(getattr(module, "rank", None) != rank for module in architecture_modules):
+                raise QwenRuntimeConfigurationError(
+                    "architecture_tensor_manifest_heterogeneous_rank",
+                    "true MIMO production layers do not have one homogeneous rank",
+                )
+            from .architecture import architecture_record
+            record = architecture_record(loaded.architecture_arm_id)
+            input_shapes = tuple(
+                batch["input_ids"].shape
+                for batch in (*data.train_microbatches, *data.eval_microbatches)
+            )
+            batch_size, sequence_length = max(
+                input_shapes, key=lambda shape: int(shape[0]) * int(shape[1])
+            )
+            payload["resources"].update(_true_mimo_resources(
+                rank=rank,
+                layers=len(architecture_modules),
+                batch_size=int(batch_size),
+                sequence_length=int(sequence_length),
+                heads=record.num_heads,
+                key_dim=record.state_key_dim,
+                value_dim=record.state_value_dim,
+                native_conv_parameters=convolution_parameters,
+            ))
     if "evaluations" in evaluation:
         payload["evaluations"] = evaluation["evaluations"]
+        hybrid_rows = [
+            row for row in evaluation["evaluations"]
+            if isinstance(row, Mapping) and row.get("task") == "ruler"
+            and row.get("context_length") == 32768
+        ]
+        if loaded.architecture_arm_id is not None and hybrid_rows:
+            teacher_rows = [row for row in hybrid_rows if row.get("evaluation_mode") == "teacher_forced"]
+            generated_rows = [row for row in hybrid_rows if row.get("evaluation_mode") == "free_generation"]
+            if teacher_rows and generated_rows:
+                task_params = _required_mapping(
+                    _required_mapping(config.get("task"), "canonical_config.task").get("params"),
+                    "canonical_config.task.params",
+                )
+                payload["hybrid_promotion_observation"] = {
+                    "arm_id": job["arm_id"], "seed": job["seed"],
+                    "pairing_id": pairing.pairing_id,
+                    "baseline_arm_id": str(task_params.get("promotion_baseline_arm_id", "gdn2-channel-r1")),
+                    "checkpoint_sha256": assets["checkpoint"].sha256,
+                    "data_sha256": assets["data"].sha256,
+                    "cells": sorted({str(row["cell_id"]) for row in hybrid_rows}),
+                    "recall": sum(int(row["numerator"]) for row in teacher_rows)
+                    / sum(int(row["denominator"]) for row in teacher_rows),
+                    "free_generation": sum(int(row["numerator"]) for row in generated_rows)
+                    / sum(int(row["denominator"]) for row in generated_rows),
+                    "lm_loss": float(metrics["eval_loss"]), "nonfinite_count": trainer.skipped_steps,
+                    "capacity_confounded": bool(task_params.get("capacity_confounded", False)),
+                }
+    if "evaluation_execution" in evaluation:
+        payload["evaluation_execution"] = copy.deepcopy(
+            evaluation["evaluation_execution"]
+        )
+    if (loaded.architecture_arm_id is not None
+            and loaded.architecture_arm_id.startswith("gdn2-mimo-r4-braid-")):
+        resources = payload["resources"]["hybrid"]
+        assert isinstance(resources, Mapping)
+        estimated_flops = 2.0 * float(resources["parameter_bytes"]) / torch.empty((), dtype=dtype).element_size()
+        task_params = _required_mapping(
+            _required_mapping(config.get("task"), "canonical_config.task").get("params"),
+            "canonical_config.task.params",
+        )
+        capacity_confounded = task_params.get("capacity_confounded", False)
+        if type(capacity_confounded) is not bool:
+            raise QwenRuntimeConfigurationError(
+                "job_configuration_invalid", "capacity_confounded must be bool"
+            )
+        if not data.eval_microbatches:
+            raise QwenRuntimeConfigurationError(
+                "hybrid_diagnostic_batch_unavailable", "hybrid run has no declared evaluation batch"
+            )
+        diagnostic_batch = _move_batch(
+            data.eval_microbatches[0], runtime_values["student_device"]
+        )
+        live_diagnostics = _run_live_hybrid_diagnostic_pass(
+            model=loaded.model, modules=architecture_modules,
+            batch=diagnostic_batch, optimizer=optimizer, scheduler=scheduler,
+            scaler=grad_scaler, trainer=trainer, metrics=metrics,
+        )
+        payload["hybrid_diagnostics"] = _collect_hybrid_diagnostics(
+            architecture_modules, trainer=trainer,
+            tokens_per_second=float(payload["performance"]["tokens_per_second"]),
+            peak_memory_bytes=int(payload["performance"]["peak_vram_bytes"]),
+            flops_per_token=estimated_flops,
+            capacity_confounded=capacity_confounded,
+            live=live_diagnostics,
+        )
+        if "hybrid_promotion_observation" in payload:
+            seed_evidence = payload["hybrid_promotion_observation"]
+            assert isinstance(seed_evidence, dict)
+            seed_evidence["effective_rank"] = payload["hybrid_diagnostics"]["effective_rank"]
+            seed_evidence["decay_horizon_ratios"] = payload["hybrid_diagnostics"]["decay_horizon_ratios"]
+            thresholds = task_params.get("hybrid_promotion_thresholds", {})
+            if not isinstance(thresholds, Mapping):
+                raise QwenRuntimeConfigurationError(
+                    "job_configuration_invalid", "hybrid_promotion_thresholds must be a mapping"
+                )
+            seed_evidence["thresholds"] = dict(thresholds)
     if arm != "native":
         exact_cache = evaluation.get("exact_cache")
         if not isinstance(exact_cache, Mapping):
@@ -2631,6 +4850,8 @@ __all__ = [
     "execute_job",
     "layerwise_alignment_loss",
     "project_cache_amplitudes_",
+    "project_hybrid_constraints_",
+    "run_qwen_arm",
     "run_job",
     "validate_teacher_requirement",
 ]

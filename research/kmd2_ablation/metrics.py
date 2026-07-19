@@ -84,6 +84,25 @@ _DIRECTIONS = {
     "throughput_tokens_per_second": 1,
     "throughput_examples_per_second": 1,
     "peak_vram_bytes": -1,
+    "hybrid_rank_update_norm": None,
+    "hybrid_rank_similarity": None,
+    "hybrid_effective_rank": None,
+    "hybrid_phase_magnitude": None,
+    "hybrid_phase_frequency": None,
+    "hybrid_effective_decay_horizons": None,
+    "hybrid_decay_horizon_ratios": None,
+    "hybrid_cache_admission_rate": None,
+    "hybrid_cache_occupancy": None,
+    "hybrid_cache_mean_age": None,
+    "hybrid_cache_read_entropy": None,
+    "hybrid_cache_gate_mean": None,
+    "hybrid_state_norm": None,
+    "hybrid_gate_mean": None,
+    "hybrid_nonfinite_count": -1,
+    "hybrid_flops_per_token": -1,
+    "hybrid_tokens_per_second": 1,
+    "hybrid_peak_memory_bytes": -1,
+    "hybrid_capacity_confounded": -1,
 }
 
 _MAX_METRICS = {
@@ -214,6 +233,44 @@ class MetricContribution:
         object.__setattr__(self, "denominator", denominator)
         object.__setattr__(self, "strata", _canonical_strata(self.strata))
         object.__setattr__(self, "state", state)
+
+
+def hybrid_diagnostic_contributions(record: Mapping[str, object]) -> tuple[MetricContribution, ...]:
+    """Convert one validated hybrid diagnostic snapshot to additive metrics."""
+    from .results import validate_hybrid_diagnostics
+
+    values = validate_hybrid_diagnostics(record)
+    contributions = [
+        MetricContribution(
+            "hybrid_rank_update_norm", float(value), 1.0, (("rank", str(index)),)
+        )
+        for index, value in enumerate(values["rank_update_norms"])
+    ]
+    fields = {
+        "rank_similarity": "hybrid_rank_similarity",
+        "effective_rank": "hybrid_effective_rank",
+        "phase_magnitude": "hybrid_phase_magnitude",
+        "phase_frequency": "hybrid_phase_frequency",
+        "effective_decay_horizons": "hybrid_effective_decay_horizons",
+        "decay_horizon_ratios": "hybrid_decay_horizon_ratios",
+        "cache_admission_rate": "hybrid_cache_admission_rate",
+        "cache_occupancy": "hybrid_cache_occupancy",
+        "cache_mean_age": "hybrid_cache_mean_age",
+        "cache_read_entropy": "hybrid_cache_read_entropy",
+        "cache_gate_mean": "hybrid_cache_gate_mean",
+        "state_norm": "hybrid_state_norm",
+        "gate_mean": "hybrid_gate_mean",
+        "nonfinite_count": "hybrid_nonfinite_count",
+        "flops_per_token": "hybrid_flops_per_token",
+        "tokens_per_second": "hybrid_tokens_per_second",
+        "peak_memory_bytes": "hybrid_peak_memory_bytes",
+        "capacity_confounded": "hybrid_capacity_confounded",
+    }
+    contributions.extend(
+        MetricContribution(metric, float(values[field]), 1.0)
+        for field, metric in fields.items()
+    )
+    return tuple(contributions)
 
 
 @dataclass(frozen=True)
@@ -1785,6 +1842,7 @@ __all__ = [
     "decide_option3",
     "evaluate_option3_branch",
     "freshness_contributions",
+    "hybrid_diagnostic_contributions",
     "integration_contributions",
     "metric_direction",
     "paired_bootstrap",

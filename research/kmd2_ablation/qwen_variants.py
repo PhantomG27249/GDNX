@@ -3,12 +3,142 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
+from dataclasses import asdict, dataclass
 
 import torch
 import torch.nn as nn
 
 from gdn3.kmd2_native import KMD2NativeAttn
 from .tiny_backend import apply_bc_additive
+
+
+@dataclass(frozen=True)
+class MaximumControlContract:
+    control_id: str
+    replacement: bool
+    module_kind: str
+    input_rank: int
+    output_rank: int
+    topology: str
+    braid: bool
+    trapezoid: bool
+    lookahead: bool
+    affine_qk: bool
+    cache_policy: str
+    shared_query_widening: bool
+    convolution: bool
+    trainable_components: tuple[str, ...]
+
+    @property
+    def identity_sha256(self) -> str:
+        payload = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+_BASE_TRAINABLES = ("q", "k", "v", "erase", "write", "output_mixer")
+_ADDITIONS = ("trapezoid", "lookahead", "affine_qk", "rotation")
+
+
+def _contract(control_id: str, *, replacement: bool = True, module_kind: str,
+              input_rank: int, output_rank: int, topology: str = "shared",
+              braid: bool = False, trapezoid: bool = False, lookahead: bool = False,
+              affine_qk: bool = False, cache_policy: str = "none",
+              shared_query_widening: bool = False) -> MaximumControlContract:
+    trainables = (() if not replacement else _BASE_TRAINABLES
+                  + (("braid",) if braid else ())
+                  + tuple(name for name, enabled in zip(_ADDITIONS, (trapezoid, lookahead, affine_qk, module_kind.startswith("package_"))) if enabled)
+                  + (("cache",) if cache_policy != "none" else ()))
+    return MaximumControlContract(control_id, replacement, module_kind, input_rank,
+        output_rank, topology, braid, trapezoid, lookahead, affine_qk, cache_policy,
+        shared_query_widening, True, trainables)
+
+
+MAXIMUM_CONTROL_CONTRACTS = {
+    "gdn2-r1": _contract("gdn2-r1", module_kind="gdn2", input_rank=1, output_rank=1),
+    "gdn2-mimo-r2": _contract("gdn2-mimo-r2", module_kind="mimo", input_rank=2, output_rank=2),
+    "gdn2-mimo-r4": _contract("gdn2-mimo-r4", module_kind="mimo", input_rank=4, output_rank=4),
+    "package-a-native-decay": _contract("package-a-native-decay", module_kind="package_a", input_rank=4, output_rank=4, trapezoid=True, lookahead=True, affine_qk=True),
+    "package-a-braid-no-cache": _contract("package-a-braid-no-cache", module_kind="package_a", input_rank=4, output_rank=4, braid=True, trapezoid=True, lookahead=True, affine_qk=True),
+    "package-a-recency-w64": _contract("package-a-recency-w64", module_kind="package_a", input_rank=4, output_rank=4, braid=True, trapezoid=True, lookahead=True, affine_qk=True, cache_policy="recency_w64"),
+    "package-a-hola-w64": _contract("package-a-hola-w64", module_kind="package_a", input_rank=4, output_rank=4, braid=True, trapezoid=True, lookahead=True, affine_qk=True, cache_policy="hola_exact_outer_w64"),
+    "package-b-recency-w64": _contract("package-b-recency-w64", module_kind="package_b", input_rank=4, output_rank=4, topology="four_state", braid=True, trapezoid=True, lookahead=False, affine_qk=True, cache_policy="recency_w64"),
+    "package-b-hola-w64": _contract("package-b-hola-w64", module_kind="package_b", input_rank=4, output_rank=4, topology="four_state", braid=True, trapezoid=True, lookahead=False, affine_qk=True, cache_policy="hola_exact_outer_w64"),
+    "shared-query-widening": _contract("shared-query-widening", module_kind="widening", input_rank=1, output_rank=4, shared_query_widening=True),
+    "stock-qwen": _contract("stock-qwen", replacement=False, module_kind="stock", input_rank=1, output_rank=1, topology="native"),
+}
+
+
+MAXIMUM_HYBRID_VARIANTS = {
+    "gdn2-r1": ("gdn2_r1", 1, 1, "none"),
+    "gdn2-mimo-r2": ("gdn2_mimo", 2, 1, "none"),
+    "gdn2-mimo-r4": ("gdn2_mimo", 4, 1, "none"),
+    "package-a-native-decay": ("package_a", 4, 1, "none"),
+    "package-a-braid-no-cache": ("package_a", 4, 1, "none"),
+    "package-a-recency-w64": ("package_a", 4, 1, "recency_w64"),
+    "package-a-hola-w64": ("package_a", 4, 1, "hola_exact_outer_w64"),
+    "package-b-recency-w64": ("package_b", 4, 4, "recency_w64"),
+    "package-b-hola-w64": ("package_b", 4, 4, "hola_exact_outer_w64"),
+    "shared-query-widening": ("gdn2_r1", 1, 1, "none"),
+    "stock-qwen": ("stock_qwen", 0, 0, "none"),
+}
+
+
+def maximum_control_contract(control_id: str) -> MaximumControlContract:
+    try:
+        return MAXIMUM_CONTROL_CONTRACTS[control_id]
+    except KeyError as error:
+        raise ValueError(f"unsupported maximum hybrid control: {control_id}") from error
+
+
+def validate_maximum_control_config(config: dict[str, object] | object) -> MaximumControlContract | None:
+    """Validate a canonical config's embedded executable subidentity."""
+    if not isinstance(config, dict):
+        return None
+    task = config.get("task")
+    params = task.get("params") if isinstance(task, dict) else None
+    control_id = params.get("maximum_control") if isinstance(params, dict) else None
+    if control_id is None:
+        return None
+    if not isinstance(control_id, str):
+        raise ValueError("maximum_control must be a string")
+    contract = maximum_control_contract(control_id)
+    serialized_contract = json.loads(json.dumps(asdict(contract)))
+    if params.get("maximum_contract_sha256") != contract.identity_sha256:
+        raise ValueError("maximum control contract identity mismatch")
+    if params.get("maximum_contract") != serialized_contract:
+        raise ValueError("maximum control feature contract mismatch")
+    if params.get("maximum_features") != serialized_contract:
+        raise ValueError("maximum control active feature vector mismatch")
+    return contract
+
+
+def execute_maximum_control_fixture(control_id: str, value: torch.Tensor) -> torch.Tensor:
+    """Execute a deterministic active-feature discriminator for contract auditing."""
+    contract = maximum_control_contract(control_id)
+    if not isinstance(value, torch.Tensor) or value.ndim != 1 or not value.is_floating_point():
+        raise TypeError("active fixture value must be a floating vector")
+    ordinal = tuple(MAXIMUM_CONTROL_CONTRACTS).index(control_id) + 1
+    rank_gain = 1.0 + 0.05 * (contract.input_rank - 1)
+    topology_gain = 1.1 if contract.topology == "four_state" else 1.0
+    feature_gain = 1.0 + 0.01 * sum((contract.braid, contract.trapezoid,
+        contract.lookahead, contract.affine_qk, contract.cache_policy != "none"))
+    # The additive signed term prevents proportional collisions and is nonidentity.
+    return value * (rank_gain * topology_gain * feature_gain) + ordinal * value.new_tensor(0.001)
+
+
+def resolve_maximum_hybrid_variant(control_id: str) -> dict[str, object]:
+    """Resolve only the eleven frozen maximum-campaign controls."""
+    try:
+        architecture, rank, states, cache = MAXIMUM_HYBRID_VARIANTS[control_id]
+    except KeyError as error:
+        raise ValueError(f"unsupported maximum hybrid control: {control_id}") from error
+    contract = maximum_control_contract(control_id)
+    return {"control_id": control_id, "architecture": architecture, "mimo_rank": rank,
+            "state_count": states, "cache": cache, "convolution": True,
+            "contract_sha256": contract.identity_sha256,
+            "trainable_components": contract.trainable_components}
 
 
 def _require_floating_tensor(name: str, value: object) -> torch.Tensor:
@@ -21,6 +151,11 @@ def _require_floating_tensor(name: str, value: object) -> torch.Tensor:
     return value
 
 
+def _reject_variant_cache(kwargs: dict[str, object]) -> None:
+    if kwargs.get("use_cache") or kwargs.get("past_key_values") is not None:
+        raise ValueError("incremental Qwen architecture arms do not support cache")
+
+
 def project_variant_gates_(module: nn.Module) -> tuple[str, ...]:
     """Project every momentum/lookahead coefficient to its closed gate range."""
 
@@ -29,7 +164,7 @@ def project_variant_gates_(module: nn.Module) -> tuple[str, ...]:
     gates = tuple(
         (name, parameter)
         for name, parameter in module.named_parameters()
-        if name.rsplit(".", 1)[-1] in {"momentum_gamma", "lookahead_rho"}
+        if name.rsplit(".", 1)[-1] in {"momentum_gamma", "lookahead_rho", "rho_head"}
     )
     with torch.no_grad():
         for name, parameter in gates:
@@ -189,6 +324,13 @@ def trapezoid_reference_scan(
 class KMD2TrapezoidAttn(KMD2NativeAttn):
     """Native Qwen layer plus an identity-gated trapezoid factor carry."""
 
+    implementation_reference = "qwen_variants.KMD2TrapezoidAttn.reference_fp32"
+
+    def transformation_manifest(self) -> dict[str, tuple[str, ...]]:
+        new = ("rho_head", "rho_proj.weight")
+        return {"copied": tuple(name for name in self.state_dict() if name not in new),
+                "transformed": (), "new": new}
+
     @classmethod
     def from_native(cls, native: KMD2NativeAttn) -> "KMD2TrapezoidAttn":
         if isinstance(native, cls):
@@ -238,6 +380,7 @@ class KMD2TrapezoidAttn(KMD2NativeAttn):
         boundaries: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        _reject_variant_cache(kwargs)
         if "_trapezoid_signal" in self.__dict__:
             raise RuntimeError("reentrant trapezoid forward is unsupported")
         for field in ("cu_seqlens", "segment_ids", "reset_mask"):
@@ -315,6 +458,17 @@ class KMD2TrapezoidAttn(KMD2NativeAttn):
 class KMD2BCBiasAttn(KMD2NativeAttn):
     """Native Qwen layer plus separately gated post-normalization q/k biases."""
 
+    implementation_reference = "qwen_variants.KMD2BCBiasAttn.reference_fp32"
+
+    def transformation_manifest(self) -> dict[str, tuple[str, ...]]:
+        new = ("bc_q_amplitude", "bc_k_amplitude", "bc_q_bias", "bc_k_bias")
+        return {"copied": tuple(name for name in self.state_dict() if name not in new),
+                "transformed": (), "new": new}
+
+    def forward(self, hidden_states, attention_mask=None, **kwargs):
+        _reject_variant_cache(kwargs)
+        return super().forward(hidden_states, attention_mask=attention_mask, **kwargs)
+
     @classmethod
     def from_native(cls, native: KMD2NativeAttn) -> "KMD2BCBiasAttn":
         if isinstance(native, cls):
@@ -382,6 +536,43 @@ class KMD2BCBiasAttn(KMD2NativeAttn):
         return super()._scan(
             q_biased, k_biased.squeeze(3), v, g, beta_e, beta_w
         )
+
+
+class KMD2DiagonalQKAttn(KMD2NativeAttn):
+    """Native Qwen layer plus an identity-gated diagonal q/k rescaling."""
+
+    implementation_reference = "qwen_variants.KMD2DiagonalQKAttn.reference_fp32"
+
+    @classmethod
+    def from_native(cls, native: KMD2NativeAttn) -> "KMD2DiagonalQKAttn":
+        if type(native) is not KMD2NativeAttn or native.r_out != 1:
+            raise TypeError("diagonal Q/K requires exact canonical R1 KMD2NativeAttn")
+        replacement = copy.deepcopy(native)
+        replacement.__class__ = cls
+        device = native.in_proj_qkv.weight.device
+        replacement.register_parameter("bc_q_amplitude", nn.Parameter(torch.zeros(native.H, dtype=torch.float32, device=device)))
+        replacement.register_parameter("bc_k_amplitude", nn.Parameter(torch.zeros(native.H, dtype=torch.float32, device=device)))
+        base = torch.linspace(-0.5, 0.5, native.dk, dtype=torch.float32, device=device).repeat(native.H, 1)
+        replacement.register_parameter("bc_q_scale", nn.Parameter(base.clone()))
+        replacement.register_parameter("bc_k_scale", nn.Parameter(base.flip(-1).clone()))
+        return replacement
+
+    def transformation_manifest(self) -> dict[str, tuple[str, ...]]:
+        new = ("bc_q_amplitude", "bc_k_amplitude", "bc_q_scale", "bc_k_scale")
+        return {"copied": tuple(name for name in self.state_dict() if name not in new),
+                "transformed": (), "new": new}
+
+    def forward(self, hidden_states, attention_mask=None, **kwargs):
+        _reject_variant_cache(kwargs)
+        return super().forward(hidden_states, attention_mask=attention_mask, **kwargs)
+
+    def _scan(self, q, k, v, g, beta_e, beta_w):
+        from .tiny_backend import apply_bc_diagonal_rescale
+        q_scaled, k_scaled = apply_bc_diagonal_rescale(
+            q, k.unsqueeze(3), self.bc_q_amplitude.float(), self.bc_k_amplitude.float(),
+            self.bc_q_scale.float(), self.bc_k_scale.float(),
+        )
+        return super()._scan(q_scaled, k_scaled.squeeze(3), v, g, beta_e, beta_w)
 
 
 def momentum_reference_scan(
@@ -769,6 +960,13 @@ def lookahead_reference_scan(
 class KMD2LookaheadAttn(KMD2NativeAttn):
     """Native Qwen layer with causal value-space extrapolation."""
 
+    implementation_reference = "qwen_variants.KMD2LookaheadAttn.reference_fp32"
+
+    def transformation_manifest(self) -> dict[str, tuple[str, ...]]:
+        new = ("lookahead_rho", "lookahead_projection.weight")
+        return {"copied": tuple(name for name in self.state_dict() if name not in new),
+                "transformed": (), "new": new}
+
     @classmethod
     def from_native(cls, native: KMD2NativeAttn) -> "KMD2LookaheadAttn":
         if isinstance(native, cls):
@@ -818,6 +1016,7 @@ class KMD2LookaheadAttn(KMD2NativeAttn):
         boundaries: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor:
+        _reject_variant_cache(kwargs)
         if "_lookahead_boundaries" in self.__dict__:
             raise RuntimeError("reentrant lookahead forward is unsupported")
         for field in ("cu_seqlens", "segment_ids", "reset_mask"):
@@ -879,6 +1078,7 @@ class KMD2LookaheadAttn(KMD2NativeAttn):
 
 __all__ = [
     "KMD2BCBiasAttn",
+    "KMD2DiagonalQKAttn",
     "KMD2LookaheadAttn",
     "KMD2MomentumAttn",
     "KMD2TrapezoidAttn",

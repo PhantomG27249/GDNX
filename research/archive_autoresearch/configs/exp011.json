@@ -1,3 +1,0 @@
-{"name":"timescale_mixture_exp011","hypothesis":"Phase-2 mechanism variant: the .mean collapse over the 4 braided decay timescales (gdn3_upgrade.py:822) mashes distinct retention rates into one averaged factor, removing the selective long-range channel a key->value binding needs to survive 512 tokens. A learned per-timescale softmax mixture (tau_gate, zero-init so warm-start is unperturbed) lets the model route content to different retention rates and preserve a slow long-range channel — should break the ~0.30 format plateau toward true retrieval.",
- "steps":500,"eval_every":50,"warmup":40,"grad_accum":1,"n_keys":4,"seq_len":512,
- "lr_memory":2.5e-4,"lr_coproduct":1.5e-4,"decay_clamp":0.999,"slow_decay":0.97,"residual_rank":16,"seed":0}

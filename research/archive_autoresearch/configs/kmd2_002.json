@@ -1,4 +1,0 @@
-{"name":"kmd2_fable_v2_horizon","hypothesis":"v1's decay init (sigmoid(2.5)=0.924) gave a ~13-token memory horizon so bindings were erased before the query; raising init to sigmoid(6.0)=0.9975 (~200-token horizon) restores the retrieval gradient. Single change vs kmd2_001 for clean attribution.",
- "kmd2":true,"kmd2_r":4,"kmd2_h":16,"kmd2_dk":64,"kmd2_dv":64,"kmd2_eps":0.5,"kmd2_decay_bias":6.0,
- "steps":400,"eval_every":80,"warmup":40,"grad_accum":1,"n_keys":4,"seq_len":512,
- "lr_memory":2.5e-4,"lr_coproduct":1.5e-4,"seed":0}
