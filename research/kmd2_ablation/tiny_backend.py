@@ -12,6 +12,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from .architecture import (
+    _channelwise_gdn2_update_unchecked,
+    _true_mimo_update_unchecked,
+)
 from .config import CacheConfig
 from .exact_cache import (
     admission_scores,
@@ -280,32 +284,11 @@ def true_mimo_update(
         raise ValueError(
             "channelwise Gated DeltaNet-2 gates currently require rank R=1"
         )
-    if rank == 1:
-        key_one = key[:, :, 0]
-        value_one = value[:, :, 0]
-        if channel_shapes:
-            erase_direction = beta_e[:, :, 0] * key_one
-            memory = torch.matmul(
-                erase_direction.unsqueeze(-2), state_bar
-            ).squeeze(-2)
-            update = beta_w[:, :, 0] * value_one - memory
-        else:
-            memory = torch.matmul(key_one.unsqueeze(-2), state_bar).squeeze(-2)
-            update = (
-                beta_w[:, :, 0].unsqueeze(-1) * value_one
-                - beta_e[:, :, 0].unsqueeze(-1) * memory
-            )
-        return state_bar + key_one.unsqueeze(-1) * update.unsqueeze(-2)
-    memory = torch.matmul(key, state_bar)
-    erase = torch.einsum(
-        "bhrd,bhrv->bhdv",
-        key,
-        (beta_e / rank).unsqueeze(-1) * memory,
-    )
-    write = torch.einsum(
-        "bhrd,bhrv->bhdv", key, beta_w.unsqueeze(-1) * value
-    )
-    return state_bar - erase + write
+    if channel_shapes:
+        return _channelwise_gdn2_update_unchecked(
+            state_bar, key, value, beta_e, beta_w
+        )
+    return _true_mimo_update_unchecked(state_bar, key, value, beta_e, beta_w)
 
 
 def _rotate_state_rows(state: Tensor, phase: Tensor) -> Tensor:

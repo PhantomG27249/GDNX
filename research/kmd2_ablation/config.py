@@ -32,6 +32,7 @@ _MECHANISMS = {
     "gdn2_decoupled",
     "exact_cache",
     "current_block_only",
+    "maximum_hybrid",
 }
 _VARIANTS = {
     "native",
@@ -65,6 +66,8 @@ _VARIANTS = {
     "per_slot_read",
     "cache_rotation_factorial",
     "cache_r_out_factorial",
+    "braid_shared_hola_w64",
+    "braid_four_state_hola_w64",
 }
 _TASKS = {
     "mqar",
@@ -110,7 +113,7 @@ _CACHE_SCORE_POLICIES = {
     "future_query_oracle",
 }
 _CACHE_READ_POLICIES = {"unit_l2", "fixed_temperature", "rmsnorm"}
-_CACHE_READ_INITIALIZATIONS = {"gamma_one_sink_zero_amplitude_zero"}
+_CACHE_READ_INITIALIZATIONS = {"gamma_one_sink_zero_amplitude_zero", "hola_gate_logit_v2_minus4"}
 _CACHE_STORAGE_DTYPES = {"fp32", "bf16"}
 _CACHE_COMPUTE_DTYPES = {"fp32"}
 
@@ -826,6 +829,144 @@ def _build_protected_metrics(value: Any) -> tuple[ProtectedMetric, ...]:
 
 
 @dataclass(frozen=True)
+class ArchitectureIdentity:
+    arm_id: str
+    registry_sha256: str
+    model_tree_sha256: str
+    ordered_examples_sha256: str
+    pretraining_checkpoint_sha256: str
+
+    def __post_init__(self) -> None:
+        from .architecture import architecture_record, registry_sha256
+        architecture_record(self.arm_id)
+        if self.registry_sha256 != registry_sha256():
+            raise ValueError("architecture.registry_sha256 does not match frozen registry")
+        for name in ("model_tree_sha256", "ordered_examples_sha256", "pretraining_checkpoint_sha256"):
+            value = getattr(self, name)
+            if len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+                raise ValueError(f"architecture.{name} must be a lowercase SHA-256")
+
+
+def _validate_architecture_matches_legacy(raw: Mapping[str, Any], identity: ArchitectureIdentity) -> None:
+    """Fail closed when legacy execution fields drift from the frozen arm."""
+    from .architecture import architecture_record
+
+    record = architecture_record(identity.arm_id)
+    if not record.cache.enabled and raw["mechanism"] == "exact_cache":
+        raise ValueError("non-cache architecture cannot carry active legacy cache")
+    if not record.cache.enabled:
+        cache = raw["cache"]
+        if cache["width"] != record.cache.width or cache["block_size"] != record.cache.block_size:
+            raise ValueError("non-cache architecture does not match disabled legacy cache dimensions")
+    expected: dict[str, tuple[str, str]] = {
+        "stock": ("native", "native"), "kmd2-r1": ("native", "native"),
+        "rot-off": ("rotation", "rotation_off"),
+        "rot-constant": ("rotation", "constant_rate_rotation"),
+        "rot-noncumulative": ("rotation", "non_cumulative_rotation"),
+        "rot-fixed-rope": ("rotation", "fixed_rope"),
+        "rot-moving-frame-oracle": ("rotation", "moving_frame_oracle"),
+        "conv-off": ("convolution", "convolution_off"),
+        "trapezoid": ("trapezoid", "trapezoid"),
+        "qk-bc-additive": ("bc_bias", "bc_bias"),
+        "qk-diagonal": ("bc_bias", "diagonal_rescale"),
+        "qk-constant-coordinate-oracle": ("bc_bias", "constant_coordinate_oracle"),
+        "lookahead": ("causal_lookahead", "causal_lookahead"),
+        "state-64x128": ("state_size", "state_size_sweep"),
+        "state-256x128": ("state_size", "state_size_sweep"),
+        "mimo-r2": ("true_mimo", "true_mimo_sweep"), "mimo-r4": ("true_mimo", "true_mimo_sweep"),
+        "gdn2-channel-r1": ("gdn2_decoupled", "channelwise_erase_write"),
+        "rout-4": ("state_size", "state_size_sweep"),
+        "cache-block-only-w0": ("current_block_only", "chunk_only"),
+        "cache-surprise-w64": ("exact_cache", "top_surprise"),
+        "cache-coupled-w64": ("exact_cache", "coupled_surprise"),
+        "cache-residual-w64": ("exact_cache", "residual_only"),
+        "cache-write-value-w64": ("exact_cache", "write_value_only"),
+        "cache-recency-w64": ("exact_cache", "recency"),
+        "cache-reservoir-w64": ("exact_cache", "reservoir"),
+        "cache-per-slot-read-w64": ("exact_cache", "per_slot_read"),
+        "cache-unbounded-oracle": ("exact_cache", "unbounded_oracle"),
+        "gdn2-mimo-r4-braid-shared-hola-w64": ("maximum_hybrid", "braid_shared_hola_w64"),
+        "gdn2-mimo-r4-braid-four-state-hola-w64": ("maximum_hybrid", "braid_four_state_hola_w64"),
+    }
+    if identity.arm_id in expected:
+        mechanism, variant = expected[identity.arm_id]
+        if raw["mechanism"] != mechanism:
+            raise ValueError("architecture arm does not match legacy mechanism")
+        if raw["variant"] != variant:
+            raise ValueError("architecture arm does not match legacy variant")
+    synthetic_only = raw["task"]["params"].get("objective") == "synthetic_only"
+    scientific_checks = (() if synthetic_only else (
+        ("architecture.seeds_mismatch", tuple(raw["seeds"]), record.seeds),
+        ("architecture.updates_mismatch", raw["budget"]["updates"], record.updates),
+        ("architecture.tokens_mismatch", raw["budget"]["tokens"], record.tokens),
+        ("architecture.curriculum_lengths_mismatch", tuple(raw["lengths"]["curriculum"]), record.curriculum_lengths),
+        ("architecture.extrapolation_lengths_mismatch", tuple(raw["lengths"]["extrapolation"]), record.extrapolation_lengths),
+    ))
+    for code, actual, expected_value in scientific_checks:
+        if actual != expected_value: raise ValueError(code)
+    if "target_layers" in raw["task"]["params"] and tuple(raw["task"]["params"]["target_layers"]) != record.target_layers:
+        raise ValueError("architecture.target_layers_mismatch")
+    params = raw["task"]["params"]
+    model = raw["model"]
+    for name, expected_value in (("num_heads", record.num_heads), ("state_key_dim", record.state_key_dim), ("state_value_dim", record.state_value_dim)):
+        if model[name] != expected_value:
+            raise ValueError(f"architecture arm does not match legacy model.{name}")
+    checks: tuple[tuple[str, Any], ...] = ()
+    if record.arm_id.startswith("gdn2-mimo-r4-braid-"):
+        checks = (
+            ("mimo_rank", 4), ("output_width", 4), ("gate_mode", "channelwise"),
+            ("timescales", list(record.timescales)), ("state_topology", record.state_topology),
+            ("cache_scope", record.cache_scope), ("update_paths", 4),
+            ("convolution_on", True),
+            ("rotation_mode", "mamba3_complex_input_dependent_cumulative"),
+            ("phase_topology", record.phase_topology),
+            ("input_rank", 4), ("output_rank", 4),
+            ("read_topology", record.read_topology), ("read_paths", record.read_paths),
+            ("state_input_mode", "trapezoid"), ("lookahead", record.lookahead),
+            ("qk_contract", record.qk_contract),
+        )
+    elif record.mimo_rank > 1:
+        checks = (("mimo_rank", record.mimo_rank), ("output_width", 1), ("gate_mode", "scalar"))
+    elif record.gate_mode == "channelwise":
+        checks = (("mimo_rank", 1), ("output_width", 1), ("gate_mode", "channelwise"))
+    elif record.output_width > 1:
+        checks = (("mimo_rank", 1), ("output_width", record.output_width), ("gate_mode", "scalar"))
+    for name, expected_value in checks:
+        if params.get(name) != expected_value:
+            raise ValueError(f"architecture arm does not match legacy {name}")
+    if record.cache.enabled:
+        cache = raw["cache"]
+        if cache["width"] != record.cache.width or cache["block_size"] != record.cache.block_size:
+            raise ValueError("architecture arm does not match legacy cache dimensions")
+        score_alias = {
+            "||k||_2 * ||beta_w*v - beta_e*m||_2": "exact_outer",
+            "||k||_2 * beta_w * ||v-m||_2": "coupled_paper",
+            "||k||_2 * ||v-m||_2": "residual_only",
+            "||k||_2 * beta_w * ||v||_2": "write_value",
+            "token_position": "recency",
+            "SHA256(seed:batch:token:head:position)[0:3]_big_endian / 16777216": "reservoir", "per_slot_exact_outer": "exact_outer",
+            "unbounded_oracle": "exact_outer",
+            "active_update_frobenius": "exact_outer",
+        }
+        expected_score = score_alias.get(record.cache.score, record.cache.score)
+        expected_read = {
+            "per_slot_unit_l2": "unit_l2",
+            "rmsnorm_rank_aware": "rmsnorm",
+        }.get(record.cache.read, record.cache.read)
+        exact = {
+            "score": expected_score, "read": expected_read,
+            "read_init": record.cache.read_init,
+            "coordinate_frame": "rotated_recurrence", "storage_dtype": "bf16",
+            "compute_dtype": "fp32", "inclusive": True,
+            "tie_policy": "score_desc_position_desc",
+        }
+        for name, expected_value in exact.items():
+            actual = _CACHE_POLICY_ALIASES.get(name, {}).get(cache[name], cache[name])
+            if actual != expected_value:
+                raise ValueError(f"architecture arm does not match legacy cache {name}")
+
+
+@dataclass(frozen=True)
 class ExperimentConfig:
     schema_version: str
     suite_version: str
@@ -850,6 +991,7 @@ class ExperimentConfig:
     required_stage: str
     cache: CacheConfig
     runtime: RuntimeConfig
+    architecture: ArchitectureIdentity | None = None
 
     def __post_init__(self) -> None:
         record_fields = (
@@ -919,7 +1061,7 @@ class ExperimentConfig:
         if not isinstance(raw, Mapping):
             raise TypeError("configuration must be a mapping")
 
-        optional = {"promotion"}
+        optional = {"promotion", "architecture"}
         required = {
             "schema_version",
             "suite_version",
@@ -970,6 +1112,12 @@ class ExperimentConfig:
             if "promotion" in raw
             else None
         )
+        architecture_values = (
+            _mapping(raw, "architecture", required={"arm_id", "registry_sha256", "model_tree_sha256", "ordered_examples_sha256", "pretraining_checkpoint_sha256"})
+            if "architecture" in raw else None
+        )
+        if architecture_values is not None:
+            _validate_architecture_matches_legacy(raw, ArchitectureIdentity(**architecture_values))
 
         _require_choice("schema_version", raw["schema_version"], {SCHEMA_VERSION})
         _require_choice("suite_version", raw["suite_version"], {SUITE_VERSION})
@@ -1048,6 +1196,7 @@ class ExperimentConfig:
                 cache, raw["mechanism"], raw["variant"], lengths
             ),
             runtime=RuntimeConfig(**runtime),
+            architecture=ArchitectureIdentity(**architecture_values) if architecture_values is not None else None,
         )
 
     def semantic_dict(self) -> dict[str, Any]:
@@ -1056,6 +1205,7 @@ class ExperimentConfig:
             field.name: _plain(getattr(self, field.name))
             for field in fields(self)
             if field.name != "runtime"
+            and not (field.name == "architecture" and self.architecture is None)
         }
 
     @property

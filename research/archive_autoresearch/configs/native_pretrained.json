@@ -1,1 +1,0 @@
-{"name":"native_pretrained_ceiling","arch":"native","reinit":false,"steps":500,"eval_every":75,"warmup":40,"grad_accum":1,"n_keys":4,"seq_len":512,"lr_memory":1e-4,"seed":0}

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import random
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -457,6 +458,43 @@ def ruler_evidence_scope(
     return "promotion"
 
 
+@dataclass(frozen=True)
+class StateTrackingScore:
+    task: str
+    correct: tuple[bool, ...]
+    lm_loss: float
+    modulus: int | None = None
+
+
+def score_state_tracking(
+    task: str,
+    predictions: Sequence[int],
+    targets: Sequence[int],
+    *,
+    lm_loss: float,
+    modulus: int | None = None,
+) -> StateTrackingScore:
+    """Score parity or modular-arithmetic state alongside finite LM loss."""
+    if task not in {"parity", "modular"}:
+        raise ValueError("state tracking task must be parity or modular")
+    predicted = tuple(predictions)
+    expected = tuple(targets)
+    if not predicted or len(predicted) != len(expected) or any(type(v) is not int for v in predicted + expected):
+        raise ValueError("state tracking predictions and targets must be matched ints")
+    loss = float(lm_loss)
+    if not math.isfinite(loss) or loss < 0:
+        raise ValueError("lm_loss must be finite and nonnegative")
+    if task == "modular":
+        if type(modulus) is not int or modulus < 2:
+            raise ValueError("modular state tracking requires modulus >= 2")
+        outcomes = tuple(a % modulus == b % modulus for a, b in zip(predicted, expected))
+    else:
+        if modulus is not None:
+            raise ValueError("parity state tracking does not accept modulus")
+        outcomes = tuple(a % 2 == b % 2 for a, b in zip(predicted, expected))
+    return StateTrackingScore(task, outcomes, loss, modulus)
+
+
 __all__ = [
     "RULER_ARMS",
     "RULER_CONTEXT_LENGTHS",
@@ -469,9 +507,11 @@ __all__ = [
     "RulerCell",
     "RulerEpisode",
     "RulerScore",
+    "StateTrackingScore",
     "build_ruler_episode",
     "ruler_evidence_scope",
     "score_free_generation",
     "score_teacher_forced",
+    "score_state_tracking",
     "select_free_generation_subset",
 ]

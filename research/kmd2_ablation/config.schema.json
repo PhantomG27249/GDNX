@@ -50,9 +50,48 @@
     },
     "required_stage": {"type": "string", "minLength": 1},
     "cache": {"$ref": "#/$defs/cache"},
-    "runtime": {"$ref": "#/$defs/runtime"}
+    "runtime": {"$ref": "#/$defs/runtime"},
+    "architecture": {"$ref": "#/$defs/architecture"}
   },
+  "allOf": [
+    {
+      "if": {"properties": {"architecture": {"properties": {"arm_id": {"enum": ["gdn2-mimo-r4-braid-shared-hola-w64", "gdn2-mimo-r4-braid-four-state-hola-w64"]}}, "required": ["arm_id"]}}, "required": ["architecture"]},
+      "then": {"properties": {"task": {"properties": {"params": {
+        "required": ["input_rank", "output_rank", "read_topology", "read_paths", "state_input_mode", "lookahead", "qk_contract"],
+        "properties": {
+          "input_rank": {"const": 4}, "output_rank": {"const": 4},
+          "read_topology": {"enum": ["shared_state_outputs", "full_cross_state"]},
+          "read_paths": {"enum": [4, 16]}, "state_input_mode": {"const": "trapezoid"},
+          "lookahead": {"type": "boolean"},
+          "qk_contract": {"enum": ["affine_diagonal_plus_additive_identity_init", "gdn_unit_directional_affine_postrenorm_v1"]}
+          ,"lambda_spec": {"type": "number", "minimum": 0}
+          ,"lambda_gate": {"type": "number", "minimum": 0}
+          ,"specialization_updates": {"type": "integer", "minimum": 0}
+        }
+      }}, "required": ["params"]}}}
+    },
+    {
+      "if": {"properties": {"architecture": {"properties": {"arm_id": {"const": "gdn2-mimo-r4-braid-shared-hola-w64"}}, "required": ["arm_id"]}}, "required": ["architecture"]},
+      "then": {"properties": {"task": {"properties": {"params": {"properties": {"read_topology": {"const": "shared_state_outputs"}, "read_paths": {"const": 4}, "lookahead": {"const": true}, "qk_contract": {"const": "affine_diagonal_plus_additive_identity_init"}}}}}}}
+    },
+    {
+      "if": {"properties": {"architecture": {"properties": {"arm_id": {"const": "gdn2-mimo-r4-braid-four-state-hola-w64"}}, "required": ["arm_id"]}}, "required": ["architecture"]},
+      "then": {"properties": {"task": {"properties": {"params": {"required": ["lambda_spec", "lambda_gate", "specialization_updates"], "properties": {"read_topology": {"const": "full_cross_state"}, "read_paths": {"const": 16}, "lookahead": {"const": false}, "qk_contract": {"const": "gdn_unit_directional_affine_postrenorm_v1"}, "lambda_spec": {"exclusiveMinimum": 0}, "lambda_gate": {"exclusiveMinimum": 0}, "specialization_updates": {"type": "integer", "minimum": 1}}}}}}}
+    }
+  ],
   "$defs": {
+    "architecture": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["arm_id", "registry_sha256", "model_tree_sha256", "ordered_examples_sha256", "pretraining_checkpoint_sha256"],
+      "properties": {
+        "arm_id": {"enum": ["stock", "kmd2-r1", "rot-off", "rot-constant", "rot-noncumulative", "rot-fixed-rope", "rot-moving-frame-oracle", "conv-off", "trapezoid", "qk-bc-additive", "qk-diagonal", "qk-constant-coordinate-oracle", "lookahead", "state-64x128", "state-256x128", "rout-4", "mimo-r2", "mimo-r4", "gdn2-channel-r1", "cache-block-only-w0", "cache-surprise-w64", "cache-recency-w64", "cache-coupled-w64", "cache-residual-w64", "cache-write-value-w64", "cache-reservoir-w64", "cache-per-slot-read-w64", "cache-unbounded-oracle", "gdn2-mimo-r4-braid-shared-hola-w64", "gdn2-mimo-r4-braid-four-state-hola-w64"]},
+        "registry_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "model_tree_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "ordered_examples_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "pretraining_checkpoint_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
     "qwen": {
       "type": "object",
       "additionalProperties": false,
@@ -217,7 +256,7 @@
           ]
         },
         "read": {"enum": ["unit_l2", "fixed_temperature", "rmsnorm"]},
-        "read_init": {"enum": ["gamma_one_sink_zero_amplitude_zero"]},
+        "read_init": {"enum": ["gamma_one_sink_zero_amplitude_zero", "hola_gate_logit_v2_minus4"]},
         "eps_cache": {"type": "number", "exclusiveMinimum": 0},
         "coordinate_frame": {"enum": ["rotated_recurrence", "pre_rotation"]},
         "pre_rotation_diagnostic": {"type": "boolean"},

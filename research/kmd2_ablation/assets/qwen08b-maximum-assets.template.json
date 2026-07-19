@@ -1,0 +1,26 @@
+{
+  "schema_version": "1.0.0",
+  "campaign_id": "qwen08b-maximum-hybrid-v1",
+  "assets": {
+    "model": {
+      "path": "REQUIRED",
+      "tree_sha256": "REQUIRED_64_HEX"
+    },
+    "tokenizer": {
+      "path": "REQUIRED",
+      "tree_sha256": "REQUIRED_64_HEX"
+    },
+    "checkpoint": {
+      "path": "REQUIRED",
+      "sha256": "REQUIRED_64_HEX"
+    },
+    "data": {
+      "path": "REQUIRED",
+      "sha256": "REQUIRED_64_HEX"
+    },
+    "teacher_model": {
+      "path": "REQUIRED",
+      "tree_sha256": "REQUIRED_64_HEX"
+    }
+  }
+}

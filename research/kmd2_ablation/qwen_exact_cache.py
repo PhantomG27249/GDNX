@@ -26,6 +26,7 @@ from .exact_cache import (
     merge_persistent_cache,
     reference_scan_with_scores,
 )
+from .qwen_hybrid_hola import four_state_exact_update_score, shared_exact_update_score
 
 
 CACHE_PARAMETER_BASENAMES = (

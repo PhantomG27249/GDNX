@@ -1,4 +1,0 @@
-{"name":"kmd2_fable_v3_datascale","hypothesis":"Induction emerges via a data phase transition (~1000s of episodes, Zoology-style); 400 episodes is pre-emergence. Horizon fix (decay_bias 6.0) + grad_accum 4 x 500 steps = 2000 episodes should let KMD-2's trainable q/k cross to nonzero recall.",
- "kmd2":true,"kmd2_r":4,"kmd2_h":16,"kmd2_dk":64,"kmd2_dv":64,"kmd2_eps":0.5,"kmd2_decay_bias":6.0,
- "steps":500,"eval_every":100,"warmup":60,"grad_accum":4,"n_keys":4,"seq_len":512,
- "lr_memory":2.5e-4,"lr_coproduct":1.5e-4,"seed":0}

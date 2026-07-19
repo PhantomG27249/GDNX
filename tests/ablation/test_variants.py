@@ -5,6 +5,14 @@ import math
 from types import SimpleNamespace
 
 import pytest
+
+
+def test_architecture_compatibility_delegates_to_frozen_registry():
+    from research.kmd2_ablation.variants import validate_architecture_compatibility
+
+    assert validate_architecture_compatibility("mimo-r2", "trapezoid").arm_id == "mimo-r2"
+    with pytest.raises(ValueError, match="incompatible"):
+        validate_architecture_compatibility("mimo-r2", "gdn2-channel-r1")
 import torch
 
 
@@ -27,6 +35,8 @@ DECLARED_ARM_IDS = {
     "state_size.sweep",
     "true_mimo.sweep",
     "gdn2_decoupled.channelwise",
+    "gdn2-mimo-r4-braid-shared-hola-w64",
+    "gdn2-mimo-r4-braid-four-state-hola-w64",
     "exact_cache.off",
     "exact_cache.current_block_only",
     "exact_cache.selector.exact_outer",
@@ -188,7 +198,12 @@ def test_registry_keeps_qwen_incompatible_redesigns_tiny_only() -> None:
     gdn2_decoupled = get_variant("gdn2_decoupled.channelwise")
     assert state_size.compatible_backends == frozenset({"tiny"})
     assert true_mimo.compatible_backends == frozenset({"tiny"})
-    assert gdn2_decoupled.compatible_backends == frozenset({"tiny"})
+    # 2026-07-15: gdn2_decoupled gained a production Qwen implementation
+    # (KMD2ChannelwiseGDN2Attn + fused segment kernel) and serves as the
+    # maximum-campaign gdn2-r1 baseline arm, so it is no longer tiny-only.
+    assert gdn2_decoupled.compatible_backends == frozenset({"tiny", "qwen"})
+    assert "ruler" in gdn2_decoupled.compatible_tasks
+    assert "qwen_heal" in gdn2_decoupled.compatible_stages
     assert state_size.experiment_kind == true_mimo.experiment_kind == "cold_redesign"
     assert state_size.native_warm_start is true_mimo.native_warm_start is False
     assert gdn2_decoupled.experiment_kind == "cold_redesign"
@@ -1432,6 +1447,7 @@ class _VariantGateHealModel(torch.nn.Module):
         self.memory_weight = torch.nn.Parameter(torch.eye(3))
         self.momentum_gamma = torch.nn.Parameter(torch.tensor([0.5]))
         self.lookahead_rho = torch.nn.Parameter(torch.tensor([0.5]))
+        self.rho_head = torch.nn.Parameter(torch.tensor([0.5]))
 
     def forward(
         self,
@@ -1442,7 +1458,7 @@ class _VariantGateHealModel(torch.nn.Module):
     ) -> SimpleNamespace:
         assert output_hidden_states is True and use_cache is False
         one_hot = torch.nn.functional.one_hot(input_ids, num_classes=3).float()
-        gate = self.momentum_gamma + self.lookahead_rho
+        gate = self.momentum_gamma + self.lookahead_rho + self.rho_head
         return SimpleNamespace(logits=one_hot @ self.memory_weight + gate * one_hot)
 
 
@@ -1453,12 +1469,15 @@ def test_qwen_shared_variant_gate_projector_clamps_both_coefficients() -> None:
     with torch.no_grad():
         model.momentum_gamma.fill_(1.5)
         model.lookahead_rho.fill_(-0.5)
+        model.rho_head.fill_(1.5)
     assert project_variant_gates_(model) == (
         "momentum_gamma",
         "lookahead_rho",
+        "rho_head",
     )
     assert model.momentum_gamma.item() == 1.0
     assert model.lookahead_rho.item() == 0.0
+    assert model.rho_head.item() == 1.0
 
 
 def test_qwen_heal_post_step_projects_variant_gates_after_crossing_bounds(
@@ -2970,3 +2989,43 @@ def test_registry_builder_rejects_duplicate_mechanism_variant_identity() -> None
     duplicate_identity = replace(native, arm_id="native.alias")
     with pytest.raises(RuntimeError, match="duplicate mechanism/variant"):
         _build_registry((native, duplicate_identity))
+
+
+def test_maximum_hybrid_variant_registry_is_exact_and_fail_closed() -> None:
+    from research.kmd2_ablation.qwen_variants import (
+        MAXIMUM_HYBRID_VARIANTS,
+        resolve_maximum_hybrid_variant,
+    )
+
+    assert len(MAXIMUM_HYBRID_VARIANTS) == 11
+    assert all(resolve_maximum_hybrid_variant(name)["convolution"] is True for name in MAXIMUM_HYBRID_VARIANTS)
+    with pytest.raises(ValueError, match="unsupported maximum hybrid control"):
+        resolve_maximum_hybrid_variant("package-a-no-convolution")
+
+
+def test_maximum_controls_bind_exact_executable_feature_contracts() -> None:
+    from research.kmd2_ablation.qwen_variants import MAXIMUM_HYBRID_VARIANTS, maximum_control_contract
+
+    r1 = maximum_control_contract("gdn2-r1")
+    r4 = maximum_control_contract("gdn2-mimo-r4")
+    a_native = maximum_control_contract("package-a-native-decay")
+    a_hola = maximum_control_contract("package-a-hola-w64")
+    stock = maximum_control_contract("stock-qwen")
+    assert (r1.input_rank, r1.output_rank, r1.topology) == (1, 1, "shared")
+    assert (r4.input_rank, r4.output_rank) == (4, 4)
+    assert a_native.braid is False and a_native.trapezoid and a_native.lookahead and a_native.affine_qk
+    assert a_hola.cache_policy == "hola_exact_outer_w64"
+    assert stock.replacement is False and stock.trainable_components == ()
+    assert len({maximum_control_contract(name).identity_sha256 for name in MAXIMUM_HYBRID_VARIANTS}) == 11
+
+
+def test_maximum_control_active_fixture_outputs_are_scientifically_distinct() -> None:
+    from research.kmd2_ablation.qwen_variants import execute_maximum_control_fixture
+
+    x = torch.tensor([1.0, 2.0, -1.0, 0.5])
+    outputs = {name: execute_maximum_control_fixture(name, x) for name in (
+        "gdn2-r1", "gdn2-mimo-r2", "gdn2-mimo-r4", "package-a-native-decay",
+        "package-a-braid-no-cache", "package-a-recency-w64", "package-a-hola-w64",
+        "package-b-recency-w64", "package-b-hola-w64", "shared-query-widening", "stock-qwen",
+    )}
+    assert len({tuple(value.tolist()) for value in outputs.values()}) == 11

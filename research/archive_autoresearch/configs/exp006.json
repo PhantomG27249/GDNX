@@ -1,3 +1,0 @@
-{"name":"lrmem15e4_steps800","hypothesis":"the ~0.30 format plateau is a sharp local minimum that diverging upward pushes (LR/capacity/binding/retention) cannot escape; a LOWER lr_memory 2.5e-4->1.5e-4 with more steps 800 trades speed for finer, more stable optimization, giving the coproduct binding a longer runway to find true retrieval instead of settling for the format shortcut.",
- "steps":800,"eval_every":50,"warmup":50,"grad_accum":1,"n_keys":4,"seq_len":512,
- "lr_memory":1.5e-4,"lr_coproduct":1.5e-4,"decay_clamp":0.999,"slow_decay":0.97,"residual_rank":16,"seed":0}

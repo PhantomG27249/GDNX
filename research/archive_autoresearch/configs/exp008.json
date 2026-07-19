@@ -1,3 +1,0 @@
-{"name":"calib_baseline_seed3","hypothesis":"all 7 prior runs use seed=0, so the 0.28-0.31 tokacc spread (incl. exp006's 'best' 0.308) may be eval/training noise not real config effects; re-running exp001's exact stable config with seed 3 measures true run-to-run variance — if it lands ~0.29+/-0.03 the plateau is a genuine seed-independent ceiling (-> Phase 2), if it shifts substantially seed-0 is a confound and earlier results need re-reading.",
- "steps":400,"eval_every":80,"warmup":40,"grad_accum":1,"n_keys":4,"seq_len":512,
- "lr_memory":2.5e-4,"lr_coproduct":1.5e-4,"decay_clamp":0.999,"slow_decay":0.97,"residual_rank":16,"seed":3}

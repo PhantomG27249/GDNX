@@ -1,0 +1,89 @@
+{
+  "schema_version": "1.0.0",
+  "campaign_id": "qwen08b-maximum-hybrid-v1",
+  "control_id": "package-a-hola-w64",
+  "classification": "flagship",
+  "features": {
+    "architecture": "package_a",
+    "mimo_rank": 4,
+    "state_count": 1,
+    "braid": true,
+    "trapezoid": true,
+    "lookahead": true,
+    "affine_qk": true,
+    "cache": "hola_exact_outer_w64",
+    "output_width": 4,
+    "convolution": true
+  },
+  "matched": {
+    "seeds": [
+      11,
+      29,
+      47
+    ],
+    "budget": {
+      "updates": 64,
+      "tokens": 262144
+    },
+    "data": {
+      "task": "ruler",
+      "max_context": 32768,
+      "ordered_examples_identity": "asset:data"
+    },
+    "target_layers": [
+      0,
+      1,
+      2,
+      4,
+      5,
+      6,
+      8,
+      9,
+      10,
+      12,
+      13,
+      14,
+      16,
+      17,
+      18,
+      20,
+      21,
+      22
+    ],
+    "dtype": [
+      "bfloat16",
+      "float32_reference"
+    ],
+    "runtime": {
+      "activation_checkpointing": true,
+      "data_parallel_sharding": true,
+      "tensor_parallelism": false,
+      "pipeline_parallelism": false,
+      "packed_sequences_require_boundaries": true
+    }
+  },
+  "assets": {
+    "model": "asset:model",
+    "tokenizer": "asset:tokenizer",
+    "checkpoint": "asset:checkpoint",
+    "data": "asset:data"
+  },
+  "preflight": {
+    "synthetic": true,
+    "all_controls_barrier": true,
+    "fail_closed": {
+      "tensor_parallelism": true,
+      "pipeline_parallelism": true,
+      "packed_without_boundaries": true
+    }
+  },
+  "runtime_facts": [
+    "python",
+    "torch",
+    "cuda",
+    "cuda_driver",
+    "gpu",
+    "dtype"
+  ],
+  "output_group": "package-a"
+}

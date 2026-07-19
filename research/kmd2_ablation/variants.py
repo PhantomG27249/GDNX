@@ -322,7 +322,7 @@ def _spec(
 
 
 _RECORDS = (
-    _spec("native", "native", "native", "baseline", "baseline", _BOTH, _ALL_TASKS, stage="local_correctness", additional_stages=frozenset({"tiny_promotion", "qwen_heal"})),
+    _spec("native", "native", "native", "baseline", "baseline", _BOTH, _ALL_TASKS, stage="local_correctness", additional_stages=frozenset({"tiny_promotion", "qwen_heal", "qwen_reliance"})),
     _spec("rotation.current", "rotation", "current_rotation", "reliance", "reliance", _BOTH, _STATE_TASKS, parameters=("rot_proj.weight", "rot_proj.bias"), state=("phase",), stage="qwen_reliance"),
     _spec("rotation.off", "rotation", "rotation_off", "reliance", "reliance", _BOTH, _STATE_TASKS, parameters=("rotation_gate",), state=("phase",), stage="qwen_reliance"),
     _spec("rotation.constant_rate", "rotation", "constant_rate_rotation", "diagnostic", "diagnostic", _TINY, _STATE_TASKS, parameters=("rotation_rate",), state=("phase",), stage="mechanism_screen"),
@@ -339,7 +339,9 @@ _RECORDS = (
     _spec("causal_lookahead", "causal_lookahead", "causal_lookahead", "addition", "incremental", _BOTH, frozenset({"trajectory"}), parameters=("lookahead_rho", "lookahead_projection.weight"), state=("v_prev",), stage="mechanism_screen"),
     _spec("state_size.sweep", "state_size", "state_size_sweep", "addition", "incremental", _TINY, frozenset({"mqar"}), parameters=("q_proj.weight", "k_proj.weight", "v_proj.weight", "z_proj.weight", "conv.weight", "decay_chan", "q_slot_scale", "rot_proj.weight", "rot_proj.bias", "rotation_rate", "out_proj.weight"), state=("state_shape",), stage="mechanism_screen", experiment_kind="cold_redesign", native_warm_start=False),
     _spec("true_mimo.sweep", "true_mimo", "true_mimo_sweep", "addition", "incremental", _TINY, frozenset({"mqar"}), parameters=("q_proj.weight", "k_proj.weight", "b_proj.weight", "conv.weight", "bw_off", "mimo_v", "mimo_z", "mimo_out"), state=("simultaneous_slots",), stage="mechanism_screen", experiment_kind="cold_redesign", native_warm_start=False),
-    _spec("gdn2_decoupled.channelwise", "gdn2_decoupled", "channelwise_erase_write", "addition", "incremental", _TINY, frozenset({"mqar"}), parameters=("erase_proj.weight", "write_proj.weight"), state=("channelwise_erase_direction", "channelwise_write_value"), stage="mechanism_screen", experiment_kind="cold_redesign", native_warm_start=False),
+    _spec("gdn2_decoupled.channelwise", "gdn2_decoupled", "channelwise_erase_write", "addition", "incremental", _BOTH, frozenset({"mqar", "ruler"}), parameters=("erase_proj.weight", "write_proj.weight"), state=("channelwise_erase_direction", "channelwise_write_value"), stage="mechanism_screen", experiment_kind="cold_redesign", native_warm_start=False, additional_stages=frozenset({"qwen_heal"})),
+    _spec("gdn2-mimo-r4-braid-shared-hola-w64", "maximum_hybrid", "braid_shared_hola_w64", "addition", "replacement", frozenset({"qwen"}), _CACHE_TASKS, parameters=("mimo_projections", "braid_router", "trapezoid_gate", "lookahead_gate", "affine_qk", "hola"), state=("shared_braided_state", "exact_outer_cache"), stage="qwen_heal"),
+    _spec("gdn2-mimo-r4-braid-four-state-hola-w64", "maximum_hybrid", "braid_four_state_hola_w64", "addition", "replacement", frozenset({"qwen"}), _CACHE_TASKS, parameters=("mimo_projections", "native_gdn_content_decay", "fixed_native_relative_horizon_multipliers", "cms_update_periods_1_16_64_256", "token_trapezoid", "gdn_unit_directional_qk", "hola_gate_logit_v2"), state=("four_mimo_rank_contributions", "valid_token_update_clock", "exact_outer_cache"), stage="qwen_heal"),
     _spec("exact_cache.off", "exact_cache", "cache_off", "baseline", "baseline", _BOTH, _CACHE_TASKS, state=("cache_disabled",), stage="local_correctness"),
     _spec("exact_cache.current_block_only", "current_block_only", "chunk_only", "diagnostic", "diagnostic", _BOTH, _CACHE_TASKS, state=("current_block",), stage="capacity_screen"),
     _spec("exact_cache.selector.exact_outer", "exact_cache", "top_surprise", "addition", "incremental", _BOTH, _CACHE_TASKS, state=("persistent_cache", "selection_scores"), stage="selector_replay", additional_stages=frozenset({"tiny_promotion", "qwen_heal"})),
@@ -458,6 +460,19 @@ def get_variant(arm_id: str) -> VariantSpec:
 
 
 lookup_variant = get_variant
+
+
+def validate_architecture_compatibility(left_arm_id: str, right_arm_id: str):
+    """Delegate architecture-family compatibility to the frozen registry."""
+    from .architecture import architecture_record
+
+    left = architecture_record(left_arm_id)
+    architecture_record(right_arm_id)
+    if not left.compatible_with(right_arm_id):
+        raise ValueError(
+            f"architecture arms {left_arm_id!r} and {right_arm_id!r} are incompatible"
+        )
+    return left
 
 
 def validate_variant_compatibility(
@@ -1333,6 +1348,7 @@ __all__ = [
     "momentum_decay_erase_interaction_allowed",
     "trapezoid_convolution_interaction_allowed",
     "validate_cache_compatibility",
+    "validate_architecture_compatibility",
     "validate_matched_cache_controls",
     "validate_variant_compatibility",
 ]

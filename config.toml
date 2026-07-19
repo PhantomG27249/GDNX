@@ -1,0 +1,19 @@
+[paths]
+package_root = "/home/shadeform/phantom/testb"
+cache = "/home/shadeform/.cache"
+hf_cache = "/home/shadeform/.cache/huggingface"
+hf_hub = "/home/shadeform/.cache/huggingface/hub"
+model = "/home/shadeform/phantom/assets/model"
+tokenizer = "/home/shadeform/phantom/assets/tokenizer"
+native_checkpoint = "/home/shadeform/phantom/assets/native-checkpoint"
+data = "/home/shadeform/phantom/assets/data"
+teacher_model = "/home/shadeform/phantom/assets/teacher-model"
+output = "/home/shadeform/phantom/output/package-b"
+
+[run]
+package = "B"
+campaign = "full"
+dtype = "bfloat16"
+student_device = "cuda:0"
+teacher_device = "cuda:1"
+checkpoint_every = 8

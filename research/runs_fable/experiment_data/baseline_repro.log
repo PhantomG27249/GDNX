@@ -1,32 +1,0 @@
-[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
-[transformers] The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d
-Loading weights:   0%|          | 0/320 [00:00<?, ?it/s]Loading weights:  99%|█████████▉| 316/320 [00:00<00:00, 3128.64it/s]Loading weights: 100%|██████████| 320/320 [00:00<00:00, 3156.67it/s]
-
-GDN3 Upgrade: Scanning 24 layers...
-  Layer  0: linear_attention -> GDN3 Kr-MIMO [OK]
-  Layer  1: linear_attention -> GDN3 Kr-MIMO [OK]
-  Layer  2: linear_attention -> GDN3 Kr-MIMO [OK]
-  Layer  3: full_attention [PRESERVED]
-  Layer  4: linear_attention -> GDN3 Kr-MIMO [OK]
-  Layer  5: linear_attention -> GDN3 Kr-MIMO [OK]
-  Layer  6: linear_attention -> GDN3 Kr-MIMO [OK]
-  Layer  7: full_attention [PRESERVED]
-  Layer  8: linear_attention -> GDN3 Kr-MIMO [OK]
-  Layer  9: linear_attention -> GDN3 Kr-MIMO [OK]
-  Layer 10: linear_attention -> GDN3 Kr-MIMO [OK]
-  Layer 11: full_attention [PRESERVED]
-  Layer 12: linear_attention -> GDN3 Kr-MIMO [OK]
-  Layer 13: linear_attention -> GDN3 Kr-MIMO [OK]
-  Layer 14: linear_attention -> GDN3 Kr-MIMO [OK]
-  Layer 15: full_attention [PRESERVED]
-  Layer 16: linear_attention -> GDN3 Kr-MIMO [OK]
-  Layer 17: linear_attention -> GDN3 Kr-MIMO [OK]
-  Layer 18: linear_attention -> GDN3 Kr-MIMO [OK]
-  Layer 19: full_attention [PRESERVED]
-  Layer 20: linear_attention -> GDN3 Kr-MIMO [OK]
-  Layer 21: linear_attention -> GDN3 Kr-MIMO [OK]
-  Layer 22: linear_attention -> GDN3 Kr-MIMO [OK]
-  Layer 23: full_attention [PRESERVED]
-
-Upgrade complete: 18 layers upgraded
-{"status": "ok", "final_tokacc": 0.2958, "final_recall": 0.0, "emergence_step": null, "skip_rate": 0.0, "wall_s": 900.6}

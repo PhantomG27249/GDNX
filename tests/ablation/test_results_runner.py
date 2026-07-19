@@ -92,6 +92,47 @@ def _provenance() -> dict[str, object]:
     }
 
 
+@pytest.mark.parametrize(
+    "arm_id",
+    [
+        "mimo-r2", "mimo-r4", "rout-4", "rot-off", "rot-constant",
+        "rot-noncumulative", "rot-fixed-rope", "rot-moving-frame-oracle",
+    ],
+)
+def test_canonical_architecture_job_emits_explicit_registry_identity(arm_id):
+    from research.kmd2_ablation.architecture import registry_sha256
+
+    config = {
+        **_config(),
+        "backend": "qwen",
+        "architecture": {"arm_id": arm_id, "registry_sha256": registry_sha256()},
+    }
+    job = build_job(config, seed=11, stage="qwen_heal", backend="qwen", arm_id=arm_id)
+
+    assert job["architecture_registry_sha256"] == registry_sha256()
+
+
+@pytest.mark.parametrize(
+    ("arm_id", "diagnostic"),
+    [("rot-off", False), ("rot-moving-frame-oracle", True)],
+)
+def test_canonical_rotation_job_emits_explicit_diagnostic_mode(arm_id, diagnostic):
+    from research.kmd2_ablation.architecture import registry_sha256
+
+    config = {
+        **_config(),
+        "backend": "qwen",
+        "architecture": {
+            "arm_id": arm_id,
+            "registry_sha256": registry_sha256(),
+            "diagnostic_training": diagnostic,
+        },
+    }
+    job = build_job(config, seed=11, stage="qwen_heal", backend="qwen", arm_id=arm_id)
+
+    assert job["architecture_diagnostic_training"] is diagnostic
+
+
 def _completed_record(
     job: dict[str, object],
     provenance: dict[str, object],
@@ -1556,3 +1597,26 @@ def test_two_concurrent_shards_have_disjoint_complete_union_and_shared_immutable
         for outcome in results
     )
     assert (root / "jobs.json").read_bytes() == jobs_bytes
+def test_hybrid_diagnostic_schema_is_exact_finite_and_serializable() -> None:
+    from research.kmd2_ablation.results import canonical_json_bytes, validate_hybrid_diagnostics
+
+    record = {
+        "rank_update_norms": [1.0, 2.0, 3.0, 4.0], "rank_similarity": 0.2,
+        "effective_rank": 3.0, "phase_magnitude": 0.1, "phase_frequency": 0.2,
+        "effective_decay_horizons": [1.0, 16.0, 64.0, 256.0],
+        "decay_horizon_ratios": [1.0, 16.0, 64.0, 256.0],
+        "all_lanes_update_each_token": False, "state_router_active": False,
+        "cache_admission_rate": 0.5,
+        "cache_occupancy": 0.25,
+        "cache_mean_age": 6.0, "cache_read_entropy": 0.7, "cache_gate_mean": 0.8,
+        "state_norm": 1.0, "gate_mean": 0.4, "nonfinite_count": 0,
+        "flops_per_token": 100.0, "tokens_per_second": 20.0,
+        "peak_memory_bytes": 1024, "capacity_confounded": False,
+        "cache_admissions": 8,
+        "cache_opportunities": 8, "cache_schema": "states", "layer_count": 2,
+    }
+    assert validate_hybrid_diagnostics(record) == record
+    assert b'"capacity_confounded":false' in canonical_json_bytes(record)
+    bad = dict(record, rank_update_norms=[1.0, float("nan"), 3.0, 4.0])
+    with pytest.raises(Exception, match="rank_update_norms"):
+        validate_hybrid_diagnostics(bad)

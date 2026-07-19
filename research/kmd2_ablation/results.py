@@ -213,6 +213,19 @@ def build_job(
     }
     if pairing_id is not None:
         record["pairing_id"] = _require_string("pairing_id", pairing_id)
+    architecture = config.get("architecture")
+    if (
+        isinstance(architecture, Mapping)
+        and architecture.get("arm_id") == arm_id
+    ):
+        record["architecture_registry_sha256"] = _require_string(
+            "architecture_registry_sha256", architecture.get("registry_sha256")
+        )
+        if arm_id.startswith("rot-"):
+            diagnostic = architecture.get("diagnostic_training", False)
+            if type(diagnostic) is not bool:
+                raise TypeError("architecture.diagnostic_training must be a bool")
+            record["architecture_diagnostic_training"] = diagnostic
     return record
 
 
@@ -1306,6 +1319,13 @@ def _validate_completed_diagnostics(
     _validate_command(record)
     if _requires_exact_cache(job):
         _validate_exact_cache(record)
+    if str(job.get("arm_id", "")).startswith("gdn2-mimo-r4-braid-"):
+        diagnostics = record.get("hybrid_diagnostics")
+        if not isinstance(diagnostics, Mapping):
+            raise RunRecordError(
+                "missing_hybrid_diagnostics", "completed hybrid run requires measured hybrid_diagnostics"
+            )
+        validate_hybrid_diagnostics(diagnostics)
 
 
 def validate_completed_run(
@@ -1317,6 +1337,66 @@ def validate_completed_run(
 
     _validate_common_run(record, job, provenance, status="completed")
     _validate_completed_diagnostics(record, job)
+
+
+_HYBRID_DIAGNOSTIC_FIELDS = {
+    "rank_update_norms", "rank_similarity", "effective_rank", "phase_magnitude",
+    "phase_frequency", "effective_decay_horizons", "decay_horizon_ratios",
+    "all_lanes_update_each_token", "state_router_active", "cache_admission_rate",
+    "cache_occupancy", "cache_mean_age", "cache_read_entropy", "cache_gate_mean", "state_norm",
+    "gate_mean", "nonfinite_count", "flops_per_token", "tokens_per_second",
+    "peak_memory_bytes", "capacity_confounded",
+    "cache_admissions", "cache_opportunities", "cache_schema", "layer_count",
+}
+
+
+def validate_hybrid_diagnostics(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Validate the additive Package-A/B diagnostic payload without changing v1 records."""
+    if not isinstance(record, Mapping) or set(record) != _HYBRID_DIAGNOSTIC_FIELDS:
+        raise RunRecordError("invalid_hybrid_diagnostics", "hybrid diagnostic fields must be exact")
+    result = dict(record)
+    ranks = result["rank_update_norms"]
+    if (isinstance(ranks, (str, bytes, bytearray)) or not isinstance(ranks, Sequence)
+            or len(ranks) != 4):
+        raise RunRecordError("invalid_hybrid_diagnostics", "rank_update_norms must contain four ranks")
+    for index, value in enumerate(ranks):
+        _finite_real(f"rank_update_norms[{index}]", value, minimum=0.0)
+    for field in (
+        "rank_similarity", "effective_rank", "phase_magnitude", "phase_frequency",
+        "cache_mean_age", "cache_read_entropy", "state_norm",
+        "flops_per_token", "tokens_per_second",
+    ):
+        _finite_real(field, result[field], minimum=0.0)
+    for field in ("cache_admission_rate", "cache_occupancy", "cache_gate_mean", "gate_mean"):
+        value = _finite_real(field, result[field])
+        if not 0.0 <= value <= 1.0:
+            raise RunRecordError("invalid_hybrid_diagnostics", f"{field} must lie in [0,1]")
+    for field in ("effective_decay_horizons", "decay_horizon_ratios"):
+        values = result[field]
+        if (isinstance(values, (str, bytes, bytearray)) or not isinstance(values, Sequence)
+                or len(values) != 4):
+            raise RunRecordError("invalid_hybrid_diagnostics", f"{field} must contain four lanes")
+        [_finite_real(f"{field}[{index}]", value, minimum=0.0)
+         for index, value in enumerate(values)]
+    expected_ratios = (1.0, 16.0, 64.0, 256.0)
+    if any(not math.isclose(float(value), expected, rel_tol=1e-4, abs_tol=1e-4)
+           for value, expected in zip(result["decay_horizon_ratios"], expected_ratios)):
+        raise RunRecordError("invalid_hybrid_diagnostics", "decay horizon ratios are not configured timescales")
+    if result["all_lanes_update_each_token"] is not False or result["state_router_active"] is not False:
+        raise RunRecordError("invalid_hybrid_diagnostics", "time braid must use clocked lane updates and remain router-free")
+    for field in ("cache_admissions", "cache_opportunities", "layer_count"):
+        if _nonnegative_int(field, result[field]) < 1:
+            raise RunRecordError("invalid_hybrid_diagnostics", f"{field} must be positive")
+    if result["cache_admissions"] > result["cache_opportunities"]:
+        raise RunRecordError("invalid_hybrid_diagnostics", "cache admissions exceed opportunities")
+    if result["cache_schema"] not in {"state", "states"}:
+        raise RunRecordError("invalid_hybrid_diagnostics", "cache_schema must be state or states")
+    _nonnegative_int("nonfinite_count", result["nonfinite_count"])
+    _nonnegative_int("peak_memory_bytes", result["peak_memory_bytes"])
+    if type(result["capacity_confounded"]) is not bool:
+        raise RunRecordError("invalid_hybrid_diagnostics", "capacity_confounded must be bool")
+    canonical_json_bytes(result)
+    return result
 
 
 _OOM_CONTEXT_FIELDS = {
@@ -1729,5 +1809,6 @@ __all__ = [
     "semantic_job_id",
     "validate_completed_run",
     "validate_failed_run",
+    "validate_hybrid_diagnostics",
     "write_immutable_json",
 ]

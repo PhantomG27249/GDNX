@@ -1,15 +1,0 @@
-[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
-[transformers] The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d
-Loading weights:   0%|          | 0/320 [00:00<?, ?it/s]Loading weights: 100%|██████████| 320/320 [00:00<00:00, 5638.36it/s]
-
-=== teacher ===
-     ctx  needles  queries   recall    exact
-     256       16        1     1.00     1.00
-     256       16        4     0.56     0.00
-     512       16        1     1.00     1.00
-     512       16        4     0.69     0.12
-    1024       16        1     1.00     1.00
-    1024       16        4     0.78     0.50
-    2048       16        1     1.00     1.00
-    2048       16        4     0.75     0.12
-wrote research/runs_fable/ruler_teacher.json

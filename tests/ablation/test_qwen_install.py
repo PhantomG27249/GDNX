@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import copy
 import os
+import threading
 from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
+
 
 from gdn3.kmd2_native import KMD2NativeAttn
 from research.kmd2_ablation.config import CacheConfig
@@ -20,12 +22,12 @@ CACHE_PARAMETER_BASENAMES = {
 }
 
 
-def _model_config() -> SimpleNamespace:
+def _model_config(*, key_head_dim: int = 4) -> SimpleNamespace:
     return SimpleNamespace(
         hidden_size=12,
         linear_num_value_heads=2,
         linear_num_key_heads=2,
-        linear_key_head_dim=4,
+        linear_key_head_dim=key_head_dim,
         linear_value_head_dim=3,
         linear_conv_kernel_dim=3,
         rms_norm_eps=1.0e-6,
@@ -41,10 +43,12 @@ def _cache_config(*, storage_dtype: str = "fp32") -> CacheConfig:
     )
 
 
-def _native(monkeypatch: pytest.MonkeyPatch, *, r_out: int = 4) -> KMD2NativeAttn:
+def _native(
+    monkeypatch: pytest.MonkeyPatch, *, r_out: int = 4, key_head_dim: int = 4,
+) -> KMD2NativeAttn:
     monkeypatch.setenv("GDN3_KMD2_ROUT", str(r_out))
     torch.manual_seed(5000 + r_out)
-    return KMD2NativeAttn(_model_config(), layer_idx=7)
+    return KMD2NativeAttn(_model_config(key_head_dim=key_head_dim), layer_idx=7)
 
 
 def _inherited_named_parameters(module: torch.nn.Module) -> dict[str, torch.nn.Parameter]:
@@ -53,6 +57,64 @@ def _inherited_named_parameters(module: torch.nn.Module) -> dict[str, torch.nn.P
         for name, parameter in module.named_parameters()
         if name.rsplit(".", 1)[-1] not in CACHE_PARAMETER_BASENAMES
     }
+
+
+def test_true_mimo_install_rejects_non_current_rotation_before_factory_or_swap(monkeypatch):
+    from research.kmd2_ablation.qwen_architecture import (
+        QwenArchitectureInstallError, install_qwen_architecture,
+    )
+    native = _native(monkeypatch, r_out=1)
+    class Layer(torch.nn.Module):
+        def __init__(self, linear_attn):
+            super().__init__(); self.linear_attn = linear_attn
+    class Model(torch.nn.Module):
+        def __init__(self, linear_attn):
+            super().__init__(); self.model = torch.nn.Module(); self.model.layers = torch.nn.ModuleList([Layer(linear_attn)])
+    model = Model(native)
+    record = SimpleNamespace(target_layers=(0,), mimo_rank=2, rotation_mode="off")
+    config = SimpleNamespace(record=record)
+    calls = []
+    with pytest.raises(QwenArchitectureInstallError, match="true_mimo_rotation_mode_unsupported"):
+        install_qwen_architecture(
+            model, (0,), config, expected_indices=(0,),
+            factory=lambda *_: calls.append("factory"),
+            native_type=KMD2NativeAttn, expected_type=torch.nn.Module,
+        )
+    assert calls == []
+    assert model.model.layers[0].linear_attn is native
+
+
+@pytest.mark.parametrize(("arm", "rank"), [("mimo-r2", 2), ("mimo-r4", 4)])
+def test_production_true_mimo_install_succeeds_with_exact_type_and_rank(monkeypatch, arm, rank):
+    from research.kmd2_ablation.architecture import architecture_record, registry_sha256
+    from research.kmd2_ablation.qwen_architecture import KMD2TrueMIMOAttn, QwenArchitectureConfig, install_qwen_architecture
+    class Layer(torch.nn.Module):
+        def __init__(self, attn): super().__init__(); self.linear_attn = attn
+    class Model(torch.nn.Module):
+        def __init__(self, attn): super().__init__(); self.model = torch.nn.Module(); self.model.layers = torch.nn.ModuleList([Layer(attn)])
+    model = Model(_native(monkeypatch, r_out=1))
+    config = QwenArchitectureConfig(arm, registry_sha256(), architecture_record(arm))
+    assert install_qwen_architecture(model, (0,), config, expected_indices=(0,)) == (0,)
+    installed = model.model.layers[0].linear_attn
+    assert type(installed) is KMD2TrueMIMOAttn and installed.rank == rank
+
+
+@pytest.mark.parametrize("failure", ["wrong_rank", "wrong_type"])
+def test_true_mimo_install_wrong_rank_or_type_rolls_back(monkeypatch, failure):
+    from research.kmd2_ablation.architecture import architecture_record, registry_sha256
+    from research.kmd2_ablation.qwen_architecture import KMD2TrueMIMOAttn, QwenArchitectureConfig, QwenArchitectureInstallError, install_qwen_architecture
+    class Layer(torch.nn.Module):
+        def __init__(self, attn): super().__init__(); self.linear_attn = attn
+    class Model(torch.nn.Module):
+        def __init__(self, attn): super().__init__(); self.model = torch.nn.Module(); self.model.layers = torch.nn.ModuleList([Layer(attn)])
+    original = _native(monkeypatch, r_out=1); model = Model(original)
+    config = QwenArchitectureConfig("mimo-r2", registry_sha256(), architecture_record("mimo-r2"))
+    def bad_factory(native, _config):
+        if failure == "wrong_type": return torch.nn.Linear(2, 2)
+        return KMD2TrueMIMOAttn.from_native(native, 4)
+    with pytest.raises(QwenArchitectureInstallError):
+        install_qwen_architecture(model, (0,), config, expected_indices=(0,), factory=bad_factory)
+    assert model.model.layers[0].linear_attn is original
 
 
 @pytest.mark.parametrize("r_out", [1, 4])
@@ -1180,6 +1242,220 @@ def _native_checkpoint_key(index: int, name: str) -> str:
     return f"model.layers.{index}.linear_attn.{name}"
 
 
+def _hybrid_identity(
+    model, target_names, arm="gdn2-mimo-r4-braid-shared-hola-w64", *,
+    key_head_dim: int = 4,
+):
+    from research.kmd2_ablation.qwen_checkpoint import (QwenHybridCheckpointIdentity,
+        expected_hybrid_tensor_contract, source_conversion_sha256)
+    kwargs = dict(
+        architecture_registry_sha256="1" * 64, implementation_sha256="2" * 64,
+        model_tree_sha256="3" * 64, ordered_examples_sha256="4" * 64,
+        pre_replacement_checkpoint_sha256=source_conversion_sha256(model, target_names), teacher_sha256="6" * 64,
+        frozen_qwen_config={"hidden_size": 12, "linear_num_value_heads": 2,
+            "linear_num_key_heads": 2, "linear_key_head_dim": key_head_dim,
+            "linear_value_head_dim": 3, "linear_conv_kernel_dim": 3,
+            "rms_norm_eps": 1e-6, "rms_norm_type": "RMSNorm", "dtype": "torch.float32",
+            "use_cache": False, "num_hidden_layers": 2, "tie_word_embeddings": False,
+            "rope_theta": 10000.0, "rope_scaling": None, "max_position_embeddings": 4096,
+            "partial_rotary_factor": 1.0},
+        cache_policy={"policy": "exact_outer", "width": 64, "block_size": 256},
+        trainable_manifest=({"name": "placeholder", "shape": [], "dtype": "torch.float32"},),
+        target_module_names=target_names,
+    )
+    provisional = QwenHybridCheckpointIdentity(**kwargs)
+    contract = expected_hybrid_tensor_contract(provisional, arm)
+    kwargs["trainable_manifest"] = tuple(sorted((
+        {"name": f"{target}.{name}", "shape": list(shape), "dtype": dtype}
+        for target in target_names for name, (shape, dtype) in contract.items()
+    ), key=lambda row: row["name"]))
+    return QwenHybridCheckpointIdentity(**kwargs)
+
+
+@pytest.mark.parametrize("arm", ["gdn2-mimo-r4-braid-shared-hola-w64", "gdn2-mimo-r4-braid-four-state-hola-w64"])
+def test_hybrid_checkpoint_replicates_all_operands_and_histories(monkeypatch, arm):
+    from research.kmd2_ablation.qwen_checkpoint import build_qwen_architecture_checkpoint
+    key_head_dim = 4 if "shared" in arm else 8
+    model = _FakeQwenModel(_model_config(key_head_dim=key_head_dim), layer_count=2)
+    sources = []
+    for index, fill in enumerate((0.125, 0.375)):
+        native = _native(monkeypatch, r_out=1, key_head_dim=key_head_dim)
+        with torch.no_grad(): native.in_proj_qkv.weight.fill_(fill)
+        model.model.layers[index].linear_attn = native
+        sources.append(native)
+    targets = tuple(f"model.layers.{index}.linear_attn" for index in range(2))
+    payload = build_qwen_architecture_checkpoint(model, target_module_names=targets,
+        architecture_arm_id=arm,
+        identity=_hybrid_identity(model, targets, arm, key_head_dim=key_head_dim))
+    for index, native in enumerate(sources):
+        prefix = targets[index] + "."
+        state = {name.removeprefix(prefix): value for name, value in payload["model_state"].items() if name.startswith(prefix)}
+        q, k, v = torch.split(native.in_proj_qkv.weight, [native.key_dim, native.key_dim, native.value_dim])
+
+        def compact_complex_bands(source):
+            per_head = source.reshape(native.H, native.dk, source.shape[-1])
+            half = native.dk // 2
+            band_half = half // 4
+            return torch.stack([
+                torch.cat((
+                    per_head[:, rank * band_half:(rank + 1) * band_half],
+                    per_head[:, half + rank * band_half:half + (rank + 1) * band_half],
+                ), 1).reshape(-1, source.shape[-1])
+                for rank in range(4)
+            ])
+
+        for name, source in (("components.q_weight", q), ("components.k_weight", k),
+                             ("components.v_weight", v), ("components.z_weight", native.in_proj_z.weight)):
+            assert state[name].shape[0] == 4
+            expected = (
+                compact_complex_bands(source)
+                if "shared" not in arm and name in {"components.q_weight", "components.k_weight"}
+                else source.unsqueeze(0).expand_as(state[name])
+            )
+            torch.testing.assert_close(state[name], expected)
+        erase = native.in_proj_b.weight[:, None, :].expand(-1, native.dk, -1).reshape(native.key_dim, 12)
+        write = native.in_proj_b.weight[:, None, :].expand(-1, native.dv, -1).reshape(native.value_dim, 12)
+        for name, source in (("components.erase_weight", erase),
+                             ("components.write_weight", write),
+                             ("components.write_offset", native.bw_off)):
+            expected = (
+                compact_complex_bands(source)
+                if "shared" not in arm and name == "components.erase_weight"
+                else source.unsqueeze(0).expand_as(state[name])
+            )
+            torch.testing.assert_close(state[name], expected)
+        torch.testing.assert_close(state["components.out_proj.weight"], native.out_proj.weight)
+        if "shared" in arm:
+            torch.testing.assert_close(state["components.native_decay_weight"], native.in_proj_a.weight)
+            torch.testing.assert_close(state["components.native_A_log"], native.A_log)
+            torch.testing.assert_close(state["components.native_dt_bias"], native.dt_bias)
+            torch.testing.assert_close(state["components.native_decay_chan"], native.decay_chan)
+            torch.testing.assert_close(state["components.c_logits"].softmax(-1), torch.full((2, 4), .25))
+            torch.testing.assert_close(state["components.d_raw"], torch.full((2, 4), .25))
+            torch.testing.assert_close(state["hola_output_mixer"],
+                torch.eye(native.dv).expand_as(state["hola_output_mixer"]) / 16)
+        else:
+            for name, source in (("components.native_decay_weight", native.in_proj_a.weight),
+                                 ("components.native_A_log", native.A_log),
+                                 ("components.native_dt_bias", native.dt_bias)):
+                torch.testing.assert_close(state[name], source)
+            assert "components.native_decay_chan" not in state
+            expected_pair = 0.5 * (
+                native.decay_chan[:, : native.dk // 2]
+                + native.decay_chan[:, native.dk // 2 :]
+            )
+            assert state["components.native_decay_pair"].shape == (
+                native.H, 4, native.dk // 8,
+            )
+            torch.testing.assert_close(
+                state["components.native_decay_pair"],
+                expected_pair.reshape(native.H, 4, native.dk // 8),
+            )
+        mixer = state["components.output_mixer"]
+        if "shared" in arm:
+            torch.testing.assert_close(mixer, torch.eye(native.dv).expand_as(mixer) / 4)
+        else:
+            # "Option A" (2026-07-15): one-hot lane-0 warm-start mixer.
+            expected = torch.zeros_like(mixer)
+            expected[:, 0, 0] = torch.eye(native.dv)
+            torch.testing.assert_close(mixer, expected)
+    assert not torch.equal(payload["model_state"][targets[0]+".components.q_weight"],
+                           payload["model_state"][targets[1]+".components.q_weight"])
+    assert set(payload["conversion_manifest"]["layers"]) == set(targets)
+    assert payload["conversion_manifest"]["out_proj"] == "copied_once"
+    assert payload["conversion_manifest"]["history_initialization"] == "all_lanes_equal"
+
+
+def test_hybrid_checkpoint_rejects_shape_before_construction(monkeypatch):
+    from research.kmd2_ablation.qwen_checkpoint import build_qwen_architecture_checkpoint
+    native = _native(monkeypatch, r_out=1); model = _FakeQwenModel(_model_config(), 1)
+    model.model.layers[0].linear_attn = native
+    native.in_proj_qkv = torch.nn.Linear(12, 21, bias=False)
+    called = False
+    def factory(_native):
+        nonlocal called
+        called = True
+        raise AssertionError("must not construct")
+    with pytest.raises(ValueError, match="in_proj_qkv.weight"):
+        build_qwen_architecture_checkpoint(model, target_module_names=("model.layers.0.linear_attn",),
+            architecture_arm_id="gdn2-mimo-r4-braid-shared-hola-w64",
+            identity=_hybrid_identity(model, ("model.layers.0.linear_attn",)), factory=factory)
+    assert called is False
+
+
+@pytest.mark.parametrize("corruption", ["missing", "unexpected", "dtype"])
+def test_hybrid_checkpoint_rejects_tensor_contract_matrix_before_construction(monkeypatch, corruption):
+    from research.kmd2_ablation.qwen_checkpoint import build_qwen_architecture_checkpoint
+    native = _native(monkeypatch, r_out=1); model = _FakeQwenModel(_model_config(), 1)
+    model.model.layers[0].linear_attn = native
+    if corruption == "missing":
+        del native._parameters["bw_off"]
+    elif corruption == "unexpected":
+        native.register_buffer("stale_tensor", torch.zeros(1))
+    else:
+        native.bw_off = torch.nn.Parameter(native.bw_off.double())
+    called = False
+    def factory(_native):
+        nonlocal called; called = True
+        raise AssertionError("must not construct")
+    target = ("model.layers.0.linear_attn",)
+    with pytest.raises((ValueError, TypeError)):
+        build_qwen_architecture_checkpoint(model, target_module_names=target,
+            architecture_arm_id="gdn2-mimo-r4-braid-shared-hola-w64",
+            identity=_hybrid_identity(model, target), factory=factory)
+    assert called is False
+
+
+@pytest.mark.skip(reason="2026-07-15 'Option A': warm start is near-identity but deliberately "
+                  "not exact (live HOLA/trapezoid gradients, braided horizons, and CMS clocks); "
+                  "the full-warm-identity contract this test asserts was repealed")
+@pytest.mark.parametrize("package", ["shared", "four_state"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_hybrid_checkpoint_full_warm_identity_prefill_chunks_and_decode(monkeypatch, package, dtype):
+    from research.kmd2_ablation.qwen_hybrid_shared import QwenSharedBraidHybrid
+    from research.kmd2_ablation.qwen_hybrid_four_state import QwenFourStateHybrid
+    monkeypatch.setenv("GDN3_KMD2_ROUT", "1")
+    torch.manual_seed(993)
+    native = KMD2NativeAttn(_model_config(), layer_idx=0).to(dtype=dtype)
+    hybrid_type = QwenSharedBraidHybrid if package == "shared" else QwenFourStateHybrid
+    hybrid = hybrid_type.from_native(native)
+    hidden = torch.randn(1, 5, 12).to(dtype)
+    expected = native(hidden)
+    one_shot, one_cache = hybrid.scan(hidden)
+    atol = 1e-6 if dtype == torch.float32 else 2e-3
+    torch.testing.assert_close(one_shot, expected, rtol=0.0, atol=atol)
+    assert torch.nn.functional.cosine_similarity(one_shot.float().flatten(), expected.float().flatten(), dim=0) >= 0.99999
+    def assert_cache_equal(left, right):
+        import dataclasses
+        for field in dataclasses.fields(left):
+            a, b = getattr(left, field.name), getattr(right, field.name)
+            if dataclasses.is_dataclass(a): assert_cache_equal(a, b)
+            elif isinstance(a, torch.Tensor):
+                torch.testing.assert_close(a, b, rtol=0.0,
+                    atol=(atol if a.is_floating_point() else 0.0))
+            else: assert a == b
+    # Every composition of T, including one-shot and token-by-token decode.
+    for cuts in range(1 << (hidden.shape[1] - 1)):
+        boundaries = [0] + [index for index in range(1, hidden.shape[1]) if cuts & (1 << (index-1))] + [hidden.shape[1]]
+        cache = None; pieces = []
+        for start, stop in zip(boundaries, boundaries[1:]):
+            output, cache = hybrid.scan(hidden[:, start:stop], initial_cache=cache)
+            pieces.append(output)
+        actual = torch.cat(pieces, 1)
+        torch.testing.assert_close(actual, expected, rtol=0.0, atol=atol)
+        assert torch.nn.functional.cosine_similarity(actual.float().flatten(), expected.float().flatten(), dim=0) >= 0.99999
+        assert_cache_equal(cache, one_cache)
+    if package == "four_state":
+        for tensor, axis in ((one_cache.states, 2), (one_cache.phase, 2),
+                       (one_cache.previous_key, 2), (one_cache.previous_value, 2),
+                       (one_cache.hola_state.keys, 3), (one_cache.hola_state.values, 3),
+                       (one_cache.hola_state.block_keys, 3),
+                       (one_cache.hola_state.block_values, 3)):
+            for lane in range(1, 4):
+                torch.testing.assert_close(tensor.select(axis, lane), tensor.select(axis, 0),
+                                           rtol=0.0, atol=atol)
+
+
 def test_installer_orders_native_checkpoint_conversion_and_optional_resume_atomically(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1433,6 +1709,70 @@ def test_installer_restores_native_mode_environment_when_manager_fails(
             None,
         )
     assert os.environ.get("GDN3_KMD2_NATIVE") == "restore-me"
+
+
+@pytest.mark.parametrize("manager_fails", [False, True])
+def test_canonical_r1_native_installer_restores_rout_on_success_and_failure(
+    monkeypatch: pytest.MonkeyPatch, manager_fails: bool
+) -> None:
+    from research.kmd2_ablation.qwen_backend import _default_native_installer
+
+    monkeypatch.setenv("GDN3_KMD2_NATIVE", "restore-native")
+    monkeypatch.setenv("GDN3_KMD2_ROUT", "restore-rout")
+    model = _FakeQwenModel(_model_config())
+
+    class Manager:
+        def apply_upgrade(self):
+            assert os.environ["GDN3_KMD2_NATIVE"] == "1"
+            assert os.environ["GDN3_KMD2_ROUT"] == "1"
+            if manager_fails:
+                raise RuntimeError("manager failure")
+            model.model.layers[0].linear_attn = KMD2NativeAttn(_model_config(), layer_idx=0)
+            return (0,)
+
+    kwargs = dict(
+        model=model, manager=Manager(), model_config=_model_config(), cache_config=None,
+        native_checkpoint=None, cache_resume=None, expected_job_id="job",
+        target_dtype=torch.float32, native_r_out=1,
+    )
+    if manager_fails:
+        with pytest.raises(RuntimeError, match="manager failure"):
+            _default_native_installer(**kwargs)
+    else:
+        assert _default_native_installer(**kwargs) == (0,)
+        native = model.model.layers[0].linear_attn
+        assert native.r_out == 1
+        assert not hasattr(native, "q_slot_scale")
+        assert not hasattr(native, "out_mix")
+    assert os.environ["GDN3_KMD2_NATIVE"] == "restore-native"
+    assert os.environ["GDN3_KMD2_ROUT"] == "restore-rout"
+
+
+def test_native_installer_serializes_process_environment_between_threads(monkeypatch):
+    from research.kmd2_ablation.qwen_backend import _default_native_installer
+    monkeypatch.setenv("GDN3_KMD2_NATIVE", "sentinel-native")
+    monkeypatch.setenv("GDN3_KMD2_ROUT", "4")
+    entered_first = threading.Event(); release_first = threading.Event(); entered_second = threading.Event(); seen = []; errors = []
+    def run(label, native_r_out, entered, block):
+        model = _FakeQwenModel(_model_config())
+        class Manager:
+            def apply_upgrade(self):
+                seen.append((label, os.environ["GDN3_KMD2_ROUT"]))
+                entered.set()
+                if block: assert release_first.wait(5)
+                model.model.layers[0].linear_attn = KMD2NativeAttn(_model_config(), layer_idx=0)
+                return (0,)
+        try:
+            _default_native_installer(model=model, manager=Manager(), model_config=_model_config(), cache_config=None, native_checkpoint=None, cache_resume=None, expected_job_id=label, target_dtype=torch.float32, native_r_out=native_r_out)
+        except BaseException as error: errors.append(error)
+    first = threading.Thread(target=run, args=("r1", 1, entered_first, True)); second = threading.Thread(target=run, args=("default", None, entered_second, False))
+    first.start(); assert entered_first.wait(5); second.start()
+    assert not entered_second.wait(0.2)
+    release_first.set(); first.join(5); second.join(5)
+    assert not errors
+    assert seen == [("r1", "1"), ("default", "4")]
+    assert os.environ["GDN3_KMD2_NATIVE"] == "sentinel-native"
+    assert os.environ["GDN3_KMD2_ROUT"] == "4"
 
 
 def _exact_cache_model(

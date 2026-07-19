@@ -99,10 +99,11 @@ class KMD2NativeAttn(nn.Module):
         q [B,T,H,r_out,dk] (scaled, rotated); k [B,T,H,dk]; v [B,T,H,dv];
         g [B,T,H,dk] per-channel decay (native scalar + offsets, exp'd);
         beta_e/beta_w [B,T,H]. Returns y [B,T,H,dv]."""
-        if _FAST_SCAN:
+        if _FAST_SCAN and q.is_cuda:
             # chunk-parallel Triton+compile kernel (A/B kernel search winner);
             # numerically equivalent to the reference loop below (bench-gated
-            # fwd relMSE<2e-3, grad<1e-2). ~80x faster fwd+bwd.
+            # fwd relMSE<2e-3, grad<1e-2). ~80x faster fwd+bwd.  CUDA-only:
+            # CPU callers (preflight gate probes) take the reference loop.
             from gdn3.kmd2_fast_scan import scan as _fast_scan
             out_mix = self.out_mix if self.r_out > 1 else None
             return _fast_scan(q, k, v, g, beta_e, beta_w, out_mix)

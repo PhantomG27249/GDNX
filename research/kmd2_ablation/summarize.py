@@ -6,6 +6,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 import os
 import shutil
 import uuid
@@ -513,6 +514,19 @@ def build_summary_artifacts(
         for record in normalized
         if record["status"] == "completed" and record.get("scientific_label") is not None
     )
+    hybrid_seed_rows = _derive_hybrid_promotion_rows(normalized)
+    hybrid_campaign = any(
+        str(item.get("arm_id", "")).startswith("gdn2-mimo-r4-braid-")
+        for item in (*normalized, *jobs)
+    )
+    hybrid_arms = {
+        str(item.get("arm_id")) for item in (*normalized, *jobs)
+        if str(item.get("arm_id", "")).startswith("gdn2-mimo-r4-braid-")
+    }
+    hybrid_promotion = (
+        {arm: aggregate_hybrid_promotion(hybrid_seed_rows.get(arm, ())) for arm in sorted(hybrid_arms)}
+        if hybrid_campaign else None
+    )
     results = {
         "schema_version": SUMMARY_SCHEMA_VERSION,
         "execution_counts": {
@@ -533,11 +547,53 @@ def build_summary_artifacts(
             "seeds": sorted({record["seed"] for record, _evaluation in ruler_rows}),
         },
     }
+    if hybrid_promotion is not None:
+        results["hybrid_promotion"] = hybrid_promotion
     return SummaryArtifacts(
         ledger_jsonl=ledger,
         results_json=canonical_json_bytes(results) + b"\n",
         results_csv=_csv_bytes(rows),
     )
+
+
+def _derive_hybrid_promotion_rows(
+    records: Sequence[Mapping[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Join candidate observations only to byte-identical matched baseline runs."""
+    observations = [
+        record["hybrid_promotion_observation"] for record in records
+        if record.get("status") == "completed"
+        and isinstance(record.get("hybrid_promotion_observation"), Mapping)
+    ]
+    rows: dict[str, list[dict[str, Any]]] = {}
+    for candidate in observations:
+        arm = str(candidate.get("arm_id", ""))
+        if not arm.startswith("gdn2-mimo-r4-braid-"):
+            continue
+        baseline_arm = candidate.get("baseline_arm_id")
+        matches = [baseline for baseline in observations if (
+            baseline.get("arm_id") == baseline_arm
+            and baseline.get("seed") == candidate.get("seed")
+            and baseline.get("pairing_id") == candidate.get("pairing_id")
+            and baseline.get("checkpoint_sha256") == candidate.get("checkpoint_sha256")
+            and baseline.get("data_sha256") == candidate.get("data_sha256")
+            and baseline.get("cells") == candidate.get("cells")
+        )]
+        if len(matches) != 1:
+            continue
+        baseline = matches[0]
+        rows.setdefault(arm, []).append({
+            "seed": candidate["seed"], "baseline": baseline["recall"],
+            "candidate": candidate["recall"],
+            "free_generation": candidate["free_generation"],
+            "lm_loss": candidate["lm_loss"], "baseline_lm_loss": baseline["lm_loss"],
+            "nonfinite_count": candidate["nonfinite_count"],
+            "capacity_confounded": candidate["capacity_confounded"],
+            "effective_rank": candidate.get("effective_rank", 0.0),
+            "decay_horizon_ratios": candidate.get("decay_horizon_ratios", [1.0, 16.0, 64.0, 256.0]),
+            "thresholds": candidate.get("thresholds", {}),
+        })
+    return rows
 
 
 def _replace_bytes(path: Path, payload: bytes) -> None:
@@ -865,6 +921,75 @@ def classify_paired_reliance(
     return ClassifiedReliance(label, interval)
 
 
+def aggregate_hybrid_promotion(rows: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Make an explicit three-seed hybrid decision; never infer promotion."""
+    values = tuple(rows)
+    if len(values) != 3 or any(not isinstance(row, Mapping) for row in values):
+        return {"decision": "no_promote", "reasons": ("missing_seed_runs",),
+                "seed_count": len(values)}
+    seeds = tuple(row.get("seed") for row in values)
+    if any(type(seed) is not int for seed in seeds) or len(set(seeds)) != 3:
+        return {"decision": "no_promote", "reasons": ("unmatched_seeds",),
+                "seed_count": len(set(seed for seed in seeds if type(seed) is int))}
+    required = {
+        "seed", "baseline", "candidate", "free_generation", "lm_loss",
+        "nonfinite_count", "capacity_confounded",
+    }
+    optional = {"baseline_lm_loss", "effective_rank", "decay_horizon_ratios", "thresholds"}
+    if any(not required <= set(row) or set(row) - required - optional for row in values):
+        raise SummaryValidationError("hybrid promotion seed fields must be exact")
+    for row in values:
+        for field in ("baseline", "candidate", "free_generation", "lm_loss"):
+            value = row[field]
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+                raise SummaryValidationError(f"hybrid promotion {field} must be finite")
+        if type(row["nonfinite_count"]) is not int or row["nonfinite_count"] < 0:
+            raise SummaryValidationError("hybrid promotion nonfinite_count must be nonnegative")
+        if type(row["capacity_confounded"]) is not bool:
+            raise SummaryValidationError("hybrid promotion capacity_confounded must be bool")
+    reasons: list[str] = []
+    threshold_rows = [row.get("thresholds", {}) for row in values]
+    if any(not isinstance(item, Mapping) for item in threshold_rows) or any(
+        dict(item) != dict(threshold_rows[0]) for item in threshold_rows[1:]
+    ):
+        raise SummaryValidationError("hybrid promotion thresholds must be matched")
+    thresholds = {"min_gain": 0.0, "min_free_generation": 0.5,
+                  "max_lm_loss": float("inf"), "max_lm_loss_increase": 0.0,
+                  "min_effective_rank": 1.5,
+                  "bootstrap_resamples": 2000, **dict(threshold_rows[0])}
+    if any(row["capacity_confounded"] for row in values):
+        reasons.append("capacity_confounded")
+    if any(row["nonfinite_count"] for row in values):
+        reasons.append("nonfinite")
+    gains = [float(row["candidate"]) - float(row["baseline"]) for row in values]
+    if any(gain <= float(thresholds["min_gain"]) for gain in gains):
+        reasons.append("no_paired_improvement")
+    from .metrics import MetricSample, paired_bootstrap
+    candidate_samples = [MetricSample(int(row["seed"]), str(row["seed"]), "hybrid", float(row["candidate"]), 1.0) for row in values]
+    baseline_samples = [MetricSample(int(row["seed"]), str(row["seed"]), "hybrid", float(row["baseline"]), 1.0) for row in values]
+    interval = paired_bootstrap(candidate_samples, baseline_samples, direction=1,
+                                random_seed=0, resamples=int(thresholds["bootstrap_resamples"]))
+    if interval.lower <= 0:
+        reasons.append("paired_ci_not_positive")
+    if min(float(row["free_generation"]) for row in values) < float(thresholds["min_free_generation"]):
+        reasons.append("free_generation_below_threshold")
+    if max(float(row["lm_loss"]) for row in values) > float(thresholds["max_lm_loss"]):
+        reasons.append("lm_loss_above_threshold")
+    if any("baseline_lm_loss" in row and float(row["lm_loss"]) - float(row["baseline_lm_loss"])
+           > float(thresholds["max_lm_loss_increase"]) for row in values):
+        reasons.append("lm_loss_regression")
+    if any(float(row.get("effective_rank", 4.0)) < float(thresholds["min_effective_rank"]) for row in values):
+        reasons.append("rank_collapse")
+    if any(tuple(round(float(x), 3) for x in row.get("decay_horizon_ratios", ()))
+           != (1.0, 16.0, 64.0, 256.0) for row in values):
+        reasons.append("decay_timescale_ratio_mismatch")
+    return {
+        "decision": "no_promote" if reasons else "promote",
+        "reasons": tuple(reasons),
+        "seed_count": 3,
+    }
+
+
 __all__ = [
     "SUMMARY_SCHEMA_VERSION",
     "ClassifiedFactorial",
@@ -872,6 +997,7 @@ __all__ = [
     "SummaryArtifacts",
     "SummaryValidationError",
     "build_summary_artifacts",
+    "aggregate_hybrid_promotion",
     "classify_factorial_addition",
     "classify_paired_reliance",
     "cli_handler",

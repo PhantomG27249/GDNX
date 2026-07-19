@@ -1,3 +1,0 @@
-{"name":"dclamp997_steps500","hypothesis":"exp006 implicated slow state-accumulation as the divergence cause; decay_clamp is the fast-track forgetting floor that bounds retained state, but it was only ever tested confounded with high LR (exp003, 4e-4->diverged). Lowering decay_clamp 0.999->0.997 at the STABLE lr 2.5e-4 isolates whether the fast-track floor controls the late divergence independently, and tests whether a tighter state bound lets retrieval escape the format plateau the way slow_decay 0.90 (slow-track) did not.",
- "steps":500,"eval_every":50,"warmup":40,"grad_accum":1,"n_keys":4,"seq_len":512,
- "lr_memory":2.5e-4,"lr_coproduct":1.5e-4,"decay_clamp":0.997,"slow_decay":0.97,"residual_rank":16,"seed":0}

@@ -1,9 +1,0 @@
-=== rm0_np64 (--r 1 --rope_mod --seed 0) ===
-{"final_tokacc": 0.9756, "final_recall": 0.9062, "wall_s": 886.5}
-=== rm0_np64_ste (--r 1 --rope_mod --compact_P 32 --compact_R 16 --compact_ste --seed 0) ===
-{"final_tokacc": 0.9756, "final_recall": 0.9062, "wall_s": 925.6}
-=== rm1_np64 (--r 1 --rope_mod --seed 1) ===
-{"final_tokacc": 0.9893, "final_recall": 0.9609, "wall_s": 856.8}
-=== rm1_np64_ste (--r 1 --rope_mod --compact_P 32 --compact_R 16 --compact_ste --seed 1) ===
-{"final_tokacc": 0.9854, "final_recall": 0.9492, "wall_s": 899.6}
-SUITE DONE

@@ -1,4 +1,0 @@
-{"name":"kmd2_fable_v1","hypothesis":"Fable's KMD-2 rank-r MIMO delta (r=4, trainable q/k/v/gates) breaks the original-GDN3 0-recall ceiling on the robust proxy; trainable query CAN align to stored keys (induction) unlike frozen-Qwen-q/k GDN3.",
- "kmd2":true,"kmd2_r":4,"kmd2_h":16,"kmd2_dk":64,"kmd2_dv":64,"kmd2_eps":0.5,
- "steps":400,"eval_every":80,"warmup":40,"grad_accum":1,"n_keys":4,"seq_len":512,
- "lr_memory":2.5e-4,"lr_coproduct":1.5e-4,"seed":0}

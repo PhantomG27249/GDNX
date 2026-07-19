@@ -143,6 +143,173 @@ def _build(raw: dict | None = None):
     )
 
 
+def test_maximum_hybrid_configs_fail_closed():
+    from research.kmd2_ablation.architecture import TARGET_LAYERS, registry_sha256
+
+    for arm_id, topology, phase_topology, read_topology, read_paths, variant in (
+        ("gdn2-mimo-r4-braid-shared-hola-w64", "shared", "shared", "shared_state_outputs", 4, "braid_shared_hola_w64"),
+        ("gdn2-mimo-r4-braid-four-state-hola-w64", "mimo_rank_contributions", "per_rank", "full_cross_state", 16, "braid_four_state_hola_w64"),
+    ):
+        raw = minimal_config_dict()
+        raw.update(mechanism="maximum_hybrid", variant=variant)
+        raw["model"].update(num_heads=16, state_key_dim=128, state_value_dim=128)
+        raw["seeds"] = [11, 29, 47]
+        raw["budget"] = {"updates": 1536, "tokens": 6291456}
+        raw["lengths"] = {"curriculum": [512, 2048, 4096, 8192], "extrapolation": [16384, 32768]}
+        raw["task"]["params"].update(
+            target_layers=list(TARGET_LAYERS), mimo_rank=4, output_width=4,
+            gate_mode="channelwise", timescales=([1, 16, 64, 256]
+                                                  if topology == "mimo_rank_contributions"
+                                                  else [64, 512, 4096, 32768]),
+            state_topology=topology, cache_scope="per_head_shared_across_ranks",
+            update_paths=4, convolution_on=True,
+            rotation_mode="mamba3_complex_input_dependent_cumulative",
+            phase_topology=phase_topology,
+            input_rank=4, output_rank=4, read_topology=read_topology,
+            read_paths=read_paths, state_input_mode="trapezoid", lookahead=(topology == "shared"),
+            qk_contract=("affine_diagonal_plus_additive_identity_init" if topology == "shared" else "gdn_unit_directional_affine_postrenorm_v1"),
+        )
+        raw["cache"].update(
+            width=64, block_size=256, score="exact_outer", read="rmsnorm",
+            storage_dtype="bf16", read_init="hola_gate_logit_v2_minus4",
+        )
+        raw["architecture"] = {
+            "arm_id": arm_id, "registry_sha256": registry_sha256(),
+            "model_tree_sha256": "a" * 64, "ordered_examples_sha256": "b" * 64,
+            "pretraining_checkpoint_sha256": "c" * 64,
+        }
+        assert _build(raw).architecture.arm_id == arm_id
+        for path, value in (
+            (("task", "params", "convolution_on"), False),
+            (("task", "params", "mimo_rank"), 2),
+            (("task", "params", "timescales"), [64, 512]),
+            (("task", "params", "rotation_mode"), "current"),
+            (("task", "params", "phase_topology"), "per_rank" if phase_topology == "shared" else "shared"),
+            (("task", "params", "input_rank"), 2),
+            (("task", "params", "output_rank"), 2),
+            (("task", "params", "read_topology"), "full_cross_state" if read_topology == "shared_state_outputs" else "shared_state_outputs"),
+            (("task", "params", "read_paths"), 16 if read_paths == 4 else 4),
+            (("task", "params", "state_input_mode"), "native"),
+            (("task", "params", "lookahead"), topology != "shared"),
+            (("task", "params", "qk_contract"), "none"),
+            (("task", "params", "cache_scope"), "per_state"),
+            (("task", "params", "update_paths"), 16),
+        ):
+            drifted = copy.deepcopy(raw)
+            target = drifted
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = value
+            with pytest.raises(ValueError, match="architecture arm does not match"):
+                _build(drifted)
+
+
+def test_optional_architecture_identity_is_exact_and_rejects_drift():
+    from research.kmd2_ablation.architecture import registry_sha256
+    raw = minimal_config_dict()
+    raw["architecture"] = {
+        "arm_id": "cache-surprise-w64", "registry_sha256": registry_sha256(),
+        "model_tree_sha256": "a" * 64, "ordered_examples_sha256": "b" * 64,
+        "pretraining_checkpoint_sha256": "c" * 64,
+    }
+    raw["cache"]["width"] = 64
+    raw["cache"]["block_size"] = 256
+    raw["seeds"] = [11, 29, 47]
+    raw["budget"] = {"updates": 1536, "tokens": 6291456}
+    raw["lengths"] = {"curriculum": [512, 2048, 4096, 8192], "extrapolation": [16384, 32768]}
+    raw["model"]["num_heads"] = 16
+    raw["model"]["state_key_dim"] = 128
+    raw["model"]["state_value_dim"] = 128
+    config = _build(raw)
+    assert config.architecture.arm_id == "cache-surprise-w64"
+    raw["architecture"]["registry_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="registry_sha256"):
+        _build(raw)
+
+
+def test_architecture_identity_rejects_legacy_mechanism_variant_mismatch():
+    from research.kmd2_ablation.architecture import registry_sha256
+    raw = minimal_config_dict()
+    raw["architecture"] = {
+        "arm_id": "mimo-r2", "registry_sha256": registry_sha256(),
+        "model_tree_sha256": "a" * 64, "ordered_examples_sha256": "b" * 64,
+        "pretraining_checkpoint_sha256": "c" * 64,
+    }
+    with pytest.raises(ValueError, match="active legacy cache"):
+        _build(raw)
+
+
+def test_architecture_identity_checks_rank_gate_output_and_model_values():
+    from research.kmd2_ablation.architecture import registry_sha256
+    raw = minimal_config_dict()
+    raw.update(mechanism="true_mimo", variant="true_mimo_sweep")
+    raw["model"].update(num_heads=16, state_key_dim=128, state_value_dim=128)
+    raw["cache"].update(width=64, block_size=256)
+    raw["seeds"] = [11, 29, 47]
+    raw["budget"] = {"updates": 1536, "tokens": 6291456}
+    raw["lengths"] = {"curriculum": [512, 2048, 4096, 8192], "extrapolation": [16384, 32768]}
+    raw["task"]["params"].update(mimo_rank=2, output_width=1, gate_mode="scalar")
+    raw["architecture"] = {
+        "arm_id": "mimo-r2", "registry_sha256": registry_sha256(),
+        "model_tree_sha256": "a" * 64, "ordered_examples_sha256": "b" * 64,
+        "pretraining_checkpoint_sha256": "c" * 64,
+    }
+    assert _build(raw).architecture.arm_id == "mimo-r2"
+    for container, field, value in (
+        ("task", "mimo_rank", 4), ("task", "output_width", 4),
+        ("task", "gate_mode", "channelwise"), ("model", "state_key_dim", 64),
+    ):
+        drifted = copy.deepcopy(raw)
+        target = drifted["task"]["params"] if container == "task" else drifted["model"]
+        target[field] = value
+        with pytest.raises(ValueError, match="architecture arm does not match"):
+            _build(drifted)
+
+
+@pytest.mark.parametrize("path,value,code", [
+    (("seeds",), [11, 29], "architecture.seeds_mismatch"),
+    (("budget", "updates"), 1535, "architecture.updates_mismatch"),
+    (("budget", "tokens"), 6291455, "architecture.tokens_mismatch"),
+    (("lengths", "curriculum"), [512], "architecture.curriculum_lengths_mismatch"),
+    (("lengths", "extrapolation"), [16384], "architecture.extrapolation_lengths_mismatch"),
+    (("task", "params", "target_layers"), [0], "architecture.target_layers_mismatch"),
+])
+def test_architecture_identity_rejects_frozen_campaign_drift(path, value, code):
+    from research.kmd2_ablation.architecture import TARGET_LAYERS, registry_sha256
+    raw = minimal_config_dict()
+    raw.update(mechanism="true_mimo", variant="true_mimo_sweep")
+    raw["model"].update(num_heads=16, state_key_dim=128, state_value_dim=128)
+    raw["cache"].update(width=64, block_size=256)
+    raw["seeds"] = [11, 29, 47]
+    raw["budget"] = {"updates": 1536, "tokens": 6291456}
+    raw["lengths"] = {"curriculum": [512, 2048, 4096, 8192], "extrapolation": [16384, 32768]}
+    raw["task"]["params"].update(mimo_rank=2, output_width=1, gate_mode="scalar", target_layers=list(TARGET_LAYERS))
+    raw["architecture"] = {"arm_id": "mimo-r2", "registry_sha256": registry_sha256(), "model_tree_sha256": "a"*64, "ordered_examples_sha256": "b"*64, "pretraining_checkpoint_sha256": "c"*64}
+    target = raw
+    for key in path[:-1]: target = target[key]
+    target[path[-1]] = value
+    with pytest.raises(ValueError, match=code):
+        _build(raw)
+
+
+@pytest.mark.parametrize("arm_id,mechanism,variant", [
+    ("mimo-r2", "exact_cache", "top_surprise"),
+    ("gdn2-channel-r1", "exact_cache", "top_surprise"),
+])
+def test_noncache_architecture_rejects_active_legacy_cache(arm_id, mechanism, variant):
+    from research.kmd2_ablation.architecture import registry_sha256
+    raw = minimal_config_dict()
+    raw.update(mechanism=mechanism, variant=variant)
+    raw["model"].update(num_heads=16, state_key_dim=128, state_value_dim=128)
+    raw["architecture"] = {
+        "arm_id": arm_id, "registry_sha256": registry_sha256(),
+        "model_tree_sha256": "a" * 64, "ordered_examples_sha256": "b" * 64,
+        "pretraining_checkpoint_sha256": "c" * 64,
+    }
+    with pytest.raises(ValueError, match="active legacy cache"):
+        _build(raw)
+
+
 def _changed(path: str, value) -> dict:
     raw = copy.deepcopy(minimal_config_dict())
     target = raw

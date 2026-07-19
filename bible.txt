@@ -1,0 +1,415 @@
+================================================================================
+GDN-X BIBLE
+The canonical description of the GDN-X architecture as implemented in this tree.
+Written 2026-07-14. If code and this document disagree, the code's reference
+implementation and its tests are authoritative; then fix whichever is wrong.
+================================================================================
+
+1. VISION
+---------
+
+GDN-X upgrades the linear-attention (GatedDeltaNet) layers of Qwen3.5-0.8B into
+a strictly more expressive recurrent memory, warm-started from the pretrained
+native GDN point and then briefly "healed" against the stock model as teacher.
+The design philosophy throughout: add degrees of freedom that are cheap,
+identifiable, and initialized so close to the native layer that a small
+distillation budget can open them without destroying pretrained behavior; gate
+every scientific claim behind measured, fail-closed evidence.
+
+The flagship ("Package B", control id `package-b-hola-w64`) composes five
+pillars, each anchored to a published mechanism:
+
+  GDN-2      Decoupled channelwise erase/write gating (arXiv:2605.22791).
+             What to remove along the key axis is controlled separately from
+             how much to commit along the value axis.
+
+  MiMo R4    True multi-input/multi-output rank 4, from Mamba-3
+             (arXiv:2603.15569). Four independent Q/K/V/erase/write/z
+             projection ranks instead of one.
+
+  Time       The four MIMO ranks are four decay histories: lane r decays with
+  braiding   gamma_native^(1/s_r), s = (1, 16, 64, 256). Lane 0 IS the native
+             GDN decay law; lanes 1-3 have 16x/64x/256x its instantaneous
+             horizon. Decay is tied within adjacent complex pairs so it
+             commutes with rotation.
+
+  CMS        Continuum-Memory-System clocks, from Nested Learning
+  clocks     (arXiv:2512.24695). Lane r performs its GDN erase/write/trapezoid
+             update only every s_r-th valid token; off-tick lanes passively
+             decay and remain readable. Memory as a frequency spectrum: the
+             fast lane is working memory, slow lanes are persistent memory.
+             There is NO cross-rank state router and NO extra CMS state axis.
+
+  HOLA       A bounded exact per-head KV cache (arXiv:2607.02303) as a
+             semiparametric complement: the recurrent state models linearly
+             compressible structure; the cache stores exactly the (k, v) pairs
+             the state visibly failed to absorb, selected by the norm of the
+             innovation actually committed to the state ("surprise").
+
+Supporting mechanisms: cumulative data-dependent complex rotation on q/k
+(Mamba-3's data-dependent-RoPE equivalence), token-dependent
+exponential-trapezoid input mixing, unit-key-preserving directional Q/K
+adaptation (affine_qk), and the stock depthwise convolution.
+
+State topology: four separable [dk x dv] fp32 states per head (4x the
+single-state baseline memory - this adaptation deliberately does NOT claim
+Mamba-3's state-size-preservation result), four owned writes per tick,
+homogeneous (router-free) transitions, and sixteen cross-rank reads per token
+mixed by a learned [H,4,4,V,V] output mixer.
+
+2. EXACT SEMANTICS (the contract any optimization must preserve)
+----------------------------------------------------------------
+
+Reference semantics: `research/kmd2_ablation/qwen_hybrid_four_state.py`
+(`QwenFourStateHybrid._scan` / `_hybrid_segment`), including its forced
+PyTorch FP32 token path. It remains the authoritative numerical oracle.
+Production all-valid, boundary-free segments dispatch the strict optional
+`qwen_hybrid_triton.py` forward/backward recurrence for B=1, H in {8,16},
+R=4, dk=dv=128, T<=64. Unsupported shapes, masks, boundaries, devices, or
+dtypes fail closed to the reference path. Rotation, normalization, the output
+mixer, HOLA, and projection remain ordinary differentiable PyTorch around the
+fused recurrence; tests pin forward, carried state, and VJP parity.
+
+Per token t, per head, per lane r:
+
+  Projections   q,k,v are projected per rank and passed through the native
+                depthwise conv1d + SiLU per rank (erase/write/z are NOT
+                convolved, matching native). q,k -> adjacent-complex layout,
+                L2-normalized, affine_qk applied, re-normalized (k exactly unit
+                norm; q scaled dk^-1/2).
+
+  Decay         log gamma_native = -exp(A_log) * softplus(a_t + dt_bias)
+                + pair-tied channel residual; gamma_r = gamma_native^(1/s_r),
+                clamped to [2^-24, 1], equal within each complex pair.
+
+  Rotation      theta_t = softplus(rot_proj(x_t)) + phase_proj(x_t)  (per rank)
+                phase_t = phase_{t-1} + theta_t (cumulative, never wrapped,
+                reset before valid boundary tokens). q,k rotated by phase_t.
+
+  CMS tick      lane r ticks iff update_count % s_r == 0, where update_count
+                counts valid tokens and resets at document boundaries. All
+                lanes tick on a document's first token.
+
+  Update        On tick:   A_t(X) = Gamma_t X - k_t (beta_e . k_t)^T Gamma_t X
+                           S_t = A_t(S_{t-1}) + (1-lambda_t) A_t(W_{t-1})
+                                 + lambda_t W_t,   W_t = k_t (beta_w . v_t)^T
+                Off tick:  S_t = Gamma_t S_{t-1}   (decay only; no erase/write)
+                W endpoint decays off-tick; a lane's first tick in a document
+                forces lambda = 1. beta_e (key-axis) and beta_w (value-axis)
+                are channelwise sigmoids - the GDN-2 decoupling.
+
+  Read          Sixteen cross reads q_i^T S_j every token (also off-tick),
+                each RMSNorm-gated with the query-rank z, mixed by the output
+                mixer (Package B init is one-hot lane 0; see the warm-start
+                contract below).
+
+  HOLA          Every valid token is staged into the C=256 block. A token's
+                visible set is persistent-W (64) + all causal tokens in its
+                own block INCLUDING itself + a learned sink; the block's final
+                token reads the full staged block BEFORE promotion. Promotion
+                keeps the top-64 by score among {persistent union block}, score
+                = RMS-over-ticking-lanes of the committed innovation
+                ||S_t - Gamma_t S_{t-1}||_F (see footnote item 4), recency as
+                stable tiebreak. Read: RMSNorm-gamma on q and cached k
+                (learned per-(head,rank) gains), softmax with sink column
+                dropped after normalization, gated into the mixed output by
+                sigmoid(cache_gate_logit), init logit -4. Document boundaries
+                advance an epoch that invalidates all prior entries.
+
+  Precision     Recurrent state, phase, previous-write, and all state math are
+                FP32 regardless of module dtype. Cache storage is bf16.
+
+  Boundaries    boundary/valid are explicit [B,T] masks; packed sequences
+                without boundaries fail closed. Chunked scans with cache carry
+                must be exactly equivalent to one-shot scans (tested).
+                Segmented activation checkpointing is exact for forward/cache
+                values and keeps gradients within the pinned FP32 parity
+                envelope (1e-3 absolute, 2e-4 relative).
+
+Warm-start contract ("Option A", decided 2026-07-15, superseding the interim
+"Option B"): near-identity conversion. The Package B output mixer initializes
+one-hot on lane 0 (reads only the native-decay state with the lane-0 query)
+and the trapezoid logit initializes at +4 (lambda ~= 0.982), so the converted
+layer starts at ~1.8% relative error / cosine 0.9999 to the native layer --
+the residue is the deliberate live-gradient warm starts of the trapezoid and
+the HOLA gate (sigmoid(-4)). The 64-update heal budget therefore goes to
+opening the new degrees of freedom, not to repairing the output, and the
+paired arm comparison is no longer warm-start-biased against the flagship.
+Ranks 1-3 have no output path at exact init; they are opened by the
+rank-specialization auxiliary loss (first 8 updates, covering the projection
+weights directly) and by mixer growth (all 16 mixer blocks receive gradient
+from the first update). The preflight identity gate is unchanged: Package B's
+contract remains conversion determinism, since ~1.8% is still far outside the
+1e-6 parity tolerance.
+
+3. TRAINING PROTOCOL
+--------------------
+
+Heal objective: CE + temperature-scaled full-vocab KL(teacher||student) per
+token + normalized layerwise residual MSE, teacher = stock Qwen3.5-0.8B
+(fail-closed if absent), plus the Package-B auxiliary loss (deterministic
+rank-specialization probe + trapezoid-gate warmup) for the first 8 updates.
+Optimizer: fused AdamW, two groups - "memory" and "cache" (cache group has
+zero weight decay); the two BF16 moment slots live on CPU outside the short
+optimizer phase, and bounded coefficients are re-projected after every step.
+Exact rollback snapshots are also CPU-resident. Budget: 64 updates and
+262,144 tokens TOTAL (one 4096-token microbatch per update), seeds 11/29/47,
+18 target layers
+(0-2,4-6,8-10,12-14,16-18,20-22; every 4th layer is full attention and
+untouched). The official text model is hidden=1024 with 16 GDN key/value heads
+of width 128; its six ordinary full-attention layers independently use 8
+attention heads. Training data is the pinned 64-window heal band; evaluation
+is the RULER matrix through context 32768. Module dtype is bfloat16 while all
+recurrent state math remains FP32; HF per-layer activation checkpointing is ON
+(required - see footnote item 3). The stock teacher runs frozen on the second
+GPU and overlaps the student forward.
+
+Launch: edit config.toml, then `bash run.sh` (dry-run first). The chain is
+run.sh -> remote_package_b.py -> scripts/run_remote_qwen_maximum_hybrids.sh
+-> scripts/run_remote_qwen.sh -> python -m research.kmd2_ablation.run_ablation
+{preflight,run,summarize}. The all-controls preflight barrier must pass before
+any training command is issued.
+
+4. EVALUATION
+-------------
+
+The canonical per-seed RULER matrix has 18 cells (six context lengths x query
+counts 1/4/8), 64 teacher-forced episodes per cell, and a deterministic
+eight-episode free-generation subset per cell: 1152 teacher-forced + 144
+free-generation rows per seed. The immutable bundle contains distinct
+partitions for seeds 11/29/47. Full-vocabulary teacher-forced scoring streams
+the LM head in bounded token chunks (0.25-GiB logit workspace); free generation
+uses one-token vocabulary projection with cross-call recurrence caching off.
+Cache/braid/decay diagnostics are recorded per run.
+
+Known long-context hazard: training sequences
+are 4096 tokens, so cumulative relative phases beyond ~0.5 rad are never seen
+in training, while at 8k+ distances cos(delta-phase) enters the negative
+regime - the earlier experiment found disabling rotations at inference vastly
+improved long-context recall. For that ablation set
+`module.active_feature_flags["rotation"] = False` on installed hybrid layers
+at inference (training default is unchanged; see footnote item 1). Re-test
+this on every trained checkpoint before drawing long-context conclusions.
+
+5. GUIDANCE FOR THE OPTIMIZER
+-----------------------------
+
+The campaign fast path no longer executes the FP32 recurrence as a per-token
+Python loop. Its remaining training hot spots are (a) activation-checkpoint
+rematerialization and eager elementwise gradient work around the fused core,
+(b) FP32 state/previous-write trace traffic for exact reverse mode, and (c)
+HOLA's FP32 W+C candidate read and sixteen cross-rank outputs. Free-generation
+evaluation is a separate wall-clock bottleneck because the architecture
+deliberately carries no recurrence state across model.generate calls.
+
+Whole-sequence projection/convolution, cumulative rotation, HOLA reads,
+checkpoint-gradient joining, and global read mixing are vectorized. Triton
+owns the exact state/trapezoid recurrence. `torch.compile` is not a campaign
+default: it has not beaten this path reliably in the pinned multi-file process
+environment, and any future compiled region must retain the same fail-closed
+reference comparison (see footnote item 11).
+
+You may fuse, chunk, batch, and vectorize freely PROVIDED the result matches
+the reference `_scan` within test tolerances (the chunked-equivalence,
+determinism, and gate-probe tests in tests/ablation are the contract). You
+must NOT change: FP32 state math; clock/boundary/reset semantics; HOLA's
+visible-set ordering (staged block readable before promotion; epoch
+invalidation); the frozen score/read formulas; cache-carry dataclass
+semantics; or checkpoint segmentation's exact forward/cache and pinned
+gradient-parity properties.
+The `MaximumControlContract` dataclass and its SHA-256 are embedded in the
+shipped campaign configs - do not add or remove contract fields.
+
+--------------------------------------------------------------------------------
+FOOTNOTE: adjustments made 2026-07-14
+--------------------------------------------------------------------------------
+ 1. Rotation flag: `active_feature_flags["rotation"]` honored by both hybrid
+    packages (default True = training behavior unchanged; False zeroes theta
+    and freezes phase). Inference-only ablation switch; the feature contract
+    dataclass was deliberately not modified.
+ 2. `scripts/run_remote_qwen.sh` was missing from the archive and has been
+    reconstructed (preflight -> run -> summarize, pinned GDN3_FAST_SCAN=1 /
+    GDN3_KMD2_ROUT=4 exports, --preflight-only / --resume / --summarize).
+    Verified end-to-end: a failed preflight exits 3 and aborts the barrier.
+ 3. Within-layer segmented BPTT checkpointing in `QwenFourStateHybrid._scan`
+    (`checkpoint_segment_tokens = 64`; None disables; bypassed under no_grad).
+    Forward outputs and carried cache/HOLA state are bitwise-identical to the
+    plain loop; parameter-gradient accumulation can differ at FP32 rounding
+    scale and is pinned to 1e-3 absolute / 2e-4 relative. The original
+    reference graph retained ~105 MB/token/layer and was unrunnable. The
+    current fused path bounds the active recurrence trace to one 64-token
+    segment (512 MiB at H=16) plus vectorized read features. HF per-layer
+    checkpointing is still required on top.
+ 4. HOLA admission score for Package B is now
+    `four_state_normalized_update_score` = RMS over ticking CMS lanes
+    (previously the raw direct-sum Frobenius norm, which inflated scores ~2.2x
+    at 256-aligned positions purely because more lanes tick there). Package A
+    keeps the paper-faithful `shared_exact_update_score`.
+ 5. transformers pin corrected 4.53.2 -> 5.13.1 in requirements.txt and
+    requirements-qwen.{txt,lock} (4.53.2 predates the qwen3_5 model family;
+    preflight fails closed on it).
+ 6. The interim "Option B" was superseded by "Option A" (see section 2):
+    warm start is near-identity but deliberately not exact.
+    The repealed full-warm-identity tests in test_qwen_install.py are skipped
+    with reasons; the Package A oracle test compares the recurrence with the
+    cache disabled (then re-enables it for the cache-carry assertions); one
+    stale trainer fixture test in test_qwen_backend.py is skipped (see its
+    reason string). The two-process gloo test fails on this sandbox for
+    environment reasons (DistStoreError) and is expected to pass on a real
+    multi-process host.
+    Test-suite status as of 2026-07-15: the retained regression set is 1431
+    passed / 8 skipped, with the environment-only two-process Gloo test
+    deselected. Running the WHOLE suite in one process still produces 35
+    reproduced order-dependent class/fast-scan/torch.compile flakes; every
+    affected file passes alone. Run per-file (as CI should: one pytest process
+    per file) until the legacy suite's process hygiene is repaired.
+ 7. Repo cleanup to the current architecture: removed the legacy tiny/exact-
+    cache campaign configs (campaigns/configs/, old configs/*.json,
+    qwen08b-runnable-v1.json), dead gdn3 kernels (hybrid_r4_scan, kernels,
+    module, triton_hybrid_r4), qwen_cache_campaign.py, the stale archive
+    MANIFEST.json (regenerate on next bundling), and stale-red test files.
+    Items awaiting review sit in delete/. A full pre-cleanup backup exists at
+    /home/dev/gdnx-backup-pre-cleanup-20260714.tar.gz.
+ 8. Native fast scan (gdn3/kmd2_native.py) now requires CUDA inputs: CPU
+    callers (the preflight gate probes) take the reference loop; GPU training
+    behavior is unchanged. The module-level _FAST_SCAN latch is kept (it is a
+    probe/AST contract surface); tests/ablation/conftest.py re-derives it from
+    the environment per test so import order cannot leak the flag across
+    tests. KMD2_NATIVE_SHA256 in inventory.py re-pinned accordingly.
+ 9. The preflight real-module gate (runner.py) now requires native output
+    parity exactly where the probe declares it expected (Package A yes,
+    Package B no) instead of unconditionally - the shipped gate contradicted
+    the shipped probe and failed the flagship (see section 2, "Option B").
+10. run_remote_qwen.sh resolves caller-relative paths before cd'ing to the
+    repo root. Flagship preflight is verified against the real official cached
+    model metadata: its largest phase is 12.720 GiB before margin / 15.264 GiB
+    after the required 20% margin on a 15.929-GiB card.
+11. 2026-07-15 throughput work, with no equation changes: the all-valid,
+    boundary-free path vectorizes whole-sequence projection/convolution,
+    cumulative rotation, batched RMSNorm, and exact HOLA block reads/promotion.
+    A strict custom Triton autograd operation now fuses each <=64-token FP32
+    four-state recurrence; it uses fixed-order reductions and no atomics and
+    falls back outside the canonical shape. Non-reentrant checkpointing drops
+    its first-pass traces and rematerializes only the active segment.
+
+    The decisive backward fix was structural rather than another kernel:
+    independent `x[:,start:stop]` checkpoint views each created a full-T
+    SliceBackward buffer. One `torch.split` node now joins all segment
+    gradients once, eliminating hundreds of redundant [T,H,R,W] adds. The
+    4x4 read mixer and output projection are likewise applied once to the
+    concatenated exact segment features rather than accumulating 64 large
+    parameter gradients. `force_reference_path`, `force_torch_recurrence`,
+    and `force_segment_mixing` preserve diagnostic fallbacks.
+
+    RTX 5060 Ti, B=1/T=4096/hidden=1024/H=16/dk=dv=128, 18 hybrid layers:
+    hybrid-only fwd+bwd+CPU-offloaded fused-Adam update = 25.77 s, peak
+    9.73 GiB. The full official 24-layer Qwen trainer with 18 replacements,
+    frozen stock teacher, CE+KL+layerwise+auxiliary losses, transactional
+    snapshots, and optimizer step measured 30.43 s first update and 30.98 s
+    steady update = 116.20 job steps/hour. With both occupied GPUs charged,
+    that is 58.10 steps/GPU-hour; peaks were 12.93 GiB student and 3.55 GiB
+    teacher. The smoke tool is
+    `python -m research.kmd2_ablation.scripts.smoke_step`.
+12. 2026-07-15 "Option A" warm start implemented (see section 2): one-hot
+    lane-0 output mixer (identity_output_mixer) and trapezoid bias init +4 in
+    HybridComponents. Measured conversion error vs native: 1.83% relative,
+    cosine 0.99992 (was 87% / 0.64 under the eye/16 + lambda=.5 init). Tests
+    pinning the old init updated; the aux-loss gate-warmup term still
+    nominally rewards (1-lambda) but its gradient at bias=4 is ~2e-5 at the
+    pinned lambda_gate=0.001 -- negligible against distillation.
+13. 2026-07-15 live metrics reporting added (Discord). qwen_training.py's
+    training loop appends one JSON line per update to OUT/live/<job_id>.jsonl
+    -- ONLY when GDNX_LIVE_METRICS=1, only on the checkpoint-writer rank, and
+    every emitter failure is swallowed (it can never alter or abort a run;
+    default path is byte-identical). scripts/metrics_webhook.py is a separate
+    crash-isolated process that tails those files and posts periodic embeds
+    to the webhook URL in the repo-root 'webhook' file (loss components,
+    tokens/sec, ETA, completion). run_remote_qwen.sh auto-enables both when
+    the 'webhook' file exists. Optimizer: the emitter is I/O off the hot
+    path (one small append per ~30s update); do not move it inside
+    train_update or make it synchronous with device work.
+14. 2026-07-15 training/campaign throughput pass, with no model-semantic
+    changes: frozen-teacher work is queued first on its configured GPU and
+    overlaps the student on the other GPU; finite checks and loss logging synchronize once per
+    phase; AdamW uses the fused CUDA implementation and its multi-GiB BF16
+    moment slots are copied to the parameter device only for optimizer.step;
+    exact rollback snapshots are staged on CPU rather than duplicating
+    parameters and optimizer slots in VRAM. The production checkpoint cadence
+    is 8 (the final update is always saved), reducing 64 full save/reload
+    validations to 8 while an
+    interruption can replay at most 7 updates. The all-controls barrier now
+    owns preflight, so individual runs do not repeat it, and preflight-only
+    invocations never start the metrics watcher. Metadata memory preflight is
+    derived from the official nested text config and checkpoint tensor
+    contract. It is phase-separated (training backward, optimizer, streamed
+    evaluation, teacher), includes every carried state/history tensor and
+    persistent specialization buffer, and applies a 20% margin per phase.
+15. The official Qwen3.5-0.8B asset is a multimodal wrapper. The loader now
+    extracts its already-loaded `model.language_model` and tied `lm_head` into
+    a meta-created causal-LM shell and releases the unused vision tower. The
+    data builder defaults to the complete declared RULER matrix, adds the
+    deterministic free-generation subset, and stores int32 token tensors only;
+    labels and dense query/source annotations are reconstructed for the one
+    selected seed at load time. Custom reduced grids are explicitly marked
+    feasibility-only and cannot silently become promotion evidence.
+16. 2026-07-15 external-review fixes (team reviewer findings, verified before
+    changing anything; no model-semantic changes on the training path):
+    (a) Global read mixing now requires a live grad mode. Under no_grad it
+        retained every normalized [B,T,H,4,4,V] read plus every FP32 HOLA
+        read until one end-of-scan concatenation -- a full-context inference
+        transient (measured 2,708 vs 1,264 MiB at T=4096 for one layer,
+        bitwise-equal outputs; linear in T, so ~8x worse at 32K). Evaluation
+        now always mixes per segment; training behavior is unchanged.
+    (b) The fused Triton forward allocates its two FP32 state traces only
+        when some differentiable input needs backward (ctx.needs_input_grad).
+        Inference/no_grad saves 512 MiB per canonical segment invocation;
+        grad-path outputs are bitwise identical (tested).
+    (c) Package-B decay saturation: the additive pair residual could push the
+        pre-clamp log-decay outside [log 2^-24, 0], and the old per-lane
+        post-division clamp then floored ONLY the fast lanes -- breaking the
+        exact 1:16:64:256 rate ratios (16 became ~8.7) -- or pinned all
+        gammas at 1. The shared pair log rate is now bounded once BEFORE the
+        horizon division, so ratios hold exactly at and beyond both bounds
+        and saturation is lane-consistent. Interior values are bit-identical
+        to the previous behavior. Hard saturation still has zero gradient
+        (documented limitation: lane-0 native-decay fidelity rules out a
+        strictly-interior reparameterization); saturation is observable via
+        the new state diagnostics and the 100-update smoke measured actual
+        residual drift of only ~3e-3 against a >=1.7e-4..2.1 saturation
+        distance, so this is a robustness fix, not an active-failure fix.
+    (d) Resource accounting now includes the training-path global-mix read
+        retention (2x(bf16+fp32) full-context reads for the live layer) in
+        both the runtime payload and the metadata memory preflight; the
+        no-grad evaluation phase deliberately excludes it per (a).
+    (e) State-growth diagnostics additionally record the max per-(head,lane)
+        matrix RMS and the global elementwise max, so one exploding head or
+        slow lane can no longer hide inside the cross-layer mean norm.
+    (f) The transformation manifest now carries a machine-readable
+        `runtime_backend` field naming the fused Triton dispatch, separate
+        from the `implementation` semantic-oracle identity (the reviewer
+        found the manifest still claimed Triton was deferred).
+    Reviewer P2 note on the HOLA admission score (RMS-over-ticking-lanes is
+    an unvalidated adaptation vs the paper's raw committed-write norm) is
+    acknowledged and intentionally NOT changed pre-campaign; it is recorded
+    as a post-campaign ablation (raw direct-sum vs RMS-over-ticking vs
+    lane-0-only vs cadence-standardized).
+17. 2026-07-15 heal budget amended 64 -> 1536 updates (6,291,456 tokens),
+    openly, before the first real run; every fail-closed budget pin
+    (ArchitectureRecord, base config example_ids heal-window-0000..1535,
+    campaign matched budget, config tests) was updated together rather than
+    bypassed. Rationale: the 64-update budget was scoped as pipeline
+    validation; opening the zero-initialized capacity (one-hot mixer lanes
+    1-3, trapezoid, cache gate at sigmoid(-4)) needs optimizer steps, and
+    full-attention retrofit experience (Billy) says 1000-2000. Training data
+    for the amended budget is a composed 1536-window band (50% general
+    filler / ~26% synthetic needle-multiquery-copy stress / ~24% semantic
+    retrieval QA blocks generated by the team's super-qwen endpoint with
+    deterministic checks, judge pass waived per team validation at ~98%
+    judge approval; attn_data/compose_heal_band.py records composition,
+    per-window labels, and band sha256). Checkpoint cadence for 1536-update
+    runs is --checkpoint-every 64. The first run under this budget is the
+    2026-07-15 overnight paired feasibility A/B (gdn2-r1 vs
+    package-b-hola-w64 vs stock teacher, seed 11 only, canonical
+    architecture; NOT promotion evidence -- the three-seed promotion
+    campaign still requires all seeds at this same amended budget).
+--------------------------------------------------------------------------------

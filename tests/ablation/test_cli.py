@@ -134,6 +134,8 @@ def test_cli_accepts_qwen_mode_assets_devices_checksums_and_no_resume():
             "cuda:1",
             "--teacher-device",
             "cuda:0",
+            "--checkpoint-every",
+            "8",
             "--model-sha256",
             "a" * 64,
             "--assets-manifest",
@@ -154,10 +156,56 @@ def test_cli_accepts_qwen_mode_assets_devices_checksums_and_no_resume():
     assert options.teacher_model == Path("teacher")
     assert options.student_device == "cuda:1"
     assert options.teacher_device == "cuda:0"
+    assert options.checkpoint_every == 8
     assert options.model_sha256 == "a" * 64
     assert options.assets_manifest == Path("assets.json")
     assert options.resume is False
     assert options.dry_run is True
+
+
+def _write_remote_package_b_config(tmp_path: Path, checkpoint_every: str = "8") -> Path:
+    path = tmp_path / "remote.toml"
+    path.write_text(
+        """[paths]
+package_root = "/package"
+cache = "/cache"
+hf_cache = "/hf-cache"
+hf_hub = "/hf-hub"
+model = "/model"
+tokenizer = "/tokenizer"
+native_checkpoint = "/checkpoint"
+data = "/data"
+teacher_model = "/teacher"
+output = "/output"
+
+[run]
+package = "B"
+campaign = "full"
+dtype = "bfloat16"
+student_device = "cuda:0"
+teacher_device = "cuda:1"
+checkpoint_every = """ + checkpoint_every + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_remote_package_b_forwards_positive_checkpoint_cadence(tmp_path):
+    from research.kmd2_ablation.remote_package_b import _command, _load
+
+    config = _load(_write_remote_package_b_config(tmp_path))
+    command = _command(config, "/output/assets.json")
+
+    index = command.index("--checkpoint-every")
+    assert command[index + 1] == "8"
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "true", '"8"'])
+def test_remote_package_b_rejects_invalid_checkpoint_cadence(tmp_path, value):
+    from research.kmd2_ablation.remote_package_b import _load
+
+    with pytest.raises(ValueError, match="checkpoint_every"):
+        _load(_write_remote_package_b_config(tmp_path, value))
 
 
 @pytest.mark.parametrize(
@@ -509,6 +557,7 @@ def _options(config: Path, output: Path, *, command="preflight", backend="tiny")
         "teacher_model": None,
         "student_device": None,
         "teacher_device": None,
+        "checkpoint_every": None,
         "dtype": None,
         "model_sha256": None,
         "tokenizer_sha256": None,
@@ -1006,6 +1055,8 @@ def test_default_tiny_resource_evaluator_uses_instantiated_task9_accounting(
     assert report["resources"]["ffn_match"]["matched"] is True
 
 
+@pytest.mark.skip(reason="2026-07-14 cleanup: the legacy tiny screening configs these "
+                  "cases load were removed with the pre-GDN-X ablation campaign")
 @pytest.mark.parametrize(
     ("config_name", "expected_state_elements"),
     [
@@ -1188,6 +1239,7 @@ def test_reproduction_commands_include_every_asset_identity_and_repo_root(tmp_pa
         "student_device": "cuda:1",
         "teacher_device": "cuda:0",
         "dtype": "bfloat16",
+        "checkpoint_every": 8,
         "model_sha256": "1" * 64,
         "tokenizer_sha256": "2" * 64,
         "checkpoint_sha256": "3" * 64,
@@ -1207,6 +1259,7 @@ def test_reproduction_commands_include_every_asset_identity_and_repo_root(tmp_pa
         "--checkpoint": identities["checkpoint"],
         "--data": identities["data"],
         "--teacher-model": identities["teacher_model"],
+        "--checkpoint-every": identities["checkpoint_every"],
         "--model-sha256": identities["model_sha256"],
         "--tokenizer-sha256": identities["tokenizer_sha256"],
         "--checkpoint-sha256": identities["checkpoint_sha256"],
@@ -1664,6 +1717,96 @@ def test_qwen_resource_probe_counts_pinned_native_additions_and_cache_exactly(
     }
 
 
+def test_metadata_only_hybrid_32k_preflight_rejects_unsafe_before_model_load(tmp_path):
+    from types import SimpleNamespace
+    from research.kmd2_ablation.config import ExperimentConfig
+    from research.kmd2_ablation.resource_probes import measure_qwen_resources
+    from research.kmd2_ablation.runner import PreflightCheckError
+    raw = _qwen_window_contract_raw()
+    raw["model"].update(hidden_size=8, num_layers=2, num_heads=2,
+                        state_key_dim=2, state_value_dim=2, ffn_dim=16,
+                        ffn_match_lower=8, ffn_match_upper=24)
+    raw["task"]["params"].update(batch_size=1, preflight_safety_margin_bytes=1024)
+    config = ExperimentConfig.from_dict(raw)
+    model = tmp_path / "model.safetensors"
+    _write_safetensors_metadata(model, {
+        "model.embed_tokens.weight": [1024, 1024],
+        "model.layers.0.linear_attn.conv1d.weight": [12, 1, 3],
+    })
+    spec = SimpleNamespace(architecture_arm_id="gdn2-mimo-r4-braid-shared-hola-w64")
+    with pytest.raises(PreflightCheckError, match="unsafe") as caught:
+        measure_qwen_resources(
+            config, spec, assets={"model": {"path": str(model)}},
+            environ={"GDN3_FAST_SCAN": "1", "GDN3_KMD2_ROUT": "4"}, loaded_modules={},
+            cuda_probe=lambda: {"free_bytes": 1, "total_bytes": 2, "device_index": 0,
+                                "device_name": "mock", "driver": 1, "runtime": "test"},
+        )
+    assert caught.value.code == "hybrid_32k_memory_unsafe"
+    from research.kmd2_ablation.runner import evaluate_exact_resources
+    safe_evidence = measure_qwen_resources(
+        config, spec, assets={"model": {"path": str(model)}},
+        environ={"GDN3_FAST_SCAN": "1", "GDN3_KMD2_ROUT": "4"}, loaded_modules={},
+        cuda_probe=lambda: {"free_bytes": 10**12, "total_bytes": 2*10**12,
+                            "device_index": 0, "device_name": "mock", "driver": 1,
+                            "runtime": "test"},
+    )
+    assert safe_evidence["recurrent_state_tensor_elements"] == 80
+    assert safe_evidence["recurrent_state_auxiliary_bytes"] == 210
+    assert safe_evidence["recurrent_state_bytes"] == (
+        4 * safe_evidence["recurrent_state_tensor_elements"]
+        + safe_evidence["recurrent_state_auxiliary_bytes"]
+    )
+    subtotal = safe_evidence["required_device_bytes"] - safe_evidence["allocator_workspace_margin_bytes"]
+    assert safe_evidence["allocator_workspace_margin_bytes"] >= 0.20 * subtotal
+    assert safe_evidence["activation_components"]["logits"] > 0
+    assert safe_evidence["activation_components"]["layer_workspace"] > 0
+    report = evaluate_exact_resources(
+        config, spec,
+        resource_evaluator=lambda _candidate, _candidate_spec: safe_evidence,
+    )
+    assert report["ok"] is True
+    assert report["resources"]["recurrent_state_tensor_elements"] == 80
+    assert report["resources"]["recurrent_state_auxiliary_bytes"] == 210
+    assert report["resources"]["qwen_execution"]["fast_scan"] is True
+
+
+def test_metadata_hybrid_preflight_rejects_malformed_native_convolution_layout(tmp_path):
+    from types import SimpleNamespace
+    from research.kmd2_ablation.config import ExperimentConfig
+    from research.kmd2_ablation.resource_probes import measure_qwen_resources
+    from research.kmd2_ablation.runner import PreflightCheckError
+
+    raw = _qwen_window_contract_raw()
+    raw["model"].update(
+        hidden_size=8, num_layers=2, num_heads=2, state_key_dim=2,
+        state_value_dim=2, ffn_dim=16, ffn_match_lower=8, ffn_match_upper=24,
+    )
+    config = ExperimentConfig.from_dict(raw)
+    model = tmp_path / "model.safetensors"
+    _write_safetensors_metadata(model, {
+        "model.embed_tokens.weight": [16, 8],
+        "model.layers.0.linear_attn.conv1d.weight": [12, 3],
+    })
+
+    with pytest.raises(PreflightCheckError) as caught:
+        measure_qwen_resources(
+            config,
+            SimpleNamespace(
+                architecture_arm_id="gdn2-mimo-r4-braid-four-state-hola-w64"
+            ),
+            assets={"model": {"path": str(model)}},
+            environ={"GDN3_FAST_SCAN": "1", "GDN3_KMD2_ROUT": "4"},
+            loaded_modules={},
+            cuda_probe=lambda: {
+                "free_bytes": 10**12, "total_bytes": 2 * 10**12,
+                "device_index": 0, "device_name": "mock", "driver": 1,
+                "runtime": "test",
+            },
+        )
+
+    assert caught.value.code == "model_config_metadata_invalid"
+
+
 @pytest.mark.parametrize(
     ("environ", "loaded_modules", "code"),
     [
@@ -1885,6 +2028,7 @@ def test_runtime_dispatcher_builder_receives_qwen_runtime_outside_jobs(
     options.teacher_model = tmp_path / "teacher"
     options.student_device = "cuda:1"
     options.teacher_device = "cuda:0"
+    options.checkpoint_every = 8
     options.dtype = "bfloat16"
     asset_hashes = {
         "model": "1" * 64,
@@ -1939,6 +2083,7 @@ def test_runtime_dispatcher_builder_receives_qwen_runtime_outside_jobs(
         "output": options.out,
         "student_device": "cuda:1",
         "teacher_device": "cuda:0",
+        "checkpoint_every": 8,
         "dtype": "bfloat16",
         "asset_hashes": asset_hashes,
         "resume": True,

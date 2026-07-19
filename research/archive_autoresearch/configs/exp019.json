@@ -1,3 +1,0 @@
-{"name":"seqlen128_exp019","hypothesis":"all 18 prior runs used seq_len=512, where the queried binding must survive ~512 tokens of decay/distractors. A shorter seq_len=128 puts the queried binding much closer to where it's stated = the EASIEST retrieval regime. If retrieval emerges at 128, decay/distance was part of the bottleneck (falsifies the structural diagnosis, reopens the search); if the plateau holds even at the easiest retrieval distance, the frozen-full-attention format-shortcut diagnosis is strongly confirmed.",
- "steps":500,"eval_every":50,"warmup":40,"grad_accum":1,"n_keys":4,"seq_len":128,
- "lr_memory":2.5e-4,"lr_coproduct":1.5e-4,"decay_clamp":0.999,"slow_decay":0.97,"residual_rank":16,"seed":0}

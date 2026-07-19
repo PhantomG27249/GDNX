@@ -1,3 +1,0 @@
-{"name":"coprod_binding_init_exp012","hypothesis":"Phase-2 mechanism variant: the coproduct key->value binding channel starts OFF at init (coprod_mix_qk/v = 0, dense-only) and must be turned on by gradients that barely flow while the dense path already satisfies the format shortcut. Initing coprod_mix_qk/v to 0.1 puts the bilinear binding partially ON from the start so it gets gradient — a coproduct-wiring init change, true to GDN3 math, forward-only. If retrieval emerges past ~0.30, binding strength was the gate; if not, the bottleneck is the read/router.",
- "steps":500,"eval_every":50,"warmup":40,"grad_accum":1,"n_keys":4,"seq_len":512,
- "lr_memory":2.5e-4,"lr_coproduct":1.5e-4,"decay_clamp":0.999,"slow_decay":0.97,"residual_rank":16,"seed":0}
